@@ -1,4 +1,6 @@
 # SiMPLE OS
+<img width="1536" height="1024" alt="5E778EAE-3171-42A1-B8CE-2EC0B9FCBDA9" src="https://github.com/user-attachments/assets/10080647-82b0-41f7-baf7-aa3b37d38890" />
+
 
 SiMPLE OS is a minimal bootable operating system for `x86_64` QEMU that:
 
