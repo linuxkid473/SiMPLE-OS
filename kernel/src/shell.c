@@ -3,6 +3,7 @@
 #include "editor.h"
 #include "fat16.h"
 #include "keyboard.h"
+#include "kmalloc.h"
 #include "power.h"
 #include "string.h"
 #include "vga.h"
@@ -32,7 +33,7 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -766,6 +767,185 @@ static void shell_help(void) {
     vga_write_line("  mv <src> <dst> - move/rename file");
     vga_write_line("  poweroff       - power off machine");
     vga_write_line("  reboot         - reboot machine");
+    vga_write_line("  kmalloc-test   - test memory allocator");
+    vga_write_line("  kmalloc-stress - stress test allocator");
+}
+
+static void shell_kmalloc_test(void) {
+    vga_write_line("[KMALLOC TEST]");
+
+    char* a = (char*)kmalloc(16);
+    char* b = (char*)kmalloc(32);
+
+    if (!a || !b) {
+        vga_write_line("FAIL: allocation failed");
+        return;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        a[i] = 'A';
+    }
+    a[5] = '\0';
+
+    for (int i = 0; i < 5; i++) {
+        b[i] = 'B';
+    }
+    b[5] = '\0';
+
+    vga_write("a=");
+    vga_write_hex((uint32_t)a);
+    vga_write(" -> ");
+    vga_write_line(a);
+
+    vga_write("b=");
+    vga_write_hex((uint32_t)b);
+    vga_write(" -> ");
+    vga_write_line(b);
+
+    if ((uint32_t)a + 16 <= (uint32_t)b) {
+        vga_write_line("PASS: no overlap");
+    } else {
+        vga_write_line("FAIL: overlap");
+    }
+}
+
+#define STRESS_BLOCKS 100
+#define STRESS_SIZES 6
+
+static void shell_kmalloc_stress(void) {
+    static void* blocks[STRESS_BLOCKS];
+    static uint32_t sizes[STRESS_BLOCKS];
+    uint32_t i;
+    int failed = 0;
+    int overlap_detected = 0;
+
+    vga_write_line("[KMALLOC STRESS]");
+
+    sizes[0] = 3;
+    sizes[1] = 5;
+    sizes[2] = 7;
+    sizes[3] = 9;
+    sizes[4] = 13;
+    sizes[5] = 21;
+
+    vga_write_line("First 10 allocations:");
+    for (i = 0; i < 10; i++) {
+        uint32_t size = sizes[i % STRESS_SIZES];
+        blocks[i] = kmalloc(size);
+        if (!blocks[i]) {
+            vga_write("FAIL: allocation ");
+            vga_write_hex(i);
+            vga_write_line(" failed");
+            return;
+        }
+        vga_write("size=");
+        vga_write_hex(size);
+        vga_write(" addr=0x");
+        vga_write_hex((uint32_t)blocks[i]);
+        vga_putc('\n');
+    }
+
+    for (i = 10; i < STRESS_BLOCKS; i++) {
+        uint32_t size = sizes[i % STRESS_SIZES];
+        blocks[i] = kmalloc(size);
+        if (!blocks[i]) {
+            vga_write("FAIL: allocation ");
+            vga_write_hex(i);
+            vga_write_line(" failed");
+            return;
+        }
+    }
+
+    vga_write("Allocated ");
+    vga_write_hex(STRESS_BLOCKS);
+    vga_write_line(" blocks total");
+
+    vga_write("First 5 addresses:");
+    vga_putc('\n');
+    for (i = 0; i < 5; i++) {
+        vga_write("  [");
+        vga_write_hex(i);
+        vga_write("] 0x");
+        vga_write_hex((uint32_t)blocks[i]);
+        vga_putc('\n');
+    }
+
+    for (i = 0; i + 1 < STRESS_BLOCKS; i++) {
+        if ((uint32_t)blocks[i] >= (uint32_t)blocks[i + 1]) {
+            overlap_detected = 1;
+            break;
+        }
+    }
+
+    if (overlap_detected) {
+        vga_write_line("FAIL: addresses not increasing");
+    } else {
+        vga_write_line("Addresses increasing: OK");
+    }
+
+    vga_write_line("Filling memory...");
+    for (i = 0; i < STRESS_BLOCKS; i++) {
+        uint32_t size = sizes[i % STRESS_SIZES];
+        char pattern = (char)('A' + (i % 26));
+        char* p = (char*)blocks[i];
+        for (uint32_t j = 0; j < size; j++) {
+            p[j] = pattern;
+        }
+    }
+
+    vga_write_line("Verifying...");
+    for (i = 0; i < STRESS_BLOCKS; i++) {
+        uint32_t size = sizes[i % STRESS_SIZES];
+        char expected = (char)('A' + (i % 26));
+        char* p = (char*)blocks[i];
+        for (uint32_t j = 0; j < size; j++) {
+            if (p[j] != expected) {
+                vga_write("FAIL at block ");
+                vga_write_hex(i);
+                vga_write(" offset ");
+                vga_write_hex(j);
+                vga_write(" expected ");
+                vga_write_hex((uint32_t)expected);
+                vga_write(" got ");
+                vga_write_hex((uint32_t)p[j]);
+                vga_putc('\n');
+                failed = 1;
+                break;
+            }
+        }
+        if (failed) break;
+    }
+
+    if (!failed) {
+        vga_write_line("PASS: memory intact");
+    }
+
+    vga_write_line("Edge case: kmalloc(0)");
+    void* zero = kmalloc(0);
+    if (zero == NULL) {
+        vga_write_line("  kmalloc(0) correctly returned NULL");
+    } else {
+        vga_write_line("  WARNING: kmalloc(0) returned non-NULL");
+    }
+
+    vga_write_line("Edge case: large allocation");
+    void* large = kmalloc(0xF0000);
+    if (large == NULL) {
+        vga_write_line("  large alloc returned NULL (expected - exceeds heap)");
+    } else {
+        vga_write_line("  large alloc succeeded at 0x");
+        vga_write_hex((uint32_t)large);
+    }
+
+    vga_write_line("Edge case: fill heap");
+    int fill_count = 0;
+    while (kmalloc(1024) != NULL) {
+        fill_count++;
+    }
+    vga_write("Filled ");
+    vga_write_hex(fill_count);
+    vga_write_line(" x 1KB blocks");
+    vga_write_line("Heap exhausted as expected");
 }
 
 static void completion_sort(console_completion_t* out) {
@@ -1059,6 +1239,24 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             }
             vga_write_line("Rebooting...");
             reboot();
+            continue;
+        }
+
+        if (strcmp(command, "kmalloc-test") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: kmalloc-test");
+                continue;
+            }
+            shell_kmalloc_test();
+            continue;
+        }
+
+        if (strcmp(command, "kmalloc-stress") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: kmalloc-stress");
+                continue;
+            }
+            shell_kmalloc_stress();
             continue;
         }
 

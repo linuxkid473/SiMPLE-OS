@@ -1,5 +1,6 @@
 #include "fat16.h"
 #include "keyboard.h"
+#include "kmalloc.h"
 #include "mouse.h"
 #include "shell.h"
 #include "vga.h"
@@ -29,6 +30,7 @@ void kernel_main(unsigned int magic, unsigned int multiboot_info) {
 
     vga_set_color(0x0F, 0x00);
     vga_clear();
+    kmalloc_init(0x200000);
     vga_write_line("Welcome to SiMPLE OS");
 
     keyboard_init();
