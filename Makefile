@@ -21,9 +21,14 @@ OBJ_C := $(patsubst kernel/src/%.c,$(BUILD_DIR)/%.o,$(SRC_C))
 OBJ_ASM := $(BUILD_DIR)/boot.o
 OBJS := $(OBJ_ASM) $(OBJ_C)
 
-.PHONY: all image run clean
+.PHONY: all image run clean user
 
 all: image
+
+user: user/hello.elf
+
+user/hello.elf: user/hello.c user/linker.ld
+	$(CC) -ffreestanding -nostdlib -Wl,-T,user/linker.ld -o $@ user/hello.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -37,7 +42,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF)
+image: $(KERNEL_ELF) user/hello.elf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -58,6 +63,7 @@ image: $(KERNEL_ELF)
 	mkdir -p "$$MNT/boot/grub"; \
 	cp $(KERNEL_ELF) "$$MNT/boot/kernel.bin"; \
 	cp grub/grub.cfg "$$MNT/boot/grub/grub.cfg"; \
+	cp user/hello.elf "$$MNT/hello.elf"; \
 	"$(GRUB_INSTALL)" --target=i386-pc --boot-directory="$$MNT/boot" --modules="part_msdos fat biosdisk multiboot normal configfile" --no-floppy "$$RDISK" >/dev/null; \
 	sync; \
 	cleanup; \

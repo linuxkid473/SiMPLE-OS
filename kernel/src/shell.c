@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "console.h"
 #include "editor.h"
+#include "elf.h"
 #include "fat16.h"
 #include "keyboard.h"
 #include "kmalloc.h"
@@ -33,7 +34,7 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -769,6 +770,7 @@ static void shell_help(void) {
     vga_write_line("  reboot         - reboot machine");
     vga_write_line("  kmalloc-test   - test memory allocator");
     vga_write_line("  kmalloc-stress - stress test allocator");
+    vga_write_line("  run <file>    - load and execute ELF program");
 }
 
 static void shell_kmalloc_test(void) {
@@ -1592,6 +1594,39 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             if (rc != FAT16_OK) {
                 print_generic_fs_error(rc);
             }
+            continue;
+        }
+
+        if (strcmp(command, "run") == 0) {
+            char* arg1 = next_token(&parse);
+            char* arg2 = next_token(&parse);
+            if (!arg1 || arg2) {
+                vga_write_line("usage: run <file>");
+                continue;
+            }
+
+            uint16_t dir_cluster = cwd_cluster;
+            char file_name[SHELL_NAME_MAX];
+            int rc = resolve_parent_and_name(fs, arg1, &dir_cluster, file_name);
+            if (rc == FAT16_ERR_NOT_FOUND || rc == FAT16_ERR_NOTDIR) {
+                print_label_target("File not found: ", arg1);
+                continue;
+            }
+            if (rc != FAT16_OK) {
+                print_label_target("Invalid file name: ", arg1);
+                continue;
+            }
+
+            char* buf = (char*)kmalloc(65536);
+            uint32_t out_len = 0;
+            rc = fat16_read_file(fs, dir_cluster, file_name, buf, 65536, &out_len);
+            if (rc != FAT16_OK) {
+                vga_write_line("Failed to read file");
+                continue;
+            }
+
+            exec_elf(buf);
+            vga_putc('\n');
             continue;
         }
 
