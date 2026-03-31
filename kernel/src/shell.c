@@ -34,7 +34,7 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -770,7 +770,11 @@ static void shell_help(void) {
     vga_write_line("  reboot         - reboot machine");
     vga_write_line("  kmalloc-test   - test memory allocator");
     vga_write_line("  kmalloc-stress - stress test allocator");
-    vga_write_line("  run <file>    - load and execute ELF program");
+    vga_write_line("  run <file>     - load and execute ELF program");
+    vga_write_line("  inttest        - test interrupt 0x30");
+    vga_write_line("  inttest2       - test interrupt 0x22");
+    vga_write_line("  div0           - trigger divide by zero");
+    vga_write_line("  badop          - trigger invalid opcode");
 }
 
 static void shell_kmalloc_test(void) {
@@ -1627,6 +1631,44 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
 
             exec_elf(buf);
             vga_putc('\n');
+            continue;
+        }
+
+        if (strcmp(command, "inttest") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: inttest");
+                continue;
+            }
+            __asm__ volatile("int $0x30");
+            continue;
+        }
+
+        if (strcmp(command, "inttest2") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: inttest2");
+                continue;
+            }
+            __asm__ volatile("int $0x22");
+            continue;
+        }
+
+        if (strcmp(command, "div0") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: div0");
+                continue;
+            }
+            int x = 1;
+            int y = x / (x - 1);
+            (void)y;
+            continue;
+        }
+
+        if (strcmp(command, "badop") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: badop");
+                continue;
+            }
+            __asm__ volatile("ud2");
             continue;
         }
 

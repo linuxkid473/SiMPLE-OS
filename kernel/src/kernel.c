@@ -1,4 +1,6 @@
 #include "fat16.h"
+#include "gdt.h"
+#include "idt.h"
 #include "keyboard.h"
 #include "kmalloc.h"
 #include "mouse.h"
@@ -35,6 +37,10 @@ void kernel_main(unsigned int magic, unsigned int multiboot_info) {
 
     keyboard_init();
     mouse_init();
+    gdt_init();
+    vga_write_line("GDT OK");
+    idt_init();
+    vga_write_line("IDT OK");
 
     fat16_fs_t fs;
     int fs_ready = (fat16_mount(&fs) == FAT16_OK);

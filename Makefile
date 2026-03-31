@@ -18,7 +18,7 @@ GRUB_INSTALL := $(shell command -v i686-elf-grub-install 2>/dev/null || echo /op
 
 SRC_C := $(wildcard kernel/src/*.c)
 OBJ_C := $(patsubst kernel/src/%.c,$(BUILD_DIR)/%.o,$(SRC_C))
-OBJ_ASM := $(BUILD_DIR)/boot.o
+OBJ_ASM := $(BUILD_DIR)/boot.o $(BUILD_DIR)/gdt_asm.o $(BUILD_DIR)/isr.o
 OBJS := $(OBJ_ASM) $(OBJ_C)
 
 .PHONY: all image run clean user
@@ -34,6 +34,12 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/boot.o: kernel/boot.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gdt_asm.o: kernel/src/gdt_asm.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/isr.o: kernel/src/isr.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
