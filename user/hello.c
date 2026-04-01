@@ -1,13 +1,8 @@
 void _start(void) {
-    char msg[] = {
-        'h','e','l','l','o',' ',
-        'f','r','o','m',' ',
-        'u','s','e','r','s','p','a','c','e','\n'
-    };
-
+    const char* msg = "hello from userspace\n";
     unsigned int len = 21;
 
-    __asm__ volatile (
+    __asm__ volatile(
         "mov $1, %%eax\n"
         "mov $1, %%ebx\n"
         "mov %0, %%ecx\n"
@@ -18,5 +13,5 @@ void _start(void) {
         : "eax", "ebx", "ecx", "edx"
     );
 
-    for (;;);
+    return;  // ← THIS is the fix
 }
