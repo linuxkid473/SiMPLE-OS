@@ -1,11 +1,17 @@
 #include "elf.h"
 #include "vga.h"
-#include "string.h"
 #include "types.h"
 
 #define USER_BASE  0x100000
 #define USER_STACK 0x200000
 
+// globals for sys_exit
+uint32_t exit_target = 0;
+int process_exited = 0;
+
+/* =========================
+   ELF VALIDATION
+========================= */
 int elf_validate(void* data) {
     uint8_t* e = (uint8_t*)data;
 
@@ -21,6 +27,9 @@ int elf_validate(void* data) {
     return 0;
 }
 
+/* =========================
+   EXEC ELF
+========================= */
 int exec_elf(void* data) {
     if (elf_validate(data) != 0) {
         vga_write_line("Invalid ELF");
@@ -31,6 +40,8 @@ int exec_elf(void* data) {
     Elf32_Phdr* phdr = (Elf32_Phdr*)((uint8_t*)data + ehdr->e_phoff);
 
     uint32_t base = 0;
+
+    // find base
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
             base = USER_BASE - phdr[i].p_vaddr;
@@ -38,6 +49,7 @@ int exec_elf(void* data) {
         }
     }
 
+    // load segments
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD)
             continue;
@@ -55,17 +67,20 @@ int exec_elf(void* data) {
     }
 
     uint32_t entry = ehdr->e_entry + base;
-    uint32_t stack_top = USER_STACK;
+
+    // setup exit hook
+    process_exited = 0;
+    exit_target = (uint32_t)&&exit_point;
 
     __asm__ volatile(
         "movl %0, %%esp\n\t"
-        "push %1\n\t"
-        "call *%2"
+        "call *%1\n\t"
         :
-        : "r"(stack_top), "r"((void*)vga_putc), "r"((void*)entry)
+        : "r"(USER_STACK), "r"((void*)entry)
         : "memory"
     );
 
+exit_point:
     vga_write_line("Returned from program");
     return 0;
 }

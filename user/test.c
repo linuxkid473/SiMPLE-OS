@@ -1,6 +1,6 @@
 int write(const char*, int);
 
 void _start(void) {
-    write("LIBC WORKS\n", 11);
+    write("this is test program\n", 21);
     return;
 }
