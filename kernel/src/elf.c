@@ -1,7 +1,10 @@
 #include "elf.h"
 #include "vga.h"
-#include "kmalloc.h"
 #include "string.h"
+#include "types.h"
+
+#define USER_BASE  0x100000
+#define USER_STACK 0x200000
 
 int elf_validate(void* data) {
     uint8_t* e = (uint8_t*)data;
@@ -27,55 +30,39 @@ int exec_elf(void* data) {
     Elf32_Ehdr* ehdr = (Elf32_Ehdr*)data;
     Elf32_Phdr* phdr = (Elf32_Phdr*)((uint8_t*)data + ehdr->e_phoff);
 
-    uint32_t min_vaddr = 0xFFFFFFFF;
-    uint32_t max_vaddr = 0;
-
+    uint32_t base = 0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type != PT_LOAD)
-            continue;
-
-        if (phdr[i].p_vaddr < min_vaddr)
-            min_vaddr = phdr[i].p_vaddr;
-
-        uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
-        if (end > max_vaddr)
-            max_vaddr = end;
-    }
-
-    uint32_t size = max_vaddr - min_vaddr;
-
-    void* base = kmalloc(size);
-    if (!base) {
-        vga_write_line("Failed to allocate memory");
-        return -1;
-    }
-
-    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type != PT_LOAD)
-            continue;
-
-        void* dest = (uint8_t*)base + (phdr[i].p_vaddr - min_vaddr);
-        void* src = (uint8_t*)data + phdr[i].p_offset;
-
-        memcpy(dest, src, phdr[i].p_filesz);
-
-        if (phdr[i].p_memsz > phdr[i].p_filesz) {
-            memset((uint8_t*)dest + phdr[i].p_filesz, 0,
-                   phdr[i].p_memsz - phdr[i].p_filesz);
+        if (phdr[i].p_type == PT_LOAD) {
+            base = USER_BASE - phdr[i].p_vaddr;
+            break;
         }
     }
 
-    void* stack = kmalloc(16384);
-    uint32_t stack_top = (uint32_t)stack + 16384;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD)
+            continue;
 
-    void* entry = (uint8_t*)base + (ehdr->e_entry - min_vaddr);
+        uint8_t* dest = (uint8_t*)(phdr[i].p_vaddr + base);
+        uint8_t* src  = (uint8_t*)data + phdr[i].p_offset;
+
+        for (uint32_t j = 0; j < phdr[i].p_filesz; j++) {
+            dest[j] = src[j];
+        }
+
+        for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) {
+            dest[j] = 0;
+        }
+    }
+
+    uint32_t entry = ehdr->e_entry + base;
+    uint32_t stack_top = USER_STACK;
 
     __asm__ volatile(
         "movl %0, %%esp\n\t"
         "push %1\n\t"
         "call *%2"
         :
-        : "r"(stack_top), "r"((void*)vga_putc), "r"(entry)
+        : "r"(stack_top), "r"((void*)vga_putc), "r"((void*)entry)
         : "memory"
     );
 

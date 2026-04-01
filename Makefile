@@ -18,7 +18,7 @@ GRUB_INSTALL := $(shell command -v i686-elf-grub-install 2>/dev/null || echo /op
 
 SRC_C := $(wildcard kernel/src/*.c)
 OBJ_C := $(patsubst kernel/src/%.c,$(BUILD_DIR)/%.o,$(SRC_C))
-OBJ_ASM := $(BUILD_DIR)/boot.o $(BUILD_DIR)/gdt_asm.o $(BUILD_DIR)/isr.o
+OBJ_ASM := $(BUILD_DIR)/boot.o $(BUILD_DIR)/gdt_asm.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/isr_syscall.o
 OBJS := $(OBJ_ASM) $(OBJ_C)
 
 .PHONY: all image run clean user
@@ -27,8 +27,12 @@ all: image
 
 user: user/hello.elf
 
+# 🔥 FIXED USER BUILD (CRITICAL)
 user/hello.elf: user/hello.c user/linker.ld
-	$(CC) -ffreestanding -nostdlib -Wl,-T,user/linker.ld -o $@ user/hello.c
+	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
+	-Wl,-T,user/linker.ld \
+	-Wl,-N \
+	-o $@ user/hello.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -40,6 +44,9 @@ $(BUILD_DIR)/gdt_asm.o: kernel/src/gdt_asm.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/isr.o: kernel/src/isr.s | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/isr_syscall.o: kernel/src/isr_syscall.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
