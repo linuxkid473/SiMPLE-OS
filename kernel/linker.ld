@@ -4,8 +4,8 @@ SECTIONS
 {
     . = 1M;
 
-    .multiboot : {
-        *(.multiboot)
+    .stivale2hdr : {
+        KEEP(*(.stivale2hdr))
     }
 
     .text : {

@@ -3,6 +3,7 @@
 
 #include "types.h"
 
+void fb_init(uint32_t* addr, uint32_t width, uint32_t height, uint32_t pitch);
 void vga_clear(void);
 void vga_putc(char c);
 void vga_write(const char* str);

@@ -14,7 +14,9 @@ IMAGE_SIZE_MB := 64
 PART_START_SECTOR := 2048
 PART_SECTOR_COUNT := 129024
 
-GRUB_INSTALL := $(shell command -v i686-elf-grub-install 2>/dev/null || echo /opt/homebrew/Cellar/i686-elf-grub/2.12/i686-elf/sbin/i686-elf-grub-install)
+LIMINE_DIR := $(BUILD_DIR)/limine
+LIMINE_SYS := $(LIMINE_DIR)/limine.sys
+LIMINE_DEPLOY := $(LIMINE_DIR)/limine-deploy
 
 SRC_C := $(wildcard kernel/src/*.c)
 OBJ_C := $(patsubst kernel/src/%.c,$(BUILD_DIR)/%.o,$(SRC_C))
@@ -51,6 +53,16 @@ user/spam.elf: user/spam.c user/linker.ld
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
+$(LIMINE_SYS): | $(BUILD_DIR)
+	mkdir -p $(LIMINE_DIR)
+	curl -sLo $(LIMINE_SYS) https://raw.githubusercontent.com/limine-bootloader/limine/v3.20221230.0-binary/limine.sys
+
+$(LIMINE_DEPLOY): | $(BUILD_DIR)
+	mkdir -p $(LIMINE_DIR)
+	curl -sLo $(LIMINE_DIR)/limine-deploy.c https://raw.githubusercontent.com/limine-bootloader/limine/v3.20221230.0-binary/limine-deploy.c
+	curl -sLo $(LIMINE_DIR)/limine-hdd.h https://raw.githubusercontent.com/limine-bootloader/limine/v3.20221230.0-binary/limine-hdd.h
+	cc -O2 $(LIMINE_DIR)/limine-deploy.c -o $(LIMINE_DEPLOY)
+
 $(BUILD_DIR)/boot.o: kernel/boot.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
@@ -69,34 +81,22 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
 	printf '\x80\x00\x02\x00\x06\xff\xff\xff\x00\x08\x00\x00\x00\xf8\x01\x00' | dd of=$(IMAGE) bs=1 seek=446 conv=notrunc >/dev/null 2>&1; \
 	printf '\x55\xaa' | dd of=$(IMAGE) bs=1 seek=510 conv=notrunc >/dev/null 2>&1; \
 	mkfs.fat -F 16 --offset $(PART_START_SECTOR) $(IMAGE) >/dev/null; \
-	DISK="$$(hdiutil attach -nomount $(IMAGE) | awk 'index($$1, "/dev/disk") == 1 { print $$1; exit }')"; \
-	RDISK="$${DISK/disk/rdisk}"; \
-	MNT="$$(mktemp -d /tmp/simpleos-mnt.XXXX)"; \
-	cleanup() { \
-	  set +e; \
-	  if mount | grep -q "on $$MNT "; then umount "$$MNT" >/dev/null 2>&1 || diskutil unmount force "$${DISK}s1" >/dev/null 2>&1; fi; \
-	  if [ -n "$$MNT" ] && [ -d "$$MNT" ]; then rmdir "$$MNT" >/dev/null 2>&1; fi; \
-	  if [ -n "$$DISK" ]; then hdiutil detach $$DISK >/dev/null 2>&1; fi; \
-	}; \
-	trap cleanup EXIT INT TERM; \
-	mount -t msdos "$${DISK}s1" "$$MNT"; \
-	mkdir -p "$$MNT/boot/grub"; \
-	cp $(KERNEL_ELF) "$$MNT/boot/kernel.bin"; \
-	cp grub/grub.cfg "$$MNT/boot/grub/grub.cfg"; \
-	cp user/hello.elf "$$MNT/hello.elf"; \
-	cp user/test.elf "$$MNT/test.elf"; \
-	cp user/spam.elf "$$MNT/spam.elf"; \
-	"$(GRUB_INSTALL)" --target=i386-pc --boot-directory="$$MNT/boot" --modules="part_msdos fat biosdisk multiboot normal configfile" --no-floppy "$$RDISK" >/dev/null; \
-	sync; \
-	cleanup; \
-	trap - EXIT INT TERM
+	mcopy -i $(IMAGE)@@1048576 $(KERNEL_ELF) ::kernel.bin; \
+	mcopy -i $(IMAGE)@@1048576 grub/limine.conf ::limine.cfg; \
+	mcopy -i $(IMAGE)@@1048576 grub/limine.conf ::limine.conf; \
+	mcopy -i $(IMAGE)@@1048576 $(LIMINE_SYS) ::limine-bios.sys; \
+	mcopy -i $(IMAGE)@@1048576 $(LIMINE_SYS) ::limine.sys; \
+	mcopy -i $(IMAGE)@@1048576 user/hello.elf ::hello.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/test.elf ::test.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/spam.elf ::spam.elf; \
+	$(LIMINE_DEPLOY) $(IMAGE)
 
 run: image
 	qemu-system-x86_64 -drive format=raw,file=$(IMAGE)

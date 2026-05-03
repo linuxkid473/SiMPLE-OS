@@ -53,63 +53,49 @@ void keyboard_read_event(key_event_t* event) {
             continue;
         }
 
-        int released = (scancode & 0x80) != 0;
-        uint8_t code = (uint8_t)(scancode & 0x7F);
-
         if (extended_prefix) {
             extended_prefix = 0;
-            if (released) {
-                continue;
-            }
-
-            if (code == 0x4B) {
-                event->type = KEY_EVENT_LEFT;
-                return;
-            }
-            if (code == 0x4D) {
-                event->type = KEY_EVENT_RIGHT;
-                return;
-            }
-            if (code == 0x48) {
-                event->type = KEY_EVENT_UP;
-                return;
-            }
-            if (code == 0x50) {
-                event->type = KEY_EVENT_DOWN;
-                return;
-            }
-            if (code == 0x53) {
-                event->type = KEY_EVENT_DELETE;
-                return;
-            }
-            continue;
+            if (scancode & 0x80) return;
+            
+            uint8_t code = scancode & 0x7F;
+            if (code == 0x4B) { event->type = KEY_EVENT_LEFT; return; }
+            if (code == 0x4D) { event->type = KEY_EVENT_RIGHT; return; }
+            if (code == 0x48) { event->type = KEY_EVENT_UP; return; }
+            if (code == 0x50) { event->type = KEY_EVENT_DOWN; return; }
+            if (code == 0x53) { event->type = KEY_EVENT_DELETE; return; }
+            return;
         }
 
-        if (code == 0x2A || code == 0x36) {
-            shift_pressed = released ? 0 : 1;
-            continue;
+        if (scancode == 0x2A || scancode == 0x36) {
+            shift_pressed = 1;
+            return;
+        }
+        if (scancode == 0xAA || scancode == 0xB6) {
+            shift_pressed = 0;
+            return;
         }
 
-        if (released) {
-            continue;
-        }
+        if (scancode & 0x80) return;
 
-        if (code == 0x1C) {
+        if (scancode == 0x1C) {
             event->type = KEY_EVENT_ENTER;
             return;
         }
 
-        if (code == 0x0E) {
+        if (scancode == 0x0E) {
             event->type = KEY_EVENT_BACKSPACE;
             return;
         }
 
-        char c = shift_pressed ? shift_keymap[code] : keymap[code];
-        if (c) {
-            event->type = KEY_EVENT_CHAR;
-            event->ch = c;
-            return;
+        if (scancode < 128) {
+            char c = shift_pressed ? shift_keymap[scancode] : keymap[scancode];
+            if (c) {
+                event->type = KEY_EVENT_CHAR;
+                event->ch = c;
+                return;
+            }
         }
+        return;
     }
 }
 
