@@ -19,7 +19,9 @@ void syscall_handler(registers_t* regs) {
             break;
 
         case SYS_EXIT:
-            vga_write_line("sys_exit called");
+            while (1) {
+                __asm__ volatile("hlt");
+            }
             break;
 
         default:

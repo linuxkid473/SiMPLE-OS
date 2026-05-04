@@ -29,13 +29,25 @@ void idt_init(void) {
 
 void sys_write(const char* buf, uint32_t len);
 
+extern uint32_t exit_target;
+extern uint32_t kernel_esp;
+extern int process_exited;
+
 static void syscall_handler(registers_t* regs) {
     switch (regs->eax) {
-        case 1:
-            sys_write((const char*)regs->ecx, regs->edx);
-            break;
-        case 2:
-            break;
+    case 1:
+        sys_write((const char*)regs->ecx, regs->edx);
+        break;
+    case 2:
+        process_exited = 1;
+        __asm__ volatile(
+            "movl %0, %%esp\n\t"
+            "jmp *%1\n\t"
+            :
+            : "r"(kernel_esp), "r"(exit_target)
+            : "memory"
+        );
+        break;
     }
 }
 

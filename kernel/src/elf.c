@@ -7,6 +7,7 @@
 
 // globals for sys_exit
 uint32_t exit_target = 0;
+uint32_t kernel_esp = 0;
 int process_exited = 0;
 
 /* =========================
@@ -72,6 +73,8 @@ int exec_elf(void* data) {
     process_exited = 0;
     exit_target = (uint32_t)&&exit_point;
 
+    __asm__ volatile("movl %%esp, %0" : "=m"(kernel_esp));
+
     __asm__ volatile(
         "movl %0, %%esp\n\t"
         "call *%1\n\t"
@@ -81,6 +84,5 @@ int exec_elf(void* data) {
     );
 
 exit_point:
-    vga_write_line("Returned from program");
-    return 0;
+  return 0;
 }
