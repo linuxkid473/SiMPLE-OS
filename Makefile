@@ -29,21 +29,18 @@ all: image
 
 user: user/hello.elf user/test.elf user/spam.elf
 
-# 🔥 hello
 user/hello.elf: user/hello.c user/linker.ld
 	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
 	-Wl,-T,user/linker.ld \
 	-Wl,-N \
 	-o $@ user/hello.c user/libc.c
 
-# 🔥 test
 user/test.elf: user/test.c user/linker.ld
 	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
 	-Wl,-T,user/linker.ld \
 	-Wl,-N \
 	-o $@ user/test.c user/libc.c
 
-# 🔥 spam
 user/spam.elf: user/spam.c user/linker.ld
 	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
 	-Wl,-T,user/linker.ld \
@@ -99,7 +96,7 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf $(LIMINE_SYS) $(
 	$(LIMINE_DEPLOY) $(IMAGE)
 
 run: image
-	qemu-system-x86_64 -drive format=raw,file=$(IMAGE)
+	qemu-system-x86_64 -drive format=raw,file=$(IMAGE) -serial stdio -no-reboot -no-shutdown
 
 clean:
 	rm -rf $(BUILD_DIR) $(IMAGE)
