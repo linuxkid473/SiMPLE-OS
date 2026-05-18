@@ -28,13 +28,11 @@ static int32_t draw_off_y = 0;
 /*
  * Cell backing buffer — stores every character and colour written via
  * draw_char() so the WM can repaint the terminal content after the
- * window is moved without needing a full off-screen framebuffer.
- * Sized for the largest reasonable client area.
+ * window is moved.  TERM_CELL_COLS/ROWS come from vga.h and are shared
+ * with the term_session_t struct so sizes always agree.
  */
-#define WM_CELL_COLS 80
-#define WM_CELL_ROWS 60
-static char    cell_chars [WM_CELL_ROWS][WM_CELL_COLS];
-static uint8_t cell_colors[WM_CELL_ROWS][WM_CELL_COLS];
+static char    cell_chars [TERM_CELL_ROWS][TERM_CELL_COLS];
+static uint8_t cell_colors[TERM_CELL_ROWS][TERM_CELL_COLS];
 
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
@@ -121,8 +119,8 @@ void vga_set_client(int off_x, int off_y, uint32_t cols, uint32_t rows) {
  */
 void vga_repaint_cells(void) {
     if (!fb_addr) return;
-    for (uint32_t r = 0; r < fb_rows && r < WM_CELL_ROWS; r++) {
-        for (uint32_t c = 0; c < fb_cols && c < WM_CELL_COLS; c++) {
+    for (uint32_t r = 0; r < fb_rows && r < TERM_CELL_ROWS; r++) {
+        for (uint32_t c = 0; c < fb_cols && c < TERM_CELL_COLS; c++) {
             uint8_t col = cell_colors[r][c];
             draw_char_rgb(
                 cell_chars[r][c],
@@ -198,7 +196,7 @@ static void draw_char(char c, uint32_t col, uint32_t row, uint8_t color) {
         return;
     }
     /* Store to cell buffer for later repaint */
-    if (row < WM_CELL_ROWS && col < WM_CELL_COLS) {
+    if (row < TERM_CELL_ROWS && col < TERM_CELL_COLS) {
         cell_chars [row][col] = c;
         cell_colors[row][col] = color;
     }
@@ -243,13 +241,13 @@ static void vga_scroll(void) {
         }
 
         /* Mirror the scroll in the cell buffer */
-        for (uint32_t r = 0; r + 1 < max_rows && r + 1 < WM_CELL_ROWS; r++) {
-            for (uint32_t c = 0; c < max_cols && c < WM_CELL_COLS; c++) {
+        for (uint32_t r = 0; r + 1 < max_rows && r + 1 < TERM_CELL_ROWS; r++) {
+            for (uint32_t c = 0; c < max_cols && c < TERM_CELL_COLS; c++) {
                 cell_chars [r][c] = cell_chars [r + 1][c];
                 cell_colors[r][c] = cell_colors[r + 1][c];
             }
         }
-        for (uint32_t c = 0; c < max_cols && c < WM_CELL_COLS; c++) {
+        for (uint32_t c = 0; c < max_cols && c < TERM_CELL_COLS; c++) {
             cell_chars [max_rows - 1][c] = ' ';
             cell_colors[max_rows - 1][c] = vga_color;
         }
@@ -265,6 +263,70 @@ static void vga_scroll(void) {
     }
 
     cursor_row = max_rows - 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Multi-instance terminal session support                            */
+/* ------------------------------------------------------------------ */
+
+void vga_init_session(term_session_t *s) {
+    uint32_t r, c;
+    for (r = 0; r < TERM_CELL_ROWS; r++)
+        for (c = 0; c < TERM_CELL_COLS; c++) {
+            s->cell_chars [r][c] = ' ';
+            s->cell_colors[r][c] = 0x0F;
+        }
+    s->cursor_row = 0;
+    s->cursor_col = 0;
+    s->vga_color  = 0x0F;
+    s->fb_cols    = 80;
+    s->fb_rows    = 49;    /* matches terminal window client height / 8 */
+    s->draw_off_x = 0;
+    s->draw_off_y = 0;
+}
+
+void vga_save_session(term_session_t *s) {
+    memcpy(s->cell_chars,  cell_chars,  sizeof(cell_chars));
+    memcpy(s->cell_colors, cell_colors, sizeof(cell_colors));
+    s->cursor_row = cursor_row;
+    s->cursor_col = cursor_col;
+    s->vga_color  = vga_color;
+    s->fb_cols    = fb_cols;
+    s->fb_rows    = fb_rows;
+    s->draw_off_x = draw_off_x;
+    s->draw_off_y = draw_off_y;
+}
+
+void vga_restore_session(const term_session_t *s) {
+    memcpy(cell_chars,  s->cell_chars,  sizeof(cell_chars));
+    memcpy(cell_colors, s->cell_colors, sizeof(cell_colors));
+    cursor_row = s->cursor_row;
+    cursor_col = s->cursor_col;
+    vga_color  = s->vga_color;
+    fb_cols    = s->fb_cols;
+    fb_rows    = s->fb_rows;
+    draw_off_x = s->draw_off_x;
+    draw_off_y = s->draw_off_y;
+}
+
+/*
+ * Render s's cell buffer directly to screen at s->draw_off_x/y.
+ * Leaves global state untouched — used to paint inactive terminal windows.
+ */
+void vga_repaint_session(const term_session_t *s) {
+    if (!fb_addr) return;
+    for (uint32_t r = 0; r < s->fb_rows && r < TERM_CELL_ROWS; r++) {
+        for (uint32_t c = 0; c < s->fb_cols && c < TERM_CELL_COLS; c++) {
+            uint8_t col = s->cell_colors[r][c];
+            draw_char_rgb(
+                s->cell_chars[r][c],
+                s->draw_off_x + (int)(c * 8),
+                s->draw_off_y + (int)(r * 8),
+                vga_palette[col & 0x0F],
+                vga_palette[(col >> 4) & 0x0F]
+            );
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */

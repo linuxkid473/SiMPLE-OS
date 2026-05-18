@@ -8,8 +8,7 @@
  * Global window state
  * ================================================================ */
 wm_window_t wm_windows[WM_MAX_WINDOWS];
-int         wm_active       = 0;
-int         wm_window_count = 0;
+int         wm_active = 0;
 
 static int scr_w;
 static int scr_h;
@@ -42,7 +41,7 @@ static int launcher_open = 0;
 #define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
 #define LNCHR_MENU_W  100
 #define LNCHR_ITEM_H   16
-#define LNCHR_NITEMS    2   /* STerm, Calculator; add entries here for more apps */
+#define LNCHR_NITEMS    3   /* STerm, Calculator, SText; add entries here for more apps */
 
 /* ================================================================
  * Calculator button grid
@@ -118,6 +117,7 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 #define COL_MENU_BG       0x1A1A33   /* launcher dropdown background       */
 #define COL_MENU_BD       0x888888   /* launcher dropdown border           */
 #define COL_MENU_FG       0xFFFFFF   /* launcher menu item text            */
+#define COL_STEXT_FG      0xCCCCCC   /* SText editor text colour           */
 
 /* ================================================================
  * Calculator state machine
@@ -139,7 +139,15 @@ typedef struct {
     int     state;          /* 0-3 as above                        */
 } calc_state_t;
 
-static calc_state_t calc;
+/* Instance pools — fixed arrays, no heap.
+ * 'used[i]' tracks whether slot i is live; the window's .instance field
+ * is the index into the matching pool. */
+static calc_state_t calc_instances[WM_MAX_CALC_INST];
+static int          calc_used[WM_MAX_CALC_INST];
+static calc_state_t *calc;   /* points to the currently-active instance */
+
+static term_session_t term_sessions[WM_MAX_TERM_INST];
+static int            term_used[WM_MAX_TERM_INST];
 
 /* ---- calc helpers ---- */
 
@@ -175,107 +183,110 @@ static void calc_build_display(char *out, int cap) {
     int  len = 0;
     out[0] = '\0';
 
-    if (calc.state == 3) {
+    if (calc->state == 3) {
         str_cat(out, 0, cap, "ERR: div/0");
         return;
     }
-    if (calc.state == 2) {                      /* show result */
-        i32_to_str(calc.left_val, tmp, sizeof(tmp));
+    if (calc->state == 2) {                      /* show result */
+        i32_to_str(calc->left_val, tmp, sizeof(tmp));
         str_cat(out, 0, cap, tmp);
         return;
     }
-    if (calc.state == 0) {                      /* entering left */
-        if (calc.num_len == 0) { out[0] = '0'; out[1] = '\0'; return; }
-        for (int i = 0; i < calc.num_len && len + 1 < cap; i++)
-            out[len++] = calc.num_buf[i];
+    if (calc->state == 0) {                      /* entering left */
+        if (calc->num_len == 0) { out[0] = '0'; out[1] = '\0'; return; }
+        for (int i = 0; i < calc->num_len && len + 1 < cap; i++)
+            out[len++] = calc->num_buf[i];
         out[len] = '\0';
         return;
     }
     /* state == 1: entering right — show "left op [right]" */
-    i32_to_str(calc.left_val, tmp, sizeof(tmp));
+    i32_to_str(calc->left_val, tmp, sizeof(tmp));
     len = str_cat(out, 0, cap, tmp);
-    if (calc.op && len + 1 < cap) out[len++] = calc.op;
+    if (calc->op && len + 1 < cap) out[len++] = calc->op;
     out[len] = '\0';
-    for (int i = 0; i < calc.num_len && len + 1 < cap; i++)
-        out[len++] = calc.num_buf[i];
+    for (int i = 0; i < calc->num_len && len + 1 < cap; i++)
+        out[len++] = calc->num_buf[i];
     out[len] = '\0';
 }
 
-static void calc_clear(void) {
-    calc.left_val   = 0;
-    calc.op         = 0;
-    calc.num_buf[0] = '0';
-    calc.num_len    = 1;
-    calc.state      = 0;
+static void calc_clear_inst(calc_state_t *c) {
+    c->left_val   = 0;
+    c->op         = 0;
+    c->num_buf[0] = '0';
+    c->num_len    = 1;
+    c->state      = 0;
 }
+
+static void calc_clear(void) { calc_clear_inst(calc); }
 
 static int32_t calc_parse_num(void) {
     int32_t v = 0;
-    for (int i = 0; i < calc.num_len; i++)
-        v = v * 10 + (calc.num_buf[i] - '0');
+    for (int i = 0; i < calc->num_len; i++)
+        v = v * 10 + (calc->num_buf[i] - '0');
     return v;
 }
 
 static void calc_compute(int32_t right) {
-    if (calc.op == '+') calc.left_val += right;
-    else if (calc.op == '-') calc.left_val -= right;
-    else if (calc.op == '*') calc.left_val *= right;
-    else if (calc.op == '/') {
-        if (right == 0) { calc.state = 3; return; }
-        calc.left_val /= right;
+    if (calc->op == '+') calc->left_val += right;
+    else if (calc->op == '-') calc->left_val -= right;
+    else if (calc->op == '*') calc->left_val *= right;
+    else if (calc->op == '/') {
+        if (right == 0) { calc->state = 3; return; }
+        calc->left_val /= right;
     }
 }
 
 static void calc_digit(int d) {
     /* Fresh start after result or error */
-    if (calc.state == 2 || calc.state == 3) calc_clear();
+    if (calc->state == 2 || calc->state == 3) calc_clear();
 
     /* Leading-zero suppression: "0" + non-zero → replace */
-    if (calc.num_len == 1 && calc.num_buf[0] == '0') {
-        if (d != 0) calc.num_buf[0] = (char)('0' + d);
+    if (calc->num_len == 1 && calc->num_buf[0] == '0') {
+        if (d != 0) calc->num_buf[0] = (char)('0' + d);
         return;
     }
-    if (calc.num_len < 10)
-        calc.num_buf[calc.num_len++] = (char)('0' + d);
+    if (calc->num_len < 10)
+        calc->num_buf[calc->num_len++] = (char)('0' + d);
 }
 
 static void calc_operator(char op) {
-    if (calc.state == 3) { calc_clear(); }
+    if (calc->state == 3) { calc_clear(); }
 
-    if (calc.state == 1 && calc.num_len > 0) {
+    if (calc->state == 1 && calc->num_len > 0) {
         calc_compute(calc_parse_num());
-        if (calc.state == 3) return;
-    } else if (calc.state == 0 && calc.num_len > 0) {
-        calc.left_val = calc_parse_num();
+        if (calc->state == 3) return;
+    } else if (calc->state == 0 && calc->num_len > 0) {
+        calc->left_val = calc_parse_num();
     }
 
-    calc.op      = op;
-    calc.num_len = 0;
-    calc.state   = 1;
+    calc->op      = op;
+    calc->num_len = 0;
+    calc->state   = 1;
 }
 
 static void calc_equals(void) {
-    if (calc.state != 1 || calc.num_len == 0) return;
+    if (calc->state != 1 || calc->num_len == 0) return;
     calc_compute(calc_parse_num());
-    if (calc.state != 3) {
-        calc.op      = 0;
-        calc.num_len = 0;
-        calc.state   = 2;
+    if (calc->state != 3) {
+        calc->op      = 0;
+        calc->num_len = 0;
+        calc->state   = 2;
     }
 }
 
 static void calc_backspace(void) {
-    if (calc.state == 2 || calc.state == 3) { calc_clear(); return; }
-    if (calc.num_len > 1) {
-        calc.num_len--;
+    if (calc->state == 2 || calc->state == 3) { calc_clear(); return; }
+    if (calc->num_len > 1) {
+        calc->num_len--;
     } else {
-        calc.num_buf[0] = '0';
-        calc.num_len    = 1;
+        calc->num_buf[0] = '0';
+        calc->num_len    = 1;
     }
 }
 
 /* Public: keyboard input to calculator (also called on button click). */
 void wm_calc_handle_char(char c) {
+    calc = &calc_instances[wm_windows[wm_active].instance];
     if      (c == 'c' || c == 'C')                  calc_clear();
     else if (c >= '0' && c <= '9')                   calc_digit(c - '0');
     else if (c == '+' || c == '-' ||
@@ -284,6 +295,152 @@ void wm_calc_handle_char(char c) {
     else if (c == '\b')                              calc_backspace();
 
     wm_draw_all();
+}
+
+/* ================================================================
+ * SText — simple text editor state
+ *
+ * Each SText instance has its own stext_inst_t.  The static pointer
+ * `si` is updated before any editor operation or render call to point
+ * at the right instance, so all the helper functions below remain
+ * unchanged.
+ *
+ * Window client area: 44 visible columns × 16 visible rows.
+ * Up to STEXT_MAX_ROWS lines stored per instance.
+ * ================================================================ */
+#define STEXT_VIS_COLS  44
+#define STEXT_VIS_ROWS  16
+#define STEXT_MAX_ROWS  64
+
+typedef struct {
+    char buf[STEXT_MAX_ROWS][STEXT_VIS_COLS + 1];
+    int  nlines, cx, cy, scroll;
+} stext_inst_t;
+
+static stext_inst_t stext_instances[WM_MAX_STEXT_INST];
+static int          stext_used[WM_MAX_STEXT_INST];
+static stext_inst_t *si;   /* points to the currently-active stext instance */
+
+static void stext_init_inst(stext_inst_t *s) {
+    int i;
+    for (i = 0; i < STEXT_MAX_ROWS; i++) s->buf[i][0] = '\0';
+    s->nlines = 1;
+    s->cx = s->cy = s->scroll = 0;
+}
+
+/* After moving the cursor, ensure it stays within the visible band. */
+static void stext_clamp_scroll(void) {
+    if (si->cy < si->scroll)
+        si->scroll = si->cy;
+    if (si->cy >= si->scroll + STEXT_VIS_ROWS)
+        si->scroll = si->cy - STEXT_VIS_ROWS + 1;
+}
+
+/* Copy row src into row dst (includes NUL). */
+static void stext_copy_row(int dst, int src) {
+    int j;
+    for (j = 0; j <= STEXT_VIS_COLS; j++)
+        si->buf[dst][j] = si->buf[src][j];
+}
+
+static void stext_insert_char(char c) {
+    int len = (int)strlen(si->buf[si->cy]);
+    int i;
+    if (len >= STEXT_VIS_COLS) return;   /* line full — silently clamp */
+    for (i = len; i >= si->cx; i--)
+        si->buf[si->cy][i + 1] = si->buf[si->cy][i];
+    si->buf[si->cy][si->cx] = c;
+    si->cx++;
+}
+
+static void stext_backspace(void) {
+    int len, prev_len, cur_len, i;
+    if (si->cx > 0) {
+        len = (int)strlen(si->buf[si->cy]);
+        for (i = si->cx - 1; i < len; i++)
+            si->buf[si->cy][i] = si->buf[si->cy][i + 1];
+        si->cx--;
+    } else if (si->cy > 0) {
+        prev_len = (int)strlen(si->buf[si->cy - 1]);
+        cur_len  = (int)strlen(si->buf[si->cy]);
+        if (prev_len + cur_len <= STEXT_VIS_COLS) {
+            /* Append current line onto previous line */
+            for (i = 0; i <= cur_len; i++)
+                si->buf[si->cy - 1][prev_len + i] = si->buf[si->cy][i];
+            /* Shift remaining lines up */
+            for (i = si->cy; i + 1 < si->nlines; i++)
+                stext_copy_row(i, i + 1);
+            si->buf[si->nlines - 1][0] = '\0';
+            si->nlines--;
+            si->cy--;
+            si->cx = prev_len;
+            stext_clamp_scroll();
+        }
+        /* If lines would overflow after merge, do nothing (safe no-op) */
+    }
+}
+
+static void stext_newline(void) {
+    int cx = si->cx;
+    int cy = si->cy;
+    int tail, i;
+    if (si->nlines >= STEXT_MAX_ROWS) return;
+    /* Shift lines below the cursor down by one */
+    for (i = si->nlines; i > cy + 1; i--)
+        stext_copy_row(i, i - 1);
+    /* New line = tail of the current line from cursor onward */
+    tail = (int)strlen(si->buf[cy]) - cx;
+    for (i = 0; i <= tail; i++)
+        si->buf[cy + 1][i] = si->buf[cy][cx + i];
+    /* Truncate current line at cursor */
+    si->buf[cy][cx] = '\0';
+    si->nlines++;
+    si->cy++;
+    si->cx = 0;
+    stext_clamp_scroll();
+}
+
+static void stext_delete_fwd(void) {
+    int len = (int)strlen(si->buf[si->cy]);
+    int i;
+    if (si->cx < len) {
+        for (i = si->cx; i < len; i++)
+            si->buf[si->cy][i] = si->buf[si->cy][i + 1];
+    }
+    /* Delete at EOL with no line merge — keep it simple */
+}
+
+static void stext_move(int key_type) {
+    int new_len;
+    if (key_type == KEY_EVENT_LEFT) {
+        if (si->cx > 0) {
+            si->cx--;
+        } else if (si->cy > 0) {
+            si->cy--;
+            si->cx = (int)strlen(si->buf[si->cy]);
+        }
+    } else if (key_type == KEY_EVENT_RIGHT) {
+        int len = (int)strlen(si->buf[si->cy]);
+        if (si->cx < len) {
+            si->cx++;
+        } else if (si->cy + 1 < si->nlines) {
+            si->cy++;
+            si->cx = 0;
+        }
+    } else if (key_type == KEY_EVENT_UP) {
+        if (si->cy > 0) {
+            si->cy--;
+            new_len = (int)strlen(si->buf[si->cy]);
+            if (si->cx > new_len) si->cx = new_len;
+        }
+    } else if (key_type == KEY_EVENT_DOWN) {
+        if (si->cy + 1 < si->nlines) {
+            si->cy++;
+            new_len = (int)strlen(si->buf[si->cy]);
+            if (si->cx > new_len) si->cx = new_len;
+        }
+    }
+    stext_clamp_scroll();
 }
 
 /* ================================================================
@@ -362,6 +519,8 @@ static void draw_calc_content(wm_window_t *w) {
     int cy = w->y + WM_TITLEBAR_H;
     int cw = w->width - 2 * WM_BORDER;   /* = 158 */
 
+    calc = &calc_instances[w->instance];   /* select this window's calc state */
+
     /* Display box: 4-px inset from client edges, 20 px tall */
     fb_fill_rect(cx + 4, cy + 4, cw - 8, 20, COL_DISPBG);
     char disp[32];
@@ -373,6 +532,39 @@ static void draw_calc_content(wm_window_t *w) {
         draw_calc_button(cx + calc_btns[i].rx,
                          cy + calc_btns[i].ry,
                          calc_btns[i].label);
+}
+
+/* ================================================================
+ * SText GUI rendering
+ * ================================================================ */
+
+static void draw_stext_content(wm_window_t *w) {
+    /* Text area: 4-px padding inside client area, 8 px per character cell */
+    int cx = w->x + WM_BORDER + 4;
+    int cy = w->y + WM_TITLEBAR_H + 4;
+    int r, line_idx;
+
+    si = &stext_instances[w->instance];    /* select this window's editor state */
+
+    /* Draw each visible row */
+    for (r = 0; r < STEXT_VIS_ROWS; r++) {
+        line_idx = si->scroll + r;
+        int ty   = cy + r * 8;
+        if (line_idx < si->nlines)
+            fb_draw_string_px(cx, ty, si->buf[line_idx], COL_STEXT_FG, COL_CLIENTBG);
+        /* Lines below si->nlines are already black from chrome fill — skip */
+    }
+
+    /* Cursor: invert the character cell under the cursor */
+    int vis_row = si->cy - si->scroll;
+    if (vis_row >= 0 && vis_row < STEXT_VIS_ROWS) {
+        char cur_ch[2];
+        cur_ch[0] = si->buf[si->cy][si->cx];
+        if (!cur_ch[0]) cur_ch[0] = ' ';
+        cur_ch[1] = '\0';
+        fb_draw_string_px(cx + si->cx * 8, cy + vis_row * 8,
+                          cur_ch, COL_CLIENTBG, COL_STEXT_FG);
+    }
 }
 
 /* ================================================================
@@ -406,6 +598,9 @@ static void draw_launcher(void) {
     /* item 1: Calculator */
     fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
                       "Calculator", COL_MENU_FG, COL_MENU_BG);
+    /* item 2: SText */
+    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 2 * LNCHR_ITEM_H + 4,
+                      "SText", COL_MENU_FG, COL_MENU_BG);
 }
 
 /* ================================================================
@@ -448,51 +643,125 @@ static int point_in_close_btn(const wm_window_t *w, int px, int py) {
 }
 
 /* ================================================================
- * Window lifecycle helpers
+ * Window / instance lifecycle helpers
  * ================================================================ */
 
-/* Close a window: hide it and transfer focus to another visible window. */
+/* Find a free slot in a used[] array of length max.  Returns index or -1. */
+static int alloc_inst(int *used, int max) {
+    int i;
+    for (i = 0; i < max; i++)
+        if (!used[i]) { used[i] = 1; return i; }
+    return -1;
+}
+
+static void free_inst(int *used, int idx) { used[idx] = 0; }
+
+/*
+ * Change focus to new_idx, saving / restoring terminal sessions as needed.
+ * Always safe to call even when old wm_active is hidden.
+ */
+static void wm_set_active(int new_idx) {
+    /* Save outgoing terminal session into its struct */
+    if (!wm_windows[wm_active].hidden &&
+        wm_windows[wm_active].type == WM_TYPE_TERMINAL)
+        vga_save_session(&term_sessions[wm_windows[wm_active].instance]);
+
+    wm_active = new_idx;
+
+    /* Restore incoming terminal session into globals */
+    if (!wm_windows[new_idx].hidden &&
+        wm_windows[new_idx].type == WM_TYPE_TERMINAL) {
+        vga_restore_session(&term_sessions[wm_windows[new_idx].instance]);
+        sync_terminal_client(&wm_windows[new_idx]);
+    }
+}
+
+/*
+ * Spawn a new window of the given type.  Finds a free window slot and a
+ * free instance slot; initialises both; transfers focus.  Silent no-op
+ * if either pool is exhausted.
+ */
+static void wm_spawn(wm_win_type_t type) {
+    int wi, inst, offset;
+    wm_window_t *w;
+
+    /* Find a free window slot (hidden == 1 means free) */
+    wi = -1;
+    { int i; for (i = 0; i < WM_MAX_WINDOWS; i++)
+        if (wm_windows[i].hidden) { wi = i; break; } }
+    if (wi < 0) return;
+
+    /* Allocate an instance slot and initialise it */
+    if (type == WM_TYPE_TERMINAL) {
+        inst = alloc_inst(term_used, WM_MAX_TERM_INST);
+        if (inst < 0) return;
+        vga_init_session(&term_sessions[inst]);
+    } else if (type == WM_TYPE_CALC) {
+        inst = alloc_inst(calc_used, WM_MAX_CALC_INST);
+        if (inst < 0) return;
+        calc_clear_inst(&calc_instances[inst]);
+    } else {
+        inst = alloc_inst(stext_used, WM_MAX_STEXT_INST);
+        if (inst < 0) return;
+        stext_init_inst(&stext_instances[inst]);
+    }
+
+    /* Cascade multiple windows of the same type so they don't overlap exactly */
+    offset = inst * 24;
+
+    w           = &wm_windows[wi];
+    w->type     = type;
+    w->instance = inst;
+    w->hidden   = 0;
+
+    if (type == WM_TYPE_TERMINAL) {
+        w->x = 2 + offset;  w->y = 2 + offset;
+        w->width = WM_TERM_W;  w->height = WM_TERM_H;
+        w->title = "STerm";
+    } else if (type == WM_TYPE_CALC) {
+        w->x = (scr_w - WM_CALC_W)  / 2 + offset;
+        w->y = (scr_h - WM_CALC_H)  / 2 + offset;
+        w->width = WM_CALC_W;  w->height = WM_CALC_H;
+        w->title = "Calculator";
+    } else {
+        w->x = (scr_w - WM_STEXT_W) / 2 + offset;
+        w->y = (scr_h - WM_STEXT_H) / 2 + offset;
+        w->width = WM_STEXT_W;  w->height = WM_STEXT_H;
+        w->title = "SText";
+    }
+
+    wm_set_active(wi);
+}
+
+/*
+ * Close a window: free its instance slot, hide it, transfer focus.
+ */
 static void wm_close_window(int idx) {
-    wm_windows[idx].hidden = 1;
+    wm_window_t *w = &wm_windows[idx];
+
+    /* Free the instance back to its pool */
+    if (w->type == WM_TYPE_TERMINAL)
+        free_inst(term_used, w->instance);
+    else if (w->type == WM_TYPE_CALC)
+        free_inst(calc_used, w->instance);
+    else
+        free_inst(stext_used, w->instance);
+
+    w->hidden = 1;
 
     /* Cancel any active drag on this window */
-    if (drag_win_idx == idx) {
-        drag_active  = 0;
-        drag_win_idx = -1;
-    }
+    if (drag_win_idx == idx) { drag_active = 0; drag_win_idx = -1; }
 
     /* Transfer focus if this was the active window */
     if (wm_active == idx) {
-        wm_active = 0;   /* default: slot 0 (may be hidden — safe via guard) */
-        for (int i = 0; i < wm_window_count; i++) {
-            if (!wm_windows[i].hidden) {
-                wm_active = i;
-                break;
-            }
-        }
+        int i, found = -1;
+        for (i = 0; i < WM_MAX_WINDOWS; i++)
+            if (!wm_windows[i].hidden) { found = i; break; }
+        /* If no visible window exists, keep wm_active = idx (now hidden);
+         * wm_active_is_terminal() returns 1 for hidden → input safe. */
+        if (found >= 0)
+            wm_set_active(found);
     }
-}
-
-/* Make the terminal visible and bring it into focus. */
-static void wm_launch_term(void) {
-    if (wm_windows[0].hidden) {
-        wm_windows[0].hidden = 0;
-        /* Restore to default position if first launch */
-    }
-    wm_active = 0;
-}
-
-/* Make the calculator visible and bring it into focus.
- * If already visible, just focus it (don't re-position). */
-static void wm_launch_calc(void) {
-    /* Slot 1 is always reserved for the calculator */
-    if (wm_windows[1].hidden) {
-        wm_windows[1].hidden = 0;
-        /* Centre on screen for a nice first appearance */
-        wm_windows[1].x = (scr_w - WM_CALC_W) / 2;
-        wm_windows[1].y = (scr_h - WM_CALC_H) / 2;
-    }
-    wm_active = 1;
 }
 
 /* ================================================================
@@ -507,12 +776,14 @@ static void handle_client_click(wm_window_t *w, int x, int y) {
     int cx = w->x + WM_BORDER;
     int cy = w->y + WM_TITLEBAR_H;
 
+    /* Point calc at this window's instance before dispatching */
+    calc = &calc_instances[w->instance];
+
     for (int i = 0; i < CALC_NCOLS * CALC_NROWS; i++) {
         int bx = cx + calc_btns[i].rx;
         int by = cy + calc_btns[i].ry;
         if (x >= bx && x < bx + CALC_BTN_W &&
             y >= by && y < by + CALC_BTN_H) {
-            /* wm_calc_handle_char updates calc state and calls wm_draw_all() */
             wm_calc_handle_char(calc_btns[i].action);
             return;
         }
@@ -552,9 +823,11 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 /* Which item did the user click? */
                 int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
                 if (item == 0) {        /* "STerm" */
-                    wm_launch_term();
+                    wm_spawn(WM_TYPE_TERMINAL);
                 } else if (item == 1) { /* "Calculator" */
-                    wm_launch_calc();
+                    wm_spawn(WM_TYPE_CALC);
+                } else if (item == 2) { /* "SText" */
+                    wm_spawn(WM_TYPE_STEXT);
                 }
                 launcher_open = 0;
                 launcher_handled = 1;
@@ -570,7 +843,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
             int order[WM_MAX_WINDOWS];
             int n = 0;
             order[n++] = wm_active;
-            for (int i = 0; i < wm_window_count; i++)
+            for (int i = 0; i < WM_MAX_WINDOWS; i++)
                 if (i != wm_active) order[n++] = i;
 
             for (int oi = 0; oi < n; oi++) {
@@ -578,7 +851,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 if (wm_windows[i].hidden) continue;
                 if (!point_in_window(&wm_windows[i], x, y)) continue;
 
-                wm_active = i;
+                wm_set_active(i);
 
                 if (point_in_titlebar(&wm_windows[i], x, y)) {
                     if (point_in_close_btn(&wm_windows[i], x, y)) {
@@ -632,43 +905,57 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
  * the terminal window, so subsequent vga_putc() calls land there.
  * ================================================================ */
 void wm_draw_all(void) {
-    /*
-     * Always sync the terminal client geometry so fb_cols/fb_rows are
-     * correct for vga_putc even when the terminal window is hidden.
-     */
-    sync_terminal_client(&wm_windows[0]);
-
     fb_fill_rect(0, 0, scr_w, scr_h, COL_DESKTOP);
 
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < wm_window_count; i++) {
-            if (wm_windows[i].hidden) continue;           /* skip hidden */
-            if ((i == wm_active) != (pass == 1)) continue;  /* z-order   */
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (wm_windows[i].hidden) continue;
+            if ((i == wm_active) != (pass == 1)) continue;
 
             wm_window_t *w = &wm_windows[i];
             draw_window_chrome(w, (i == wm_active));
 
             if (w->type == WM_TYPE_TERMINAL) {
-                sync_terminal_client(w);
-                vga_repaint_cells();
+                if (i == wm_active) {
+                    /*
+                     * Active terminal: globals already hold this session's
+                     * state (maintained by wm_set_active).  Just update the
+                     * draw offset in case the window was moved, then repaint.
+                     */
+                    sync_terminal_client(w);
+                    vga_repaint_cells();
+                } else {
+                    /*
+                     * Inactive terminal: paint directly from the saved session
+                     * without touching global state, so the active terminal's
+                     * cursor / cell buffer are preserved.
+                     */
+                    term_session_t *ts = &term_sessions[w->instance];
+                    ts->draw_off_x = w->x + WM_BORDER;
+                    ts->draw_off_y = w->y + WM_TITLEBAR_H;
+                    ts->fb_cols    = (uint32_t)((w->width  - 2*WM_BORDER) / 8);
+                    ts->fb_rows    = (uint32_t)((w->height - WM_TITLEBAR_H - WM_BORDER) / 8);
+                    vga_repaint_session(ts);
+                }
             } else if (w->type == WM_TYPE_CALC) {
                 draw_calc_content(w);
+            } else if (w->type == WM_TYPE_STEXT) {
+                draw_stext_content(w);
             }
         }
     }
+
     /*
      * vga_set_client guarantee:
-     * The terminal is drawn in exactly one pass. sync_terminal_client()
-     * is the last call for it. If the terminal is active (pass 1) it is
-     * drawn last — client is set correctly. If it is inactive (pass 0)
-     * it is drawn before the active window; the active window uses only
-     * fb_fill_rect / fb_draw_string_px and never calls vga_set_client(),
-     * so the terminal's settings survive. If the calculator is hidden,
-     * the terminal is drawn in pass 1 as the sole visible window.
+     * wm_set_active() calls sync_terminal_client() whenever focus moves to
+     * a terminal, so globals always reflect the focused terminal.  The
+     * active terminal also calls sync_terminal_client() above to refresh the
+     * draw offset if the window moved.  Non-terminal focus paths leave the
+     * last active terminal's settings intact so vga_putc still works.
      */
 
-    draw_launcher();                               /* always on top of windows */
-    draw_cursor(mouse_get_x(), mouse_get_y());     /* absolute topmost         */
+    draw_launcher();
+    draw_cursor(mouse_get_x(), mouse_get_y());
 }
 
 /* ================================================================
@@ -676,33 +963,28 @@ void wm_draw_all(void) {
  * ================================================================ */
 
 void wm_init(int sw, int sh) {
+    int i;
     scr_w         = sw;
     scr_h         = sh;
     launcher_open = 0;
 
-    calc_clear();
+    /* Mark all window slots as free */
+    for (i = 0; i < WM_MAX_WINDOWS; i++) wm_windows[i].hidden = 1;
 
-    /* Window 0: Terminal — large, starts at top-left */
-    wm_windows[0].x      = 2;
-    wm_windows[0].y      = 2;
-    wm_windows[0].width  = WM_TERM_W;
-    wm_windows[0].height = WM_TERM_H;
-    wm_windows[0].title  = "Terminal";
-    wm_windows[0].type   = WM_TYPE_TERMINAL;
-    wm_windows[0].hidden = 1;   /* hidden at boot; launched via Apps → STerm */
+    /* Clear all instance pools */
+    for (i = 0; i < WM_MAX_TERM_INST;  i++) { term_used[i]  = 0; vga_init_session(&term_sessions[i]); }
+    for (i = 0; i < WM_MAX_CALC_INST;  i++) { calc_used[i]  = 0; calc_clear_inst(&calc_instances[i]); }
+    for (i = 0; i < WM_MAX_STEXT_INST; i++) { stext_used[i] = 0; stext_init_inst(&stext_instances[i]); }
 
-    /* Window 1: Calculator — hidden at boot; launched via Apps menu.
-     * Position is set when wm_launch_calc() first shows it. */
-    wm_windows[1].x      = (sw - WM_CALC_W) / 2;
-    wm_windows[1].y      = (sh - WM_CALC_H) / 2;
-    wm_windows[1].width  = WM_CALC_W;
-    wm_windows[1].height = WM_CALC_H;
-    wm_windows[1].title  = "Calculator";
-    wm_windows[1].type   = WM_TYPE_CALC;
-    wm_windows[1].hidden = 1;    /* <-- not shown until Apps → Calculator */
+    /* Safe default current-instance pointers (updated by wm_spawn / key handlers) */
+    calc = &calc_instances[0];
+    si   = &stext_instances[0];
 
-    wm_active       = 0;   /* points to terminal slot; hidden at boot — safe via wm_active_is_terminal() guard */
-    wm_window_count = 2;   /* total allocated slots; hidden ones still count */
+    /* wm_active must be a valid index before wm_set_active's save check runs */
+    wm_active = 0;
+
+    /* Auto-spawn the initial terminal so the shell has somewhere to write */
+    wm_spawn(WM_TYPE_TERMINAL);
 
     wm_draw_all();
 }
@@ -735,10 +1017,12 @@ void wm_handle_key(int key_type) {
 void wm_tab_switch(void) {
     /* Skip hidden windows so Alt+Tab only cycles visible ones. */
     int start = wm_active;
-    int next  = (wm_active + 1) % wm_window_count;
+    int next  = (wm_active + 1) % WM_MAX_WINDOWS;
     while (next != start && wm_windows[next].hidden)
-        next = (next + 1) % wm_window_count;
-    wm_active = next;   /* if all others are hidden, stays on current */
+        next = (next + 1) % WM_MAX_WINDOWS;
+    /* If all others are hidden, next == start — stays on current (no-op). */
+    if (next != wm_active)
+        wm_set_active(next);
     wm_draw_all();
 }
 
@@ -746,4 +1030,26 @@ int wm_active_is_terminal(void) {
     /* Safety: if the active slot is somehow hidden, treat as terminal */
     if (wm_windows[wm_active].hidden) return 1;
     return wm_windows[wm_active].type == WM_TYPE_TERMINAL;
+}
+
+int wm_active_is_stext(void) {
+    if (wm_windows[wm_active].hidden) return 0;
+    return wm_windows[wm_active].type == WM_TYPE_STEXT;
+}
+
+void wm_stext_handle_key(int key_type, char ch) {
+    si = &stext_instances[wm_windows[wm_active].instance];
+    if (key_type == KEY_EVENT_CHAR) {
+        if (ch >= 32 && ch <= 126) stext_insert_char(ch);
+    } else if (key_type == KEY_EVENT_BACKSPACE) {
+        stext_backspace();
+    } else if (key_type == KEY_EVENT_ENTER) {
+        stext_newline();
+    } else if (key_type == KEY_EVENT_DELETE) {
+        stext_delete_fwd();
+    } else if (key_type == KEY_EVENT_LEFT  || key_type == KEY_EVENT_RIGHT ||
+               key_type == KEY_EVENT_UP    || key_type == KEY_EVENT_DOWN) {
+        stext_move(key_type);
+    }
+    wm_draw_all();
 }

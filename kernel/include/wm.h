@@ -39,12 +39,27 @@
 #define WM_CALC_W  162
 #define WM_CALC_H  148
 
-#define WM_MAX_WINDOWS 4     /* upper bound; bump when adding new apps   */
+/* SText editor window — 44 cols × 16 visible rows at 8 px/cell.
+ * text area: 44*8=352 wide, 16*8=128 tall; 4 px padding each side.
+ * client area: 360 × 136
+ * window total: (2+360+2) × (18+136+2) = 364 × 156 */
+#define WM_STEXT_W 364
+#define WM_STEXT_H 156
+
+/* Maximum simultaneous windows on screen.
+ * 3 app types × 3 instances each = 9 worst case. */
+#define WM_MAX_WINDOWS    9
+
+/* Per-type instance pool sizes.  Sum must fit in WM_MAX_WINDOWS. */
+#define WM_MAX_TERM_INST  3
+#define WM_MAX_CALC_INST  3
+#define WM_MAX_STEXT_INST 3
 
 /* ---- window type ---- */
 typedef enum {
     WM_TYPE_TERMINAL = 0,
-    WM_TYPE_CALC
+    WM_TYPE_CALC,
+    WM_TYPE_STEXT
 } wm_win_type_t;
 
 /* ---- window descriptor ---- */
@@ -53,14 +68,14 @@ typedef struct {
     int            width, height;
     const char    *title;
     wm_win_type_t  type;
+    int            instance;    /* index into the per-type instance pool  */
     int            hidden;      /* 1 = not rendered, not focusable,
                                  *     not hit-tested by mouse             */
 } wm_window_t;
 
 /* ---- global state (read-only outside wm.c) ---- */
 extern wm_window_t wm_windows[WM_MAX_WINDOWS];
-extern int         wm_active;        /* index of the focused window  */
-extern int         wm_window_count;  /* number of allocated slots    */
+extern int         wm_active;    /* index of the focused window */
 
 /* ---- API ---- */
 
@@ -80,6 +95,14 @@ void wm_tab_switch(void);
 
 /* Returns 1 if the currently focused window is the terminal. */
 int wm_active_is_terminal(void);
+
+/* Returns 1 if the currently focused window is the SText editor. */
+int wm_active_is_stext(void);
+
+/* Route a key event to the SText editor.
+ * key_type is a KEY_EVENT_* value cast to int; ch is valid only for
+ * KEY_EVENT_CHAR.  Always calls wm_draw_all() before returning. */
+void wm_stext_handle_key(int key_type, char ch);
 
 /* Feed one character (or '\b' for backspace) to the calculator.
  * Ignored unless the calculator window exists.
