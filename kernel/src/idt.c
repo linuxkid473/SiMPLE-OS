@@ -161,8 +161,8 @@ static void syscall_handler(registers_t* regs) {
          * We patch regs->eip so isr_syscall's normal epilogue + iret jumps
          * to exit_trampoline instead of back into user code.  We do NOT
          * touch regs->eflags — iret restores the original EFLAGS which has
-         * IF=0.  exit_trampoline then restores kernel_esp and jumps to
-         * exec_elf's exit_point label with interrupts still disabled.
+         * IF=0.  exit_trampoline then restores kernel_esp and ret's back
+         * into exec_elf.
          *
          * IMPORTANT: do NOT set IF=1 here.  Doing so lets the unmasked PIC
          * fire a timer IRQ at vector 8 (#DF handler) before the trampoline
@@ -171,6 +171,26 @@ static void syscall_handler(registers_t* regs) {
         process_exited = 1;
         regs->eip      = (uint32_t)exit_trampoline;
         break;
+    case 3: {
+        /*
+         * SYS_READ — blocking line input from the active terminal.
+         *
+         * ecx = destination char* buffer (in the shared address space)
+         * edx = max_len including the NUL terminator
+         *
+         * Delegates to console_read_line() which polls the keyboard,
+         * echoes characters, handles backspace/cursor editing, and routes
+         * Alt+Arrow / Alt+Tab to the WM so window management keeps working
+         * while the ELF program waits for input.
+         *
+         * regs->eax receives the byte count (excluding NUL).  popa in the
+         * ISR epilogue restores it into EAX, which is the user program's
+         * return register for the int 0x80 convention.
+         */
+        uint32_t sys_read(char* buf, uint32_t max_len);
+        regs->eax = sys_read((char*)regs->ecx, regs->edx);
+        break;
+    }
     default:
         klog("syscall", "unknown syscall number");
         break;
