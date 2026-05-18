@@ -161,10 +161,15 @@ void console_read_line_opts(
          * Alt+Tab restores normal terminal input immediately.
          */
         if (!wm_active_is_terminal()) {
-            if (event.type == KEY_EVENT_CHAR)
-                wm_calc_handle_char(event.ch);
-            else if (event.type == KEY_EVENT_BACKSPACE)
-                wm_calc_handle_char('\b');
+            if (wm_active_is_stext()) {
+                wm_stext_handle_key((int)event.type, event.ch);
+            } else {
+                /* Calculator */
+                if (event.type == KEY_EVENT_CHAR)
+                    wm_calc_handle_char(event.ch);
+                else if (event.type == KEY_EVENT_BACKSPACE)
+                    wm_calc_handle_char('\b');
+            }
             continue;
         }
 

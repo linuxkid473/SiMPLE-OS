@@ -175,7 +175,8 @@ static int fat_name_to_83(const char* name, uint8_t out[11]) {
         if (c >= 'a' && c <= 'z') {
             c = (char)(c - ('a' - 'A'));
         }
-        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-')) {
             return FAT16_ERR_INVALID;
         }
         out[i] = (uint8_t)c;
@@ -187,7 +188,8 @@ static int fat_name_to_83(const char* name, uint8_t out[11]) {
             if (c >= 'a' && c <= 'z') {
                 c = (char)(c - ('a' - 'A'));
             }
-            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '-')) {
                 return FAT16_ERR_INVALID;
             }
             out[8 + i] = (uint8_t)c;

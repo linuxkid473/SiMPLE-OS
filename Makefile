@@ -27,25 +27,24 @@ OBJS := $(OBJ_ASM) $(OBJ_C)
 
 all: image
 
-user: user/hello.elf user/test.elf user/spam.elf
+user: user/hello.elf user/test.elf user/spam.elf user/systest.elf
 
-user/hello.elf: user/hello.c user/linker.ld
-	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
-	-Wl,-T,user/linker.ld \
-	-Wl,-N \
-	-o $@ user/hello.c user/libc.c
+# User program build flags: no libc, no PIC, flat binary via linker.ld
+USER_CC := $(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
+	-Wl,-T,user/linker.ld -Wl,-N
 
-user/test.elf: user/test.c user/linker.ld
-	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
-	-Wl,-T,user/linker.ld \
-	-Wl,-N \
-	-o $@ user/test.c user/libc.c
+user/hello.elf: user/hello.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/hello.c user/libc.c
 
-user/spam.elf: user/spam.c user/linker.ld
-	$(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
-	-Wl,-T,user/linker.ld \
-	-Wl,-N \
-	-o $@ user/spam.c user/libc.c
+user/test.elf: user/test.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/test.c user/libc.c
+
+user/spam.elf: user/spam.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/spam.c user/libc.c
+
+# systest is self-contained — no libc.c needed
+user/systest.elf: user/systest.c user/linker.ld
+	$(USER_CC) -o $@ user/systest.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -78,7 +77,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -93,6 +92,7 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf $(LIMINE_SYS) $(
 	mcopy -i $(IMAGE)@@1048576 user/hello.elf ::hello.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/test.elf ::test.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/spam.elf ::spam.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/systest.elf ::systest.elf; \
 	$(LIMINE_DEPLOY) $(IMAGE)
 
 run: image

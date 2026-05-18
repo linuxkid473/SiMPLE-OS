@@ -34,7 +34,15 @@ typedef struct {
     uint32_t p_align;
 } Elf32_Phdr;
 
-int elf_validate(void* data);
-int exec_elf(void* data);
+int  elf_validate(void* data);
+int  exec_elf(void* data);
+
+/*
+ * exit_trampoline — iret lands here after SYS_EXIT patches the ISR frame.
+ * Declared naked; restores all callee-saved registers (saved by launch_program
+ * before the user stack switch) and kernel_esp, then `ret`s back into exec_elf.
+ * Never called directly.
+ */
+void exit_trampoline(void);
 
 #endif

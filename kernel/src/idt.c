@@ -1,4 +1,5 @@
 #include "idt.h"
+#include "elf.h"
 #include "klog.h"
 #include "panic.h"
 #include "registers.h"
@@ -140,8 +141,6 @@ void idt_init(void) {
     klog("idt", "initialized with 32 exception handlers + syscall gate");
 }
 
-extern uint32_t exit_target;
-extern uint32_t kernel_esp;
 extern int process_exited;
 
 static void syscall_handler(registers_t* regs) {
@@ -152,14 +151,25 @@ static void syscall_handler(registers_t* regs) {
         break;
     }
     case 2:
+        /*
+         * SYS_EXIT — safe cooperative unwind via ISR frame patch.
+         *
+         * This kernel runs entirely at ring 0 with IF=0 (no sti is ever
+         * called; the 8259A PIC is never remapped, so enabling interrupts
+         * would fire hardware IRQs at exception vectors 0-15 → #DF/panic).
+         *
+         * We patch regs->eip so isr_syscall's normal epilogue + iret jumps
+         * to exit_trampoline instead of back into user code.  We do NOT
+         * touch regs->eflags — iret restores the original EFLAGS which has
+         * IF=0.  exit_trampoline then restores kernel_esp and jumps to
+         * exec_elf's exit_point label with interrupts still disabled.
+         *
+         * IMPORTANT: do NOT set IF=1 here.  Doing so lets the unmasked PIC
+         * fire a timer IRQ at vector 8 (#DF handler) before the trampoline
+         * can restore the kernel stack — immediate hard freeze.
+         */
         process_exited = 1;
-        __asm__ volatile(
-            "movl %0, %%esp\n\t"
-            "jmp *%1\n\t"
-            :
-            : "r"(kernel_esp), "r"(exit_target)
-            : "memory"
-        );
+        regs->eip      = (uint32_t)exit_trampoline;
         break;
     default:
         klog("syscall", "unknown syscall number");
