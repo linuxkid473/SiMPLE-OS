@@ -40,6 +40,8 @@ extern void isr28(void);
 extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
+extern void isr34(void);
+extern void isr48(void);
 extern void isr_syscall(void);
 
 static const char* exception_names[] = {
@@ -123,6 +125,10 @@ void idt_init(void) {
     idt_set_gate(30, (uint32_t)isr30, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(31, (uint32_t)isr31, IDT_TYPE_INTERRUPT_GATE);
 
+    /* software interrupt test vectors (inttest2=0x22, inttest=0x30) */
+    idt_set_gate(0x22, (uint32_t)isr34,  IDT_TYPE_INTERRUPT_GATE);
+    idt_set_gate(0x30, (uint32_t)isr48,  IDT_TYPE_INTERRUPT_GATE);
+
     idt_set_gate(0x80, (uint32_t)isr_syscall,
         IDT_FLAG_PRESENT | IDT_FLAG_32BIT | IDT_FLAG_DPL3 | IDT_FLAG_TRAP);
 
@@ -174,7 +180,10 @@ void isr_handler(registers_t* regs) {
         return;
     }
 
-    serial_write(COM1, "[SIMPLE] isr: unhandled INT #");
+    vga_write("[INT] vector 0x");
+    vga_write_hex(regs->int_no);
+    vga_write_line(" handled, returning");
+    serial_write(COM1, "[SIMPLE] isr: SW INT #");
     serial_write_dec(COM1, regs->int_no);
     serial_write(COM1, "\n");
 }

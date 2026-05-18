@@ -30,6 +30,8 @@
 .global isr29
 .global isr30
 .global isr31
+.global isr34
+.global isr48
 
 .extern isr_handler
 
@@ -122,3 +124,7 @@ MAKE_ISR_NOERR 28
 MAKE_ISR_NOERR 29
 MAKE_ISR_NOERR 30
 MAKE_ISR_NOERR 31
+
+/* software interrupt stubs for inttest2 (0x22=34) and inttest (0x30=48) */
+MAKE_ISR_NOERR 34
+MAKE_ISR_NOERR 48
