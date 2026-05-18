@@ -1,6 +1,7 @@
 #include "wm.h"
 #include "vga.h"
 #include "keyboard.h"
+#include "mouse.h"
 #include "string.h"
 
 /* ---- global window state ---- */
@@ -10,6 +11,12 @@ int         wm_window_count = 0;
 
 static int scr_w;
 static int scr_h;
+
+/* ---- drag state (mouse-driven window movement) ---- */
+static int drag_active  = 0;   /* 1 while left button held on a title bar */
+static int drag_win_idx = -1;  /* index into wm_windows[]                 */
+static int drag_off_x   = 0;   /* cursor offset from window's top-left X  */
+static int drag_off_y   = 0;   /* cursor offset from window's top-left Y  */
 
 /* ---- colour palette ---- */
 #define COL_DESKTOP       0x00001A   /* very dark navy desktop             */
@@ -261,6 +268,107 @@ static void draw_calc_content(wm_window_t *w) {
 }
 
 /* ================================================================
+ * Mouse cursor rendering
+ *
+ * A white crosshair (±5 px arms) with a 1-pixel black border so it
+ * stays visible on any background.  Drawn using raw fb_fill_rect()
+ * calls so it never touches the cell buffer.
+ * ================================================================ */
+
+#define CUR_ARM 5   /* half-arm length in pixels */
+
+static void draw_cursor(int x, int y) {
+    int arm = CUR_ARM;
+    int len = arm * 2 + 1;
+    /* black outline (one pixel wider on each side) */
+    fb_fill_rect(x - arm - 1, y - 1,       len + 2, 3,       0x000000);
+    fb_fill_rect(x - 1,       y - arm - 1, 3,       len + 2, 0x000000);
+    /* white cross */
+    fb_fill_rect(x - arm, y,     len, 1, 0xFFFFFF);
+    fb_fill_rect(x,       y - arm, 1, len, 0xFFFFFF);
+}
+
+/* ================================================================
+ * Mouse hit-testing
+ * ================================================================ */
+
+/* 1 if pixel (px, py) lies anywhere inside window w */
+static int point_in_window(const wm_window_t *w, int px, int py) {
+    return px >= w->x && px < w->x + w->width  &&
+           py >= w->y && py < w->y + w->height;
+}
+
+/* 1 if pixel (px, py) lies inside the title bar stripe of window w */
+static int point_in_titlebar(const wm_window_t *w, int px, int py) {
+    return px >= w->x && px < w->x + w->width &&
+           py >= w->y && py < w->y + WM_TITLEBAR_H;
+}
+
+/* ================================================================
+ * wm_handle_mouse — focus, drag, and repaint on every mouse event.
+ *
+ * Called by mouse.c after assembling each complete 3-byte PS/2 packet.
+ * new_buttons / prev_buttons are bitmasks: bit 0 = left button.
+ * ================================================================ */
+void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
+    int left_now  = (int)(new_buttons  & 1);
+    int left_prev = (int)(prev_buttons & 1);
+
+    /* ---- left button just pressed → hit-test + focus + drag start ---- */
+    if (left_now && !left_prev) {
+        /*
+         * Check windows in z-order: the active window sits on top, so
+         * test it first; then test the remaining windows in index order.
+         */
+        int order[WM_MAX_WINDOWS];
+        int n = 0;
+        order[n++] = wm_active;
+        for (int i = 0; i < wm_window_count; i++)
+            if (i != wm_active) order[n++] = i;
+
+        for (int oi = 0; oi < n; oi++) {
+            int i = order[oi];
+            if (!point_in_window(&wm_windows[i], x, y)) continue;
+
+            /* Bring this window into focus */
+            wm_active = i;
+
+            /* Start a drag if the click landed on the title bar */
+            if (point_in_titlebar(&wm_windows[i], x, y)) {
+                drag_active  = 1;
+                drag_win_idx = i;
+                drag_off_x   = x - wm_windows[i].x;
+                drag_off_y   = y - wm_windows[i].y;
+            }
+            break;   /* click consumed — don't fall through to windows below */
+        }
+    }
+
+    /* ---- dragging: move the grabbed window with the cursor ---- */
+    if (drag_active && left_now) {
+        wm_window_t *w = &wm_windows[drag_win_idx];
+        w->x = x - drag_off_x;
+        w->y = y - drag_off_y;
+        /* Clamp so the window stays entirely on screen */
+        if (w->x < 0)                w->x = 0;
+        if (w->y < 0)                w->y = 0;
+        if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
+        if (w->y + w->height > scr_h) w->y = scr_h - w->height;
+    }
+
+    /* ---- button released → end drag ---- */
+    if (!left_now && left_prev) {
+        drag_active = 0;
+    }
+
+    /*
+     * Repaint everything.  wm_draw_all() ends by drawing the cursor on
+     * top using mouse_get_x/y, so the cursor is always the topmost pixel.
+     */
+    wm_draw_all();
+}
+
+/* ================================================================
  * wm_draw_all — the central repaint routine.
  *
  * Two-pass z-order:
@@ -306,6 +414,9 @@ void wm_draw_all(void) {
      * uses only raw fb calls and never touches vga_set_client(), so the
      * terminal's client settings are preserved.
      */
+
+    /* Cursor is always the topmost pixel — draw it after everything else. */
+    draw_cursor(mouse_get_x(), mouse_get_y());
 }
 
 /* ================================================================

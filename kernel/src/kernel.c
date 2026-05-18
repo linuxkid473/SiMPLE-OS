@@ -116,6 +116,10 @@ void kernel_main(struct stivale2_struct *s2) {
                     fb_tag->framebuffer_pitch);
             wm_init((int)fb_tag->framebuffer_width,
                     (int)fb_tag->framebuffer_height);
+            /* Tell the mouse driver the screen size before mouse_init()
+             * so the cursor starts at screen centre and clamps correctly. */
+            mouse_set_screen((int)fb_tag->framebuffer_width,
+                             (int)fb_tag->framebuffer_height);
             klog("fb", "framebuffer initialized");
             klog_dec("fb", "width", fb_tag->framebuffer_width);
             klog_dec("fb", "height", fb_tag->framebuffer_height);

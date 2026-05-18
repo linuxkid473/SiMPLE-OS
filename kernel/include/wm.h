@@ -79,4 +79,16 @@ int wm_active_is_terminal(void);
  * Ignored unless the calculator window exists. */
 void wm_calc_handle_char(char c);
 
+/*
+ * Process a mouse event from mouse.c.
+ *
+ * x, y         — new cursor pixel position (already clamped to screen).
+ * new_buttons  — current button bitmask (bit 0 = left).
+ * prev_buttons — button state from the previous packet.
+ *
+ * Performs hit-testing, focus change, and drag movement, then calls
+ * wm_draw_all() which draws the cursor as its last step.
+ */
+void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons);
+
 #endif
