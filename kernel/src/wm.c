@@ -42,7 +42,7 @@ static int launcher_open = 0;
 #define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
 #define LNCHR_MENU_W  100
 #define LNCHR_ITEM_H   16
-#define LNCHR_NITEMS    1   /* just Calculator; add entries here for more apps */
+#define LNCHR_NITEMS    2   /* STerm, Calculator; add entries here for more apps */
 
 /* ================================================================
  * Calculator button grid
@@ -111,6 +111,8 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 #define COL_BTNBG         0x223355   /* calculator button background       */
 #define COL_BTNBDR        0x4466AA   /* calculator button border           */
 #define COL_BTNFG         0xFFFFFF   /* calculator button label text       */
+#define COL_CLOSEBTN_BG   0x882222   /* close button background — dark red */
+#define COL_CLOSEBTN_BD   0xBB4444   /* close button border                */
 #define COL_LNCHR_BG      0x333366   /* launcher button background         */
 #define COL_LNCHR_BD      0x8888CC   /* launcher button border             */
 #define COL_MENU_BG       0x1A1A33   /* launcher dropdown background       */
@@ -309,6 +311,16 @@ static void draw_window_chrome(wm_window_t *w, int is_active) {
                       wy + WM_BORDER + 3,
                       w->title, COL_TITLEFG, ct);
 
+    /* Close button — 12×12 px, top-right of title bar */
+    int cbx = wx + ww - 16;
+    int cby = wy + 4;
+    fb_fill_rect(cbx,      cby,      12, 12, COL_CLOSEBTN_BG);
+    fb_fill_rect(cbx,      cby,      12, 1,  COL_CLOSEBTN_BD);
+    fb_fill_rect(cbx,      cby + 11, 12, 1,  COL_CLOSEBTN_BD);
+    fb_fill_rect(cbx,      cby,      1,  12, COL_CLOSEBTN_BD);
+    fb_fill_rect(cbx + 11, cby,      1,  12, COL_CLOSEBTN_BD);
+    fb_draw_string_px(cbx + 2, cby + 2, "X", COL_TITLEFG, COL_CLOSEBTN_BG);
+
     /* Client background */
     fb_fill_rect(wx + WM_BORDER,
                  wy + WM_TITLEBAR_H,
@@ -388,8 +400,11 @@ static void draw_launcher(void) {
     fb_fill_rect(LNCHR_MENU_X,                   LNCHR_MENU_Y + menu_h - 1, LNCHR_MENU_W, 1,       COL_MENU_BD);
     fb_fill_rect(LNCHR_MENU_X,                   LNCHR_MENU_Y,              1,             menu_h, COL_MENU_BD);
     fb_fill_rect(LNCHR_MENU_X + LNCHR_MENU_W - 1, LNCHR_MENU_Y,            1,             menu_h, COL_MENU_BD);
-    /* item 0: Calculator */
-    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 5,
+    /* item 0: STerm */
+    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 4,
+                      "STerm", COL_MENU_FG, COL_MENU_BG);
+    /* item 1: Calculator */
+    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
                       "Calculator", COL_MENU_FG, COL_MENU_BG);
 }
 
@@ -427,9 +442,45 @@ static int point_in_titlebar(const wm_window_t *w, int px, int py) {
            py >= w->y && py < w->y + WM_TITLEBAR_H;
 }
 
+/* 1 if (px,py) is inside the close button (12×12 at top-right of title bar) */
+static int point_in_close_btn(const wm_window_t *w, int px, int py) {
+    return point_in_rect(px, py, w->x + w->width - 16, w->y + 4, 12, 12);
+}
+
 /* ================================================================
- * Calculator launch helper
+ * Window lifecycle helpers
  * ================================================================ */
+
+/* Close a window: hide it and transfer focus to another visible window. */
+static void wm_close_window(int idx) {
+    wm_windows[idx].hidden = 1;
+
+    /* Cancel any active drag on this window */
+    if (drag_win_idx == idx) {
+        drag_active  = 0;
+        drag_win_idx = -1;
+    }
+
+    /* Transfer focus if this was the active window */
+    if (wm_active == idx) {
+        wm_active = 0;   /* default: slot 0 (may be hidden — safe via guard) */
+        for (int i = 0; i < wm_window_count; i++) {
+            if (!wm_windows[i].hidden) {
+                wm_active = i;
+                break;
+            }
+        }
+    }
+}
+
+/* Make the terminal visible and bring it into focus. */
+static void wm_launch_term(void) {
+    if (wm_windows[0].hidden) {
+        wm_windows[0].hidden = 0;
+        /* Restore to default position if first launch */
+    }
+    wm_active = 0;
+}
 
 /* Make the calculator visible and bring it into focus.
  * If already visible, just focus it (don't re-position). */
@@ -500,7 +551,9 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                               LNCHR_MENU_W, menu_h)) {
                 /* Which item did the user click? */
                 int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
-                if (item == 0) {        /* "Calculator" */
+                if (item == 0) {        /* "STerm" */
+                    wm_launch_term();
+                } else if (item == 1) { /* "Calculator" */
                     wm_launch_calc();
                 }
                 launcher_open = 0;
@@ -528,11 +581,16 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 wm_active = i;
 
                 if (point_in_titlebar(&wm_windows[i], x, y)) {
-                    /* Start drag — only title bar, never client area */
-                    drag_active  = 1;
-                    drag_win_idx = i;
-                    drag_off_x   = x - wm_windows[i].x;
-                    drag_off_y   = y - wm_windows[i].y;
+                    if (point_in_close_btn(&wm_windows[i], x, y)) {
+                        /* Close button — hide window and transfer focus */
+                        wm_close_window(i);
+                    } else {
+                        /* Start drag — only title bar, never client area */
+                        drag_active  = 1;
+                        drag_win_idx = i;
+                        drag_off_x   = x - wm_windows[i].x;
+                        drag_off_y   = y - wm_windows[i].y;
+                    }
                 } else {
                     /* Client-area click → route to the app */
                     handle_client_click(&wm_windows[i], x, y);
@@ -574,7 +632,11 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
  * the terminal window, so subsequent vga_putc() calls land there.
  * ================================================================ */
 void wm_draw_all(void) {
-    if (wm_window_count == 0) return;
+    /*
+     * Always sync the terminal client geometry so fb_cols/fb_rows are
+     * correct for vga_putc even when the terminal window is hidden.
+     */
+    sync_terminal_client(&wm_windows[0]);
 
     fb_fill_rect(0, 0, scr_w, scr_h, COL_DESKTOP);
 
@@ -627,7 +689,7 @@ void wm_init(int sw, int sh) {
     wm_windows[0].height = WM_TERM_H;
     wm_windows[0].title  = "Terminal";
     wm_windows[0].type   = WM_TYPE_TERMINAL;
-    wm_windows[0].hidden = 0;
+    wm_windows[0].hidden = 1;   /* hidden at boot; launched via Apps → STerm */
 
     /* Window 1: Calculator — hidden at boot; launched via Apps menu.
      * Position is set when wm_launch_calc() first shows it. */
@@ -639,13 +701,18 @@ void wm_init(int sw, int sh) {
     wm_windows[1].type   = WM_TYPE_CALC;
     wm_windows[1].hidden = 1;    /* <-- not shown until Apps → Calculator */
 
-    wm_active       = 0;   /* terminal has focus at boot */
+    wm_active       = 0;   /* points to terminal slot; hidden at boot — safe via wm_active_is_terminal() guard */
     wm_window_count = 2;   /* total allocated slots; hidden ones still count */
 
     wm_draw_all();
 }
 
 void wm_handle_key(int key_type) {
+    /* Don't try to move a hidden window */
+    if (wm_windows[wm_active].hidden) {
+        wm_draw_all();
+        return;
+    }
     wm_window_t *w = &wm_windows[wm_active];
     int dx = 0, dy = 0;
 
