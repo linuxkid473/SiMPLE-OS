@@ -9,6 +9,7 @@
 #include "serial.h"
 #include "shell.h"
 #include "vga.h"
+#include "wm.h"
 #define _STIVALE2_SPLIT_64
 #include "stivale2.h"
 
@@ -113,6 +114,8 @@ void kernel_main(struct stivale2_struct *s2) {
                     fb_tag->framebuffer_width,
                     fb_tag->framebuffer_height,
                     fb_tag->framebuffer_pitch);
+            wm_init((int)fb_tag->framebuffer_width,
+                    (int)fb_tag->framebuffer_height);
             klog("fb", "framebuffer initialized");
             klog_dec("fb", "width", fb_tag->framebuffer_width);
             klog_dec("fb", "height", fb_tag->framebuffer_height);

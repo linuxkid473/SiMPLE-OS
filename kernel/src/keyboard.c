@@ -2,8 +2,9 @@
 #include "io.h"
 #include "mouse.h"
 
-static int shift_pressed = 0;
-static int extended_prefix = 0;
+static int shift_pressed    = 0;
+static int alt_pressed      = 0;
+static int extended_prefix  = 0;
 
 static const char keymap[128] = {
     0, 27, '1', '2', '3', '4', '5', '6',
@@ -28,8 +29,13 @@ static const char shift_keymap[128] = {
 };
 
 void keyboard_init(void) {
-    shift_pressed = 0;
+    shift_pressed   = 0;
+    alt_pressed     = 0;
     extended_prefix = 0;
+}
+
+int keyboard_is_alt_pressed(void) {
+    return alt_pressed;
 }
 
 void keyboard_read_event(key_event_t* event) {
@@ -55,17 +61,25 @@ void keyboard_read_event(key_event_t* event) {
 
         if (extended_prefix) {
             extended_prefix = 0;
-            if (scancode & 0x80) return;
-            
             uint8_t code = scancode & 0x7F;
-            if (code == 0x4B) { event->type = KEY_EVENT_LEFT; return; }
-            if (code == 0x4D) { event->type = KEY_EVENT_RIGHT; return; }
-            if (code == 0x48) { event->type = KEY_EVENT_UP; return; }
-            if (code == 0x50) { event->type = KEY_EVENT_DOWN; return; }
+
+            /* Right Alt press / release (extended 0x38) */
+            if (code == 0x38) {
+                alt_pressed = (scancode & 0x80) ? 0 : 1;
+                return;
+            }
+
+            if (scancode & 0x80) return;   /* other extended key releases */
+
+            if (code == 0x4B) { event->type = KEY_EVENT_LEFT;   return; }
+            if (code == 0x4D) { event->type = KEY_EVENT_RIGHT;  return; }
+            if (code == 0x48) { event->type = KEY_EVENT_UP;     return; }
+            if (code == 0x50) { event->type = KEY_EVENT_DOWN;   return; }
             if (code == 0x53) { event->type = KEY_EVENT_DELETE; return; }
             return;
         }
 
+        /* Left Shift press / release */
         if (scancode == 0x2A || scancode == 0x36) {
             shift_pressed = 1;
             return;
@@ -74,6 +88,10 @@ void keyboard_read_event(key_event_t* event) {
             shift_pressed = 0;
             return;
         }
+
+        /* Left Alt press / release (0x38 press, 0xB8 = 0x80|0x38 release) */
+        if (scancode == 0x38) { alt_pressed = 1; return; }
+        if (scancode == 0xB8) { alt_pressed = 0; return; }
 
         if (scancode & 0x80) return;
 
