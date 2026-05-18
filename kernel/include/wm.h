@@ -12,12 +12,14 @@
  *     active last) so the active window always appears on top.
  *   - No real multitasking: the shell event loop does all routing.
  *   - Terminal uses the existing vga cell-buffer path (vga_set_client +
- *     vga_repaint_cells).  The calculator draws directly to the
- *     framebuffer with fb_fill_rect / fb_draw_string_px.
+ *     vga_repaint_cells).  Other windows draw directly to the framebuffer
+ *     with fb_fill_rect / fb_draw_string_px.
+ *   - The launcher bar is a system-level UI strip that is always rendered
+ *     on top of all windows and is hit-tested before windows.
  *
  * Key bindings:
  *   Alt + Arrow  — move the currently focused window
- *   Alt + Tab    — cycle focus to the next window
+ *   Alt + Tab    — cycle focus to the next visible window
  *   (normal keys route to whichever app owns the focused window)
  */
 
@@ -31,11 +33,13 @@
 #define WM_TERM_W  644
 #define WM_TERM_H  412
 
-/* Calculator window */
-#define WM_CALC_W  200
-#define WM_CALC_H  100
+/* Calculator window — fits display bar + 4×4 clickable button grid.
+ * client area: 158 × 128
+ * window total: (2+158+2) × (18+128+2) = 162 × 148 */
+#define WM_CALC_W  162
+#define WM_CALC_H  148
 
-#define WM_MAX_WINDOWS 3     /* upper bound on the fixed window array    */
+#define WM_MAX_WINDOWS 4     /* upper bound; bump when adding new apps   */
 
 /* ---- window type ---- */
 typedef enum {
@@ -45,49 +49,48 @@ typedef enum {
 
 /* ---- window descriptor ---- */
 typedef struct {
-    int            x, y;       /* top-left pixel on the screen     */
+    int            x, y;        /* top-left pixel on the screen           */
     int            width, height;
     const char    *title;
     wm_win_type_t  type;
+    int            hidden;      /* 1 = not rendered, not focusable,
+                                 *     not hit-tested by mouse             */
 } wm_window_t;
 
 /* ---- global state (read-only outside wm.c) ---- */
 extern wm_window_t wm_windows[WM_MAX_WINDOWS];
 extern int         wm_active;        /* index of the focused window  */
-extern int         wm_window_count;
+extern int         wm_window_count;  /* number of allocated slots    */
 
 /* ---- API ---- */
 
-/* Initialise both windows and draw the first frame.
+/* Initialise window slots and draw the first frame.
  * Must be called after fb_init(). */
 void wm_init(int screen_w, int screen_h);
 
-/* Redraw desktop + all windows (inactive first, active last).
- * Safe to call any time; leaves vga text API anchored to the terminal. */
+/* Redraw desktop + launcher + all visible windows + cursor.
+ * Safe to call at any time; leaves vga text API anchored to the terminal. */
 void wm_draw_all(void);
 
 /* Move the active window one step in the given KEY_EVENT_* direction. */
 void wm_handle_key(int key_type);
 
-/* Cycle focus to the next window and repaint. */
+/* Cycle focus to the next visible (non-hidden) window and repaint. */
 void wm_tab_switch(void);
 
 /* Returns 1 if the currently focused window is the terminal. */
 int wm_active_is_terminal(void);
 
 /* Feed one character (or '\b' for backspace) to the calculator.
- * Ignored unless the calculator window exists. */
+ * Ignored unless the calculator window exists.
+ * Always calls wm_draw_all() before returning. */
 void wm_calc_handle_char(char c);
 
 /*
- * Process a mouse event from mouse.c.
- *
+ * Process a mouse event.  Called by mouse.c on each complete 3-byte packet.
  * x, y         — new cursor pixel position (already clamped to screen).
  * new_buttons  — current button bitmask (bit 0 = left).
  * prev_buttons — button state from the previous packet.
- *
- * Performs hit-testing, focus change, and drag movement, then calls
- * wm_draw_all() which draws the cursor as its last step.
  */
 void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons);
 
