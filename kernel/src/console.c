@@ -129,7 +129,18 @@ void console_read_line_opts(
         }
 
         /*
-         * Alt + Arrow → move the WM window.
+         * Alt + Tab → cycle window focus.
+         * Intercepted before the tab-completion check below so that
+         * Alt+Tab never triggers the shell's filename completer.
+         */
+        if (keyboard_is_alt_pressed() &&
+            event.type == KEY_EVENT_CHAR && event.ch == '\t') {
+            wm_tab_switch();
+            continue;
+        }
+
+        /*
+         * Alt + Arrow → move the currently focused window.
          * Plain arrows keep their original behaviour (cursor movement /
          * history navigation) so the shell and editor are unaffected.
          * This check must come before the plain-arrow handlers below.
@@ -140,6 +151,21 @@ void console_read_line_opts(
                 wm_handle_key((int)event.type);
                 continue;
             }
+        }
+
+        /*
+         * Input routing: when the calculator window is focused, all
+         * normal key presses go to the calculator, not to the shell
+         * readline.  The readline loop keeps spinning (single-threaded),
+         * it just does not consume any characters.  Switching back with
+         * Alt+Tab restores normal terminal input immediately.
+         */
+        if (!wm_active_is_terminal()) {
+            if (event.type == KEY_EVENT_CHAR)
+                wm_calc_handle_char(event.ch);
+            else if (event.type == KEY_EVENT_BACKSPACE)
+                wm_calc_handle_char('\b');
+            continue;
         }
 
         /* Plain Left / Right — in-line cursor movement */
