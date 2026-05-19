@@ -1,26 +1,26 @@
-static int sys_write(const char *buf, int len) {
+static int write(const char *buf, int len) {
     int ret;
+
     __asm__ volatile(
         "int $0x80"
         : "=a"(ret)
         : "a"(1), "c"(buf), "d"(len)
         : "memory"
     );
+
     return ret;
 }
 
-static int sys_read(char *buf, int max_len) {
-    int ret;
+static void yield(void) {
     __asm__ volatile(
         "int $0x80"
-        : "=a"(ret)
-        : "a"(3), "c"(buf), "d"(max_len)
+        :
+        : "a"(4)
         : "memory"
     );
-    return ret;
 }
 
-static void sys_exit(int code) {
+static void exit(int code) {
     (void)code;
 
     __asm__ volatile(
@@ -34,24 +34,18 @@ static void sys_exit(int code) {
         __asm__ volatile("hlt");
 }
 
-static int strlen(const char *s) {
-    int n = 0;
-    while (s[n])
-        n++;
-    return n;
-}
-
 void _start(void) {
-    char buf[128];
+    write("yieldtest start\n", 16);
 
-    sys_write("=== readtest ===\n", 19);
-    sys_write("Type something: ", 16);
+    for (int i = 0; i < 5; i++) {
+        write("calling SYS_YIELD\n", 20);
 
-    int n = sys_read(buf, sizeof(buf));
+        yield();
 
-    sys_write("\nYou typed: ", 13);
-    sys_write(buf, n);
-    sys_write("\n", 1);
+        write("returned from SYS_YIELD\n", 26);
+    }
 
-    sys_exit(0);
+    write("yieldtest done\n", 15);
+
+    exit(0);
 }
