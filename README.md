@@ -1,123 +1,260 @@
-# SiMPLE OS
-<img width="1536" height="1024" alt="5E778EAE-3171-42A1-B8CE-2EC0B9FCBDA9" src="https://github.com/user-attachments/assets/10080647-82b0-41f7-baf7-aa3b37d38890" />
+SiMPLE OS
+
+<img width="1254" height="1254" alt="SiMPLE" src="https://github.com/user-attachments/assets/48f1adbb-e018-48a4-8e75-c9d2ffabcce9" />
 
 
-SiMPLE OS is a minimal bootable operating system for `x86_64` QEMU that:
+A tiny graphical hobby operating system focused on simplicity, responsiveness, and systems experimentation.
 
-- boots via **GRUB** (Multiboot)
-- runs a freestanding **32-bit C kernel**
-- uses **VGA text mode** + **keyboard input**
-- provides an interactive shell (`SiMPLE>`) with filesystem commands
-- implements a basic **FAT16** driver (read/write dirs and files)
-- includes a simple line-based text editor (`edit <file>`)
+⸻
 
-## Implemented Commands
+About
 
-- `help`
-- `clear`
-- `echo <text>`
-- `ls`
-- `cd <dir>` (`..`, `.`, and `/` supported)
-- `open <file>`
-- `mkdir <dir>`
-- `touch <file>`
-- `edit <file>`
-- `rm <name>` (files and empty directories)
+SiMPLE OS is a custom x86 hobby operating system written from scratch in C and x86 assembly.
 
-## Project Structure
+The project began as a minimal framebuffer experiment and gradually evolved into a small graphical desktop OS with:
 
-```text
-SiMPLE/
-├── Makefile
-├── README.md
-├── grub/
-│   └── grub.cfg
-└── kernel/
-    ├── boot.s
-    ├── linker.ld
-    ├── include/
-    │   ├── ata.h
-    │   ├── console.h
-    │   ├── editor.h
-    │   ├── fat16.h
-    │   ├── io.h
-    │   ├── keyboard.h
-    │   ├── shell.h
-    │   ├── string.h
-    │   ├── types.h
-    │   └── vga.h
-    └── src/
-        ├── ata.c
-        ├── console.c
-        ├── editor.c
-        ├── fat16.c
-        ├── kernel.c
-        ├── keyboard.c
-        ├── shell.c
-        ├── string.c
-        └── vga.c
-```
+* a custom window manager
+* multiterminal support
+* ELF executable loading
+* a syscall interface
+* interactive userspace-style programs
+* mouse-driven GUI interaction
+* a tiny desktop environment
 
-## Build
+The goal of SiMPLE OS is not POSIX compliance or Linux compatibility.
 
-From the project root:
+Instead, the project focuses on:
 
-```bash
-make image
-```
+* clean architecture
+* readability
+* experimentation
+* fast iteration
+* low-level computer systems understanding
 
-This builds:
+Everything currently runs in ring 0 by design to keep the system compact and easy to reason about.
 
-- `build/kernel.bin` (Multiboot kernel)
-- `simple.img` (raw disk image with MBR + FAT16 + GRUB + kernel)
+⸻
 
-## Run
+Features
 
-```bash
-qemu-system-x86_64 -drive format=raw,file=simple.img
-```
+Desktop Environment
 
-On boot you should see:
+* Custom framebuffer desktop
+* Multiwindow pseudo-WM
+* Mouse cursor + window dragging
+* Window focus + z-order
+* App launcher menu
+* Multiple instances of applications
+* Close buttons
+* Alt+Tab window switching
+* Alt+Arrow keyboard window movement
 
-```text
-Welcome to SiMPLE OS
-SiMPLE>
-```
+Applications
 
-## Notes
+STerm
 
-- FAT16 implementation is short-name based (8.3 names, uppercase on disk).
-- Keyboard handling uses polling of PS/2 scancodes.
-- Disk access uses ATA PIO (LBA28) for sector reads/writes.
-- Shell input supports in-line cursor editing and command history.
-- Editor supports cursor movement, in-place insert/delete, and `:w`, `:q`, `:wq`.
+A graphical terminal window with:
 
-## Key Components
+* independent terminal sessions
+* shell integration
+* multiline rendering
+* command execution
 
-### Boot path
+SText
 
-1. BIOS starts GRUB from MBR-installed boot code.
-2. GRUB loads `/boot/kernel.bin` using Multiboot.
-3. Kernel starts at `_start` in `kernel/boot.s` and calls `kernel_main`.
+A lightweight text editor with:
 
-### FAT16
+* editable text buffer
+* scrolling
+* cursor movement
+* multiline editing
 
-- Mounts first FAT16 partition from MBR.
-- Parses BPB and computes FAT/root/data regions.
-- Supports:
-  - directory enumeration
-  - directory creation (`mkdir`)
-  - file creation (`touch`)
-  - file read (`open`)
-  - file overwrite/write (`edit` save path)
-  - file and empty-directory delete (`rm`)
-  - folder navigation (`cd`)
+Calculator
 
-### Shell + editor
+A clickable GUI calculator with:
 
-- Shell loop handles command parsing and dispatch.
-- `edit` opens a simple append-based editor:
-  - type lines to append
-  - `:w` save
-  - `:q` quit without saving
-  - `:wq` save and quit
+* button grid
+* integer arithmetic
+* mouse interaction
+* keyboard support
+
+⸻
+
+ELF Execution
+
+SiMPLE OS supports loading and executing ELF programs directly from disk.
+
+Current functionality:
+
+* ELF loading
+* executable relocation
+* syscall interface
+* synchronous task execution
+* clean program return handling
+
+Example:
+
+run readtest.elf
+
+⸻
+
+Syscalls
+
+Current syscall interface:
+
+Syscall	Number	Description
+SYS_WRITE	1	Write text to the active STerm
+SYS_EXIT	2	Exit ELF program cleanly
+SYS_READ	3	Blocking terminal input
+
+Example userspace syscall:
+
+__asm__ volatile(
+    "int $0x80"
+    :
+    : "a"(1), "c"(buf), "d"(len)
+    : "memory"
+);
+
+⸻
+
+Window Manager
+
+The WM is intentionally minimal.
+
+Design goals:
+
+* fixed-size arrays
+* no dynamic allocation-heavy systems
+* no compositing (yet)
+* no retained widget frameworks
+* tiny readable codebase
+
+Current architecture:
+
+* framebuffer renderer
+* software cursor
+* simple z-order rendering
+* per-window application state
+
+⸻
+
+Filesystem
+
+Current filesystem support:
+
+* FAT16
+
+The system currently uses 8.3 filenames for ELF programs and filesystem compatibility.
+
+⸻
+
+Building
+
+Requirements
+
+* x86_64 ELF cross compiler
+* NASM
+* QEMU
+* GNU Make
+* mtools
+
+Example packages:
+
+* x86_64-elf-gcc
+* nasm
+* qemu-system-x86_64
+* mtools
+
+⸻
+
+Build
+
+make
+
+This produces:
+
+simple.img
+
+⸻
+
+Running
+
+QEMU
+
+qemu-system-x86_64 \
+  -m 512M \
+  -drive format=raw,file=simple.img \
+  -display cocoa,zoom-to-fit=on
+
+⸻
+
+Example Programs
+
+readtest.elf
+
+Interactive syscall test program:
+
+=== readtest ===
+Type something:
+hello world
+You typed: hello world
+
+⸻
+
+Architecture Goals
+
+Planned future work includes:
+
+* cooperative multitasking
+* EXT2 support
+* VFS layer
+* compositing
+* .kext loadable kernel extensions
+* improved syscall layer
+* IRQ subsystem cleanup
+* timer-driven scheduling
+* networking experiments
+
+⸻
+
+Philosophy
+
+SiMPLE OS intentionally avoids overengineering.
+
+The project values:
+
+* simplicity
+* experimentation
+* visibility into the machine
+* architectural clarity
+* fun
+
+It is heavily inspired by:
+
+* TempleOS
+* classic Macintosh systems
+* BSD-style design philosophy
+* hobbyist systems programming culture
+
+⸻
+
+Project Status
+
+SiMPLE OS is an active experimental hobby OS and is not intended for production use.
+
+Expect:
+
+* bugs
+* crashes
+* architectural rewrites
+* questionable design decisions
+* sudden ambitious features at 3am
+
+And that’s part of the fun.
+
+⸻
+
+License
+
+See LICENSE.
