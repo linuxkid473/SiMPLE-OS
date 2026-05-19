@@ -1,7 +1,6 @@
-SiMPLE OS
-
 <img width="1254" height="1254" alt="SiMPLE" src="https://github.com/user-attachments/assets/48f1adbb-e018-48a4-8e75-c9d2ffabcce9" />
 
+SiMPLE OS
 
 A tiny graphical hobby operating system focused on simplicity, responsiveness, and systems experimentation.
 
