@@ -43,8 +43,8 @@ user/spam.elf: user/spam.c user/libc.c user/linker.ld
 	$(USER_CC) -o $@ user/spam.c user/libc.c
 
 # systest is self-contained — no libc.c needed
-user/systest.elf: user/systest.c user/linker.ld
-	$(USER_CC) -o $@ user/systest.c
+user/systest.elf: user/systest.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/systest.c user/libc.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

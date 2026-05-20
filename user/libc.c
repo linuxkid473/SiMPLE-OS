@@ -47,3 +47,16 @@ int close(int fd) {
 
     return ret;
 }
+
+int fd_read(int fd, void* buf, int len) {
+    int ret;
+
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(7), "c"(fd), "d"(buf), "b"(len)
+        : "memory"
+    );
+
+    return ret;
+}

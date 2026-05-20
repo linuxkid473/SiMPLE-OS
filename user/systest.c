@@ -1,65 +1,108 @@
-/*
- * user/systest.c — demonstration of the SiMPLE OS syscall ABI
- *
- * Syscall ABI (int 0x80):
- *   eax = number   ecx = arg0   edx = arg1   return → eax
- *
- *   1  SYS_WRITE  ecx=buf, edx=len  — write to active terminal
- *   2  SYS_EXIT                     — clean return to shell
- *
- * This file is self-contained: it does not use libc.c so the wrappers
- * are visible alongside the tests.
- */
+/* user/systest.c */
 
-/* ------------------------------------------------------------------ */
-/* Inline syscall wrappers                                             */
-/* ------------------------------------------------------------------ */
+#include <stdint.h>
 
-static int sys_write(const char *buf, int len) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(1), "c"(buf), "d"(len)
-        : "memory"
-    );
-    return ret;
-}
+/* libc wrappers */
+int write(const char* buf, int len);
+void exit(void);
+int open(const char* path, int flags);
+int close(int fd);
+int fd_read(int fd, void* buf, int len);
 
-static void sys_exit(int code) {
-    (void)code;   /* exit code not yet used by the kernel — reserved for future */
-    __asm__ volatile(
-        "int $0x80"
-        :
-        : "a"(2)
-        : "memory"
-    );
-    /* If the kernel somehow falls through, spin safely */
-    while (1) __asm__ volatile("hlt");
-}
+/* open flags */
+#define O_READ   (1 << 0)
 
-/* ------------------------------------------------------------------ */
-/* Tiny helpers                                                        */
-/* ------------------------------------------------------------------ */
-
-static int slen(const char *s) {
+static int strlen(const char* s) {
     int n = 0;
-    while (s[n]) n++;
+    while (s[n])
+        n++;
     return n;
 }
 
-static void print(const char *s) {
-    sys_write(s, slen(s));
+static void puts(const char* s) {
+    write(s, strlen(s));
 }
 
-/* ------------------------------------------------------------------ */
-/* Entry point                                                         */
-/* ------------------------------------------------------------------ */
+static void put_hex_byte(uint8_t b) {
+    char out[3];
+    const char* hex = "0123456789ABCDEF";
+
+    out[0] = hex[(b >> 4) & 0xF];
+    out[1] = hex[b & 0xF];
+    out[2] = '\0';
+
+    puts(out);
+}
+
+static void put_num(int n) {
+    char buf[16];
+    int i = 0;
+
+    if (n == 0) {
+        puts("0");
+        return;
+    }
+
+    while (n > 0) {
+        buf[i++] = '0' + (n % 10);
+        n /= 10;
+    }
+
+    while (i--) {
+        char c[2];
+        c[0] = buf[i];
+        c[1] = '\0';
+        puts(c);
+    }
+}
 
 void _start(void) {
-    print("=== systest ===\n");
-    print("SYS_WRITE (1): this line proves it works.\n");
-    print("SYS_WRITE (1): so does this one.\n");
-    print("Calling SYS_EXIT (2) — shell prompt should return cleanly.\n");
-    sys_exit(0);
+    int fd;
+    int n;
+    uint8_t buf[16];
+    int i;
+
+    puts("SYS_FREAD test\n");
+
+    fd = open("hello.elf", O_READ);
+
+    if (fd < 0) {
+        puts("open failed\n");
+        exit();
+    }
+
+    puts("opened hello.elf\n");
+
+    n = fd_read(fd, buf, sizeof(buf));
+
+    if (n < 0) {
+        puts("fd_read failed\n");
+        close(fd);
+        exit();
+    }
+
+    puts("read ");
+    put_num(n);
+    puts(" bytes\n");
+
+    puts("first 16 bytes:\n");
+
+    for (i = 0; i < n; i++) {
+        put_hex_byte(buf[i]);
+        puts(" ");
+    }
+
+    puts("\n");
+
+    n = fd_read(fd, buf, 8);
+
+    puts("second read returned ");
+    put_num(n);
+    puts(" bytes\n");
+
+    close(fd);
+
+    puts("test complete\n");
+
+    exit();
 }
