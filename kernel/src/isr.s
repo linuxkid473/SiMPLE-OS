@@ -32,6 +32,8 @@
 .global isr31
 .global isr34
 .global isr48
+/* IRQ stubs — hardware interrupts remapped to 0x20-0x2F after pic_init() */
+.global isr32
 
 .extern isr_handler
 
@@ -128,3 +130,12 @@ MAKE_ISR_NOERR 31
 /* software interrupt stubs for inttest2 (0x22=34) and inttest (0x30=48) */
 MAKE_ISR_NOERR 34
 MAKE_ISR_NOERR 48
+
+/*
+ * IRQ0 (PIT timer) — vector 0x20 = 32.
+ * Uses the same save/restore frame as CPU exception stubs so isr_handler()
+ * receives a registers_t* on the kernel stack.  The handler sends EOI and
+ * may overwrite *regs to context-switch to a different process; iret then
+ * jumps into whoever's state is in the frame.
+ */
+MAKE_ISR_NOERR 32

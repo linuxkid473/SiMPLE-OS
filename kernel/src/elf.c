@@ -104,7 +104,7 @@ launch_ring3(uint32_t entry   __attribute__((unused)),
         "pushl $0x23\n\t"             /* SS  = user data (0x20 | RPL=3) */
         "pushl %%edx\n\t"             /* ESP = user_sp                  */
         "pushfl\n\t"                  /* EFLAGS                         */
-        "andl $~0x200, (%%esp)\n\t"   /* clear IF (no IRQs in this OS)  */
+        "orl $0x200, (%%esp)\n\t"     /* set IF — enable timer preemption in ring3 */
         "pushl $0x1B\n\t"             /* CS  = user code (0x18 | RPL=3) */
         "pushl %%ecx\n\t"             /* EIP = entry                    */
 

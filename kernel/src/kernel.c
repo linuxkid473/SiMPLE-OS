@@ -7,6 +7,8 @@
 #include "mouse.h"
 #include "paging.h"
 #include "panic.h"
+#include "pic.h"
+#include "pit.h"
 #include "process.h"
 #include "serial.h"
 #include "shell.h"
@@ -147,6 +149,15 @@ void kernel_main(struct stivale2_struct *s2) {
     mouse_init();
     klog("mouse", "initialized");
 
+    /*
+     * Remap 8259 PIC BEFORE idt_init so that hardware IRQs land on
+     * vectors 0x20-0x2F instead of conflicting with CPU exceptions 0-31.
+     * All IRQ lines are masked by pic_init; we unmask IRQ0 after the IDT
+     * and PIT are fully configured.
+     */
+    pic_init();
+    klog_boot("PIC remapped (8259)");
+
     gdt_init();
     klog_boot("GDT initialized");
 
@@ -155,6 +166,18 @@ void kernel_main(struct stivale2_struct *s2) {
 
     idt_init();
     klog_boot("IDT initialized");
+
+    pit_init();
+    klog_boot("PIT initialized (100 Hz)");
+
+    /* Unmask IRQ0 (PIT timer) — this starts the hardware ticks */
+    pic_unmask(0);
+    klog_boot("IRQ0 unmasked — preemptive scheduler active");
+
+    /* Enable interrupts: ring0 shell runs with IF=1, ring3 processes
+     * already get IF=1 from launch_ring3's EFLAGS setup */
+    __asm__ volatile("sti");
+    klog_boot("interrupts enabled (sti)");
 
     vga_write_line("Welcome to SiMPLE OS");
 

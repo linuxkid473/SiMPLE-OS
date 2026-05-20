@@ -16,15 +16,28 @@
  */
 #define PROC_POOL_BASE 0x500000U
 
-typedef enum { PROC_DEAD = 0, PROC_RUNNING = 1, PROC_RUNNABLE = 2 } proc_state_t;
+/*
+ * Number of timer ticks a process runs before the scheduler preempts it.
+ * At PIT_HZ=100 Hz, PROC_TIMESLICE=10 gives 100 ms time slices.
+ */
+#define PROC_TIMESLICE 10U
+
+typedef enum {
+    PROC_DEAD     = 0,   /* slot is free, may be reused           */
+    PROC_RUNNING  = 1,   /* currently executing on CPU            */
+    PROC_RUNNABLE = 2,   /* ready to run, waiting for CPU         */
+    PROC_ZOMBIE   = 3,   /* exited, waiting to be reaped (future) */
+    PROC_BLOCKED  = 4,   /* sleeping / waiting for I/O (future)   */
+} proc_state_t;
 
 typedef struct {
     int          pid;
     proc_state_t state;
-    registers_t  saved_regs;   /* saved user-side CPU state (iret frame + gprs) */
-    uint32_t    *page_dir;     /* pointer to this process's 4KB page directory */
+    registers_t  saved_regs;       /* saved user-side CPU state (iret frame + gprs) */
+    uint32_t    *page_dir;         /* pointer to this process's 4KB page directory  */
     fd_table_t   fd_table;
     int          exit_code;
+    uint32_t     ticks_remaining;  /* preemption countdown; reset on each switch-in */
 } process_t;
 
 extern process_t proc_table[MAX_PROCS];
@@ -44,5 +57,12 @@ void proc_exit(registers_t *regs, int code);
 /* Fork: duplicate current process. Returns child pid to parent (in regs->eax),
  * child will see eax=0 when it first runs. Returns -1 on failure. */
 int proc_fork(registers_t *regs);
+
+/*
+ * Called from the PIT timer IRQ handler (pit_timer_tick).
+ * Decrements the current process's time slice and preempts if expired and
+ * another RUNNABLE process exists.  Only preempts ring3 code (CS.RPL=3).
+ */
+void proc_timer_tick(registers_t *regs);
 
 #endif

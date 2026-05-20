@@ -4,6 +4,8 @@
 #include "gdt.h"
 #include "klog.h"
 #include "panic.h"
+#include "pic.h"
+#include "pit.h"
 #include "process.h"
 #include "registers.h"
 #include "serial.h"
@@ -45,6 +47,7 @@ extern void isr28(void);
 extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
+extern void isr32(void);   /* IRQ0 — PIT timer, vector 0x20 */
 extern void isr34(void);
 extern void isr48(void);
 extern void isr_syscall(void);
@@ -128,6 +131,13 @@ void idt_init(void) {
     idt_set_gate(29, (uint32_t)isr29, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(30, (uint32_t)isr30, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(31, (uint32_t)isr31, IDT_TYPE_INTERRUPT_GATE);
+
+    /*
+     * IRQ0 (PIT timer) at vector 0x20.
+     * Interrupt gate (IF=0 on entry): prevents nested timer IRQs while the
+     * scheduler is running.  DPL=0 so ring3 cannot invoke it with `int 0x20`.
+     */
+    idt_set_gate(0x20, (uint32_t)isr32, IDT_TYPE_INTERRUPT_GATE);
 
     idt_set_gate(0x22, (uint32_t)isr34, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(0x30, (uint32_t)isr48, IDT_TYPE_INTERRUPT_GATE);
@@ -277,6 +287,12 @@ static void syscall_handler(registers_t *regs) {
 void isr_handler(registers_t *regs) {
     if (regs->int_no == 0x80) {
         syscall_handler(regs);
+        return;
+    }
+
+    if (regs->int_no == 0x20) {
+        /* IRQ0: PIT timer tick — may preempt current ring3 process */
+        pit_timer_tick(regs);
         return;
     }
 
