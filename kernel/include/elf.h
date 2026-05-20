@@ -6,6 +6,10 @@
 #define PT_LOAD 1
 #define ET_EXEC 2
 
+/* User address space bounds — must match user/linker.ld and paging.c */
+#define USER_BASE   0x300000U
+#define USER_STACK  0x400000U
+
 typedef struct {
     uint8_t e_ident[16];
     uint16_t e_type;

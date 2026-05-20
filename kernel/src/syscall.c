@@ -12,36 +12,28 @@
  *
  * Syscall table:
  *   1  SYS_WRITE  — write bytes to the active terminal
- *                   ecx = buf (const char*), edx = len
- *                   returns: bytes written
- *   2  SYS_EXIT   — terminate program and return to shell
- *                   (handled entirely in idt.c via exit_trampoline)
- *   3  SYS_READ   — blocking line input from the active terminal
- *                   ecx = buf (char*), edx = max_len (including NUL)
- *                   returns: bytes read (excluding NUL)
- *   4  SYS_YIELD  — cooperative yield (no-op; no scheduler in this kernel)
- *                   returns: 0
- *   5  SYS_OPEN   — open a file, allocate a file descriptor
- *                   ecx = path, edx = flags (O_READ|O_WRITE|O_CREATE)
- *                   returns: fd >= FD_MIN_USER, or negative errno
- *   6  SYS_CLOSE  — release a file descriptor
- *                   ecx = fd
- *                   returns: 0, or negative errno
- *   7  SYS_FREAD  — read bytes from an open fd
- *                   ecx = fd, edx = buf, ebx = max_len
- *                   returns: bytes read (0 = EOF), or negative errno
- *   8  SYS_FWRITE — write bytes to an open fd at current offset
- *                   ecx = fd, edx = buf, ebx = len
- *                   returns: bytes written, or negative errno
+ *   2  SYS_EXIT   — terminate program (handled in idt.c via exit_trampoline)
+ *   3  SYS_READ   — blocking line input
+ *   4  SYS_YIELD  — cooperative yield (no-op)
+ *   5  SYS_OPEN   — open file → fd
+ *   6  SYS_CLOSE  — release fd
+ *   7  SYS_FREAD  — read from fd
+ *   8  SYS_FWRITE — write to fd
  *   9  SYS_SEEK   — reposition fd offset
- *                   ecx = fd, edx = offset (signed), ebx = whence (SEEK_SET/CUR/END)
- *                   returns: new absolute offset, or negative errno
+ *  10  SYS_EXEC   — replace current process image with a new ELF
+ *                   ecx = path (const char*, user pointer)
+ *                   does not return on success; returns -errno on failure
  */
 
 #include "console.h"
+#include "elf.h"
 #include "fat16.h"
 #include "fd.h"
+#include "gdt.h"
 #include "klog.h"
+#include "process.h"
+#include "registers.h"
+#include "serial.h"
 #include "string.h"
 #include "vga.h"
 #include "types.h"
@@ -66,6 +58,10 @@ void syscall_set_fs(fat16_fs_t* fs) {
 }
 
 fd_table_t* syscall_get_fd_table(void) {
+    /* If a process is running, use its per-process fd table. */
+    if (current_proc >= 0 && proc_table[current_proc].state != PROC_DEAD)
+        return &proc_table[current_proc].fd_table;
+    /* Fallback for kernel-only context (e.g. shell-level operations). */
     if (!g_fd_table_ok) {
         fd_table_init(&g_fd_table);
         g_fd_table_ok = 1;
@@ -111,7 +107,8 @@ int32_t sys_read(char* buf, uint32_t max_len) {
 }
 
 /* -----------------------------------------------------------------------
- * SYS_YIELD (4): cooperative yield — no-op in single-task kernel.
+ * SYS_YIELD (4): handled directly in idt.c's syscall_handler via proc_yield().
+ * This stub is kept so nothing breaks if called directly.
  * ----------------------------------------------------------------------- */
 int32_t sys_yield(void) {
     return 0;
@@ -359,4 +356,147 @@ int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence) {
     klog_dec("syscall", "SYS_SEEK old", old_offset);
     klog_dec("syscall", "SYS_SEEK new", f->offset);
     return new_pos;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_EXEC (10): ecx = path (const char*, user pointer)
+ *
+ * Replaces the current user-space image with a new ELF executable loaded
+ * from the FAT16 filesystem.  On success this syscall does NOT return to
+ * the calling program — the ISR's iret frame is patched to jump directly
+ * to the new ELF entry point at ring3.  On failure -errno is returned
+ * normally and the original program continues.
+ *
+ * The kernel stack context (kernel_esp, saved_ebp/ebx/esi/edi) saved by
+ * launch_ring3() is preserved across exec, so when the new program
+ * eventually calls SYS_EXIT, exit_trampoline restores exec_elf's frame
+ * exactly as if the original program had exited.
+ * ----------------------------------------------------------------------- */
+
+/* Kernel-side read buffer — lives in supervisor memory, never overlaps user space. */
+#define EXEC_BUF_SIZE (64 * 1024)
+static uint8_t exec_buf[EXEC_BUF_SIZE];
+
+/* Machine code for the ring3 exit stub planted just below the new stack top.
+ * If _start returns without calling SYS_EXIT this stub runs instead. */
+static const uint8_t exec_exit_stub[] = {
+    0xB8, 0x02, 0x00, 0x00, 0x00,  /* mov $2, %eax   (SYS_EXIT) */
+    0x31, 0xC9,                      /* xor %ecx, %ecx            */
+    0xCD, 0x80,                      /* int $0x80                 */
+    0xF4                             /* hlt            (safety)   */
+};
+#define EXEC_STUB_ADDR (USER_STACK - 32U)
+
+int32_t sys_exec(const char *path, registers_t *regs) {
+    klog("syscall", "SYS_EXEC");
+
+    /* --- 1. Validate the user-supplied path pointer ------------------- */
+    if (!user_ptr_ok(path, 1)) {
+        klog("syscall", "SYS_EXEC: invalid path pointer");
+        return -(int32_t)EINVAL;
+    }
+
+    const char *name = path;
+    if (name[0] == '/') name++;
+    if (!*name) {
+        klog("syscall", "SYS_EXEC: empty path");
+        return -(int32_t)EINVAL;
+    }
+
+    if (!g_fs) {
+        klog("syscall", "SYS_EXEC: filesystem not mounted");
+        return -(int32_t)EIO;
+    }
+
+    klog("syscall", "SYS_EXEC: reading file");
+    serial_write(COM1, "[SIMPLE] SYS_EXEC: path=");
+    serial_write(COM1, name);
+    serial_write(COM1, "\n");
+
+    /* --- 2. Read the ELF file into the kernel exec buffer ------------- */
+    uint32_t out_len = 0;
+    int rc = fat16_read_file(g_fs, 0, name, exec_buf, EXEC_BUF_SIZE, &out_len);
+    if (rc != FAT16_OK) {
+        klog("syscall", "SYS_EXEC: file not found or read error");
+        return -(int32_t)ENOENT;
+    }
+    klog_dec("syscall", "SYS_EXEC: file bytes", out_len);
+
+    /* --- 3. Validate ELF header --------------------------------------- */
+    if (elf_validate(exec_buf) != 0) {
+        klog("syscall", "SYS_EXEC: invalid ELF");
+        return -(int32_t)ENOEXEC;
+    }
+
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)exec_buf;
+    Elf32_Phdr *phdr = (Elf32_Phdr *)(exec_buf + ehdr->e_phoff);
+
+    /* Compute load bias: shift first PT_LOAD segment to USER_BASE. */
+    uint32_t base = 0;
+    int found_load = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            base = USER_BASE - phdr[i].p_vaddr;
+            found_load = 1;
+            break;
+        }
+    }
+    if (!found_load) {
+        klog("syscall", "SYS_EXEC: no PT_LOAD segment");
+        return -(int32_t)ENOEXEC;
+    }
+
+    /* --- 4. Bounds-check all load segments before touching user space - */
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t dest_start = phdr[i].p_vaddr + base;
+        uint32_t dest_end   = dest_start + phdr[i].p_memsz;
+        if (dest_start < USER_BASE || dest_end > USER_STACK) {
+            klog_hex("syscall", "SYS_EXEC: segment out of bounds", dest_start);
+            return -(int32_t)ENOEXEC;
+        }
+    }
+
+    klog("syscall", "SYS_EXEC: ELF valid, loading new image");
+
+    /* --- 5. Copy new ELF segments into user space --------------------- */
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr + base);
+        uint8_t *src  = exec_buf + phdr[i].p_offset;
+        for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
+        for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) dest[j] = 0;
+    }
+
+    uint32_t entry = ehdr->e_entry + base;
+    klog_hex("syscall", "SYS_EXEC: new entry", entry);
+
+    /* --- 6. Plant exit stub and set up new user stack ----------------- */
+    uint8_t *stub = (uint8_t *)EXEC_STUB_ADDR;
+    for (uint32_t i = 0; i < sizeof(exec_exit_stub); i++) stub[i] = exec_exit_stub[i];
+
+    uint32_t new_sp = USER_STACK - 4U - 32U; /* one slot below the stub */
+    *(uint32_t *)new_sp = EXEC_STUB_ADDR;     /* _start return address   */
+
+    klog_hex("syscall", "SYS_EXEC: new_sp", new_sp);
+
+    /* --- 7. Patch the ISR iret frame to jump to the new entry point --- *
+     *                                                                     *
+     * The frame on the kernel ISR stack (kstack, at TSS.esp0) currently  *
+     * holds the old program's [EIP, CS, EFLAGS, ESP, SS].  We overwrite  *
+     * it so the isr_syscall epilogue's iret jumps straight into the new   *
+     * ELF instead of returning to the old program.  The old code/data at  *
+     * USER_BASE has already been replaced above, so there is nothing left  *
+     * for the old program to execute even if somehow control returned.    */
+    regs->eip     = entry;
+    regs->cs      = SEG_UCODE;   /* 0x1B — user code, DPL=3  */
+    regs->eflags  = 0x02;        /* reserved bit; IF=0        */
+    regs->useresp = new_sp;
+    regs->ss      = SEG_UDATA;   /* 0x23 — user data, DPL=3  */
+
+    serial_write(COM1, "[SIMPLE] SYS_EXEC: iret frame patched → new program\n");
+
+    /* Return value ends up in regs->eax via popa, but the new _start
+     * never inspects eax, so the value is irrelevant. */
+    return 0;
 }

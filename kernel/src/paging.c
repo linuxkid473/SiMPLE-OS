@@ -89,3 +89,33 @@ void paging_init(void) {
     klog("paging", "ring3 page tables installed");
     klog_hex("paging", "page_dir phys", (uint32_t)page_dir);
 }
+
+uint32_t *paging_get_page_dir(void) {
+    return page_dir;
+}
+
+void paging_clone(uint32_t *dst_dir, uint32_t *dst_tab0, uint32_t phys_user_base) {
+    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+        if (i == 0) {
+            dst_tab0[i] = 0;  /* null guard */
+        } else if (i < 0x300U) {
+            /* kernel pages: identical physical frames, supervisor */
+            dst_tab0[i] = (i * PAGE_SIZE) | PTE_PRESENT | PTE_RW;
+        } else {
+            /* user pages: remap to child's physical frames */
+            dst_tab0[i] = (phys_user_base + (i - 0x300U) * PAGE_SIZE)
+                          | PTE_PRESENT | PTE_RW | PTE_USER;
+        }
+    }
+
+    /* PDE[0]: point to child's page table, U/S=1 */
+    dst_dir[0] = (uint32_t)dst_tab0 | PDE_PRESENT | PDE_RW | PDE_USER;
+
+    /* PDE[1..1023]: 4 MB supervisor large pages — same formula as paging_init */
+    for (uint32_t i = 1; i < PD_ENTRIES; i++)
+        dst_dir[i] = (i * LARGE_PAGE) | PDE_PRESENT | PDE_RW | PDE_PS;
+}
+
+void paging_switch_dir(uint32_t *dir) {
+    __asm__ volatile("mov %0, %%cr3" : : "r"((uint32_t)dir) : "memory");
+}

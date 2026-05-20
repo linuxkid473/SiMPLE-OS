@@ -4,6 +4,7 @@
 #include "gdt.h"
 #include "klog.h"
 #include "panic.h"
+#include "process.h"
 #include "registers.h"
 #include "serial.h"
 #include "string.h"
@@ -142,9 +143,7 @@ void idt_init(void) {
     klog("idt", "initialized: 32 exception gates + ring3 syscall gate");
 }
 
-/* Declared in elf.c */
-extern int      process_exited;
-extern void     exit_trampoline(void);
+/* process_exited and exit_trampoline used in process.c (via proc_exit). */
 
 /* -------------------------------------------------------------------------
    User-process fault handler
@@ -185,17 +184,11 @@ static void kill_user_process(registers_t *regs, const char *reason) {
         vga_write_line(reason);
     }
 
-    process_exited = 1;
     /*
-     * Patch the iret frame so the ISR epilogue (pop segs, popa, add $8, iret)
-     * jumps to exit_trampoline at ring0 (CS=0x08, RPL=0).
-     * iret will NOT pop useresp/ss when CS has RPL=0, leaving them on the
-     * TSS kernel stack; exit_trampoline immediately switches to kernel_esp so
-     * the abandoned words are harmless.
+     * Delegate to proc_exit which either schedules the next runnable process
+     * or patches the iret frame to exit_trampoline (last process exiting).
      */
-    regs->eip    = (uint32_t)exit_trampoline;
-    regs->cs     = SEG_KCODE;
-    regs->eflags = 0x02; /* reserved bit 1 only; IF=0 */
+    proc_exit(regs, -1);
 }
 
 /* -------------------------------------------------------------------------
@@ -209,22 +202,19 @@ static void syscall_handler(registers_t *regs) {
         break;
     }
     case 2:
-        /* SYS_EXIT: patch iret frame to return to exit_trampoline at ring0 */
-        process_exited   = 1;
-        regs->eip        = (uint32_t)exit_trampoline;
-        regs->cs         = SEG_KCODE;
-        regs->eflags     = 0x02;
+        /* SYS_EXIT: ecx = exit code */
+        proc_exit(regs, (int)regs->ecx);
         break;
     case 3: {
         int32_t sys_read(char *buf, uint32_t max_len);
         regs->eax = (uint32_t)sys_read((char *)regs->ecx, regs->edx);
         break;
     }
-    case 4: {
-        int32_t sys_yield(void);
-        regs->eax = (uint32_t)sys_yield();
+    case 4:
+        /* SYS_YIELD: cooperative yield to next runnable process */
+        proc_yield(regs);
+        regs->eax = 0;
         break;
-    }
     case 5: {
         int32_t sys_open(const char *path, uint32_t flags);
         regs->eax = (uint32_t)sys_open((const char *)regs->ecx, regs->edx);
@@ -256,6 +246,24 @@ static void syscall_handler(registers_t *regs) {
                                         (int32_t)regs->ebx);
         break;
     }
+    case 10: {
+        /*
+         * SYS_EXEC — ecx = path (user pointer).
+         * On success: iret frame is patched; does not return to caller.
+         * On failure: regs->eax gets -errno; iret returns normally.
+         */
+        int32_t sys_exec(const char *path, registers_t *regs);
+        regs->eax = (uint32_t)sys_exec((const char *)regs->ecx, regs);
+        break;
+    }
+    case 11:
+        /*
+         * SYS_FORK — duplicate current process.
+         * Parent: regs->eax = child pid (>0).
+         * Child:  saved_regs.eax = 0 (set inside proc_fork).
+         */
+        regs->eax = (uint32_t)proc_fork(regs);
+        break;
     default:
         klog_dec("syscall", "unknown syscall", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);

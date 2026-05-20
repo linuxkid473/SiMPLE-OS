@@ -11,6 +11,7 @@
 /* errno codes (POSIX subset) */
 #define ENOENT   2
 #define EIO      5
+#define ENOEXEC  8
 #define EBADF    9
 #define EACCES   13
 #define EMFILE   24

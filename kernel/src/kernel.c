@@ -7,6 +7,7 @@
 #include "mouse.h"
 #include "paging.h"
 #include "panic.h"
+#include "process.h"
 #include "serial.h"
 #include "shell.h"
 #include "vga.h"
@@ -136,6 +137,9 @@ void kernel_main(struct stivale2_struct *s2) {
     klog_boot("memory manager initialized");
     klog_hex("kmalloc", "heap_start", 0x200000);
     klog_hex("kmalloc", "heap_size", KMALLOC_HEAP_SIZE);
+
+    proc_init();
+    klog_boot("process table initialized");
 
     keyboard_init();
     klog("keyboard", "initialized");

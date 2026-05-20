@@ -1,6 +1,8 @@
 #include "elf.h"
 #include "gdt.h"
 #include "klog.h"
+#include "paging.h"
+#include "process.h"
 #include "serial.h"
 #include "vga.h"
 #include "types.h"
@@ -14,17 +16,14 @@
  *   0x3F0000 – 0x3FFFC7   user stack (grows down)    (user-accessible)
  *   0x3FFFC8 – 0x3FFFFF   exit stub + stack frame    (user-accessible)
  *
- * IMPORTANT: USER_BASE must match user/linker.ld.
+ * USER_BASE and USER_STACK come from elf.h; must match user/linker.ld and paging.c.
  */
-#define USER_BASE   0x300000U
-#define USER_STACK  0x400000U   /* top of user stack, exclusive */
 
 /*
- * Kernel stack used for ring3 → ring0 ISR transitions (via TSS.esp0).
- * Separate from the main kernel call stack so the two never collide.
+ * The ISR kernel stack is now managed per-process in process.c (proc_kstacks[]).
+ * proc_register_initial() calls tss_set_esp0() with proc_kstacks[0] before
+ * launch_ring3(), so no separate kstack is needed here.
  */
-#define KSTACK_SIZE 4096
-static uint8_t kstack[KSTACK_SIZE] __attribute__((aligned(16)));
 
 /*
  * Context saved by launch_ring3() so that exit_trampoline can restore it
@@ -199,8 +198,12 @@ int exec_elf(void *data) {
     klog_hex("elf", "stub",     stub_addr);
     klog("elf", "launching ring3 program");
 
-    /* Set TSS kernel ISR stack for ring3 → ring0 transitions. */
-    tss_set_esp0((uint32_t)(kstack + KSTACK_SIZE));
+    /*
+     * Register this as the initial process (slot 0).
+     * proc_register_initial() sets TSS.esp0 to proc_kstacks[0] and sets
+     * current_proc=0 so syscall handlers can find the right fd_table.
+     */
+    proc_register_initial(paging_get_page_dir(), (fd_table_t *)0);
 
     process_exited = 0;
 
