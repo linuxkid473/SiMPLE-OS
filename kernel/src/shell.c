@@ -3,6 +3,7 @@
 #include "editor.h"
 #include "elf.h"
 #include "fat16.h"
+#include "fd.h"
 #include "keyboard.h"
 #include "kmalloc.h"
 #include "power.h"
@@ -35,7 +36,7 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "write", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "write", "seek", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -768,6 +769,7 @@ static void shell_help(void) {
     vga_write_line("  cp <src> <dst> - copy file");
     vga_write_line("  mv <src> <dst> - move/rename file");
     vga_write_line("  write <f> <t>  - write text to file");
+    vga_write_line("  seek <fd> <n> <set|cur|end> - seek fd");
     vga_write_line("  poweroff       - power off machine");
     vga_write_line("  reboot         - reboot machine");
     vga_write_line("  kmalloc-test   - test memory allocator");
@@ -1643,6 +1645,90 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             u32_to_dec(text_len, num, sizeof(num));
             vga_write(num);
             vga_write_line(" bytes");
+            continue;
+        }
+
+        if (strcmp(command, "seek") == 0) {
+            char* arg_fd     = next_token(&parse);
+            char* arg_offset = next_token(&parse);
+            char* arg_whence = next_token(&parse);
+            char* extra      = next_token(&parse);
+            if (!arg_fd || !arg_offset || !arg_whence || extra) {
+                vga_write_line("usage: seek <fd> <offset> <set|cur|end>");
+                continue;
+            }
+
+            /* parse fd */
+            int s_fd = 0;
+            for (int i = 0; arg_fd[i]; i++) {
+                if (arg_fd[i] < '0' || arg_fd[i] > '9') { s_fd = -1; break; }
+                s_fd = s_fd * 10 + (arg_fd[i] - '0');
+            }
+            if (s_fd < 0) {
+                vga_write_line("seek: invalid fd");
+                continue;
+            }
+
+            /* parse offset (may be negative) */
+            int s_neg = 0;
+            int s_off = 0;
+            int s_start = 0;
+            if (arg_offset[0] == '-') { s_neg = 1; s_start = 1; }
+            for (int i = s_start; arg_offset[i]; i++) {
+                if (arg_offset[i] < '0' || arg_offset[i] > '9') { s_off = -1; break; }
+                if (s_off >= 0) s_off = s_off * 10 + (arg_offset[i] - '0');
+            }
+            if (s_off < 0 && !s_neg) {
+                vga_write_line("seek: invalid offset");
+                continue;
+            }
+            if (s_neg) s_off = -s_off;
+
+            /* parse whence */
+            int s_whence;
+            if (strcmp(arg_whence, "set") == 0)      s_whence = 0; /* SEEK_SET */
+            else if (strcmp(arg_whence, "cur") == 0) s_whence = 1; /* SEEK_CUR */
+            else if (strcmp(arg_whence, "end") == 0) s_whence = 2; /* SEEK_END */
+            else {
+                vga_write_line("seek: whence must be set, cur, or end");
+                continue;
+            }
+
+            fd_table_t* tbl = syscall_get_fd_table();
+            file_descriptor_t* f = fd_get(tbl, s_fd);
+            if (!f) {
+                vga_write_line("seek: bad fd");
+                continue;
+            }
+
+            /* compute new offset kernel-side (mirrors sys_seek logic) */
+            int new_off;
+            if (s_whence == 0) {
+                new_off = s_off;
+            } else if (s_whence == 1) {
+                new_off = (int)f->offset + s_off;
+            } else {
+                fat16_dirent_t dirent;
+                if (fs && fat16_stat(fs, f->dir_cluster, f->name, &dirent) == FAT16_OK)
+                    f->size = dirent.size;
+                new_off = (int)f->size + s_off;
+            }
+
+            if (new_off < 0) {
+                vga_write_line("seek: negative offset");
+                continue;
+            }
+
+            f->offset = (uint32_t)new_off;
+
+            vga_write("fd ");
+            char num_buf[12];
+            u32_to_dec((uint32_t)s_fd, num_buf, sizeof(num_buf));
+            vga_write(num_buf);
+            vga_write(" offset -> ");
+            u32_to_dec((uint32_t)new_off, num_buf, sizeof(num_buf));
+            vga_write(num_buf);
+            vga_putc('\n');
             continue;
         }
 

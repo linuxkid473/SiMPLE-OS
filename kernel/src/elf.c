@@ -3,8 +3,19 @@
 #include "vga.h"
 #include "types.h"
 
-#define USER_BASE  0x100000   /* where PT_LOAD segments land          */
-#define USER_STACK 0x200000   /* top of the user stack (grows down)   */
+/*
+ * User address space layout (flat, no MMU):
+ *
+ *   0x100000 – ~0x130000  kernel code + data + BSS
+ *   0x200000 – 0x2FFFFF   kmalloc heap (KMALLOC_HEAP_SIZE = 1 MB)
+ *   0x300000 – 0x3EFFFF   user ELF code/data/BSS    (USER_BASE)
+ *   0x3F0000 – 0x3FFFFF   user stack (grows down)   (USER_STACK top)
+ *
+ * IMPORTANT: USER_BASE and the base address in user/linker.ld MUST match.
+ * Changing one requires changing the other and rebuilding all user ELFs.
+ */
+#define USER_BASE  0x300000   /* where PT_LOAD segments land          */
+#define USER_STACK 0x400000   /* top of the user stack (grows down)   */
 
 /*
  * Kernel register state saved by launch_program() before the user stack switch.
@@ -106,7 +117,9 @@ __attribute__((naked)) void exit_trampoline(void) {
  * Must be noinline (guarantees cdecl stack layout for the arg reads).
  * Basic asm inside naked: '%' is literal.
  */
-__attribute__((naked, noinline)) static void launch_program(uint32_t entry, uint32_t user_sp) {
+__attribute__((naked, noinline)) static void
+launch_program(uint32_t entry __attribute__((unused)),
+               uint32_t user_sp __attribute__((unused))) {
     __asm__(
         "movl %esp, kernel_esp\n\t"   /* save kernel ESP (→ return addr)    */
         "movl %ebp, saved_ebp\n\t"
@@ -159,6 +172,18 @@ int exec_elf(void* data) {
         }
     }
 
+    /* Safety: refuse to load over kernel or heap space */
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t dest_start = phdr[i].p_vaddr + base;
+        uint32_t dest_end   = dest_start + phdr[i].p_memsz;
+        if (dest_start < USER_BASE || dest_end > USER_STACK) {
+            klog_hex("elf", "unsafe load dest", dest_start);
+            vga_write_line("ELF: load region outside user space — refused");
+            return -1;
+        }
+    }
+
     /* Copy segments into memory */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD)
@@ -175,6 +200,8 @@ int exec_elf(void* data) {
 
     uint32_t entry = ehdr->e_entry + base;
 
+    klog_hex("elf", "entry", entry);
+    klog_hex("elf", "user_sp", USER_STACK - 4);
     klog("elf", "launching program");
 
     process_exited = 0;

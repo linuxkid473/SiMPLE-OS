@@ -33,6 +33,9 @@
  *   8  SYS_FWRITE — write bytes to an open fd at current offset
  *                   ecx = fd, edx = buf, ebx = len
  *                   returns: bytes written, or negative errno
+ *   9  SYS_SEEK   — reposition fd offset
+ *                   ecx = fd, edx = offset (signed), ebx = whence (SEEK_SET/CUR/END)
+ *                   returns: new absolute offset, or negative errno
  */
 
 #include "console.h"
@@ -44,12 +47,11 @@
 #include "types.h"
 
 /*
- * Minimum valid userspace pointer.  Rejects NULL and the zero page.
- * In this ring-0 kernel user programs load at USER_BASE (0x100000) and
- * their stack sits just below 0x200000, so anything above 0x1000 that
- * doesn't wrap is a plausible user pointer.
+ * Minimum valid userspace pointer.  Must match USER_BASE in elf.c.
+ * User programs load at 0x300000; their stack is below 0x400000.
+ * Pointers below 0x300000 are into kernel or heap space — reject them.
  */
-#define USER_ADDR_MIN 0x1000UL
+#define USER_ADDR_MIN 0x300000UL
 
 static fat16_fs_t* g_fs          = NULL;
 static fd_table_t  g_fd_table;
@@ -296,4 +298,65 @@ int32_t sys_fwrite(int32_t fd, const char* buf, uint32_t len) {
 
     klog_dec("syscall", "SYS_FWRITE wrote", len);
     return (int32_t)len;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_SEEK (9): ecx = fd, edx = offset (signed), ebx = whence
+ *
+ * Repositions fd->offset according to whence:
+ *   SEEK_SET(0): new offset = offset
+ *   SEEK_CUR(1): new offset = fd->offset + offset
+ *   SEEK_END(2): new offset = file_size + offset
+ *
+ * Seeking beyond EOF is allowed (no cluster allocation).
+ * Negative final offsets are rejected with -EINVAL.
+ * fd->size is NOT modified by seek.
+ * ----------------------------------------------------------------------- */
+int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence) {
+    klog_dec("syscall", "SYS_SEEK fd",     (uint32_t)fd);
+    klog_dec("syscall", "SYS_SEEK offset", (uint32_t)offset);
+    klog_dec("syscall", "SYS_SEEK whence", (uint32_t)whence);
+
+    file_descriptor_t* f = fd_get(syscall_get_fd_table(), (int)fd);
+    if (!f) {
+        klog("syscall", "SYS_SEEK: invalid fd");
+        return -(int32_t)EBADF;
+    }
+
+    int32_t new_pos;
+
+    if (whence == SEEK_SET) {
+        if (offset < 0) {
+            klog("syscall", "SYS_SEEK: negative SEEK_SET offset");
+            return -(int32_t)EINVAL;
+        }
+        new_pos = offset;
+    } else if (whence == SEEK_CUR) {
+        new_pos = (int32_t)f->offset + offset;
+        if (new_pos < 0) {
+            klog("syscall", "SYS_SEEK: negative result from SEEK_CUR");
+            return -(int32_t)EINVAL;
+        }
+    } else if (whence == SEEK_END) {
+        /* Re-stat to pick up the latest on-disk size */
+        if (g_fs) {
+            fat16_dirent_t dirent;
+            if (fat16_stat(g_fs, f->dir_cluster, f->name, &dirent) == FAT16_OK)
+                f->size = dirent.size;
+        }
+        new_pos = (int32_t)f->size + offset;
+        if (new_pos < 0) {
+            klog("syscall", "SYS_SEEK: negative result from SEEK_END");
+            return -(int32_t)EINVAL;
+        }
+    } else {
+        klog("syscall", "SYS_SEEK: invalid whence");
+        return -(int32_t)EINVAL;
+    }
+
+    uint32_t old_offset = f->offset;
+    f->offset = (uint32_t)new_pos;
+    klog_dec("syscall", "SYS_SEEK old", old_offset);
+    klog_dec("syscall", "SYS_SEEK new", f->offset);
+    return new_pos;
 }

@@ -5,6 +5,7 @@
 #include "panic.h"
 #include "registers.h"
 #include "serial.h"
+#include "string.h"
 #include "vga.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
@@ -204,6 +205,14 @@ static void syscall_handler(registers_t* regs) {
                                           regs->ebx);
         break;
     }
+    case 9: {
+        /* SYS_SEEK: ecx = fd, edx = offset (signed), ebx = whence */
+        int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence);
+        regs->eax = (uint32_t)sys_seek((int32_t)regs->ecx,
+                                        (int32_t)regs->edx,
+                                        (int32_t)regs->ebx);
+        break;
+    }
     default:
         klog_dec("syscall", "unknown syscall number", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);
@@ -218,9 +227,8 @@ void isr_handler(registers_t* regs) {
     }
 
     if (regs->int_no < 32) {
-        const char* name = (regs->int_no < 32) ? exception_names[regs->int_no] : "Unknown";
-        kernel_panic_regs(name, regs->int_no, regs->err_code,
-                          regs->eip, regs->cs, regs->eflags);
+        const char* name = exception_names[regs->int_no];
+        kernel_panic_full(name, regs);
         return;
     }
 

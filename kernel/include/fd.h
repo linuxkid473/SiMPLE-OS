@@ -18,6 +18,11 @@
 #define ENOSPC   28
 #define EINVAL   22
 
+/* seek whence constants */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
 /* descriptor table sizing */
 #define FD_MAX      8
 #define FD_MIN_USER 3   /* 0-2 reserved (stdin/stdout/stderr ABI slots) */

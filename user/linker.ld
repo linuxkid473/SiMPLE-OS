@@ -2,7 +2,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x00100000;
+    . = 0x00300000;  /* must match USER_BASE in kernel/src/elf.c */
 
     .flat : {
         *(.text*)

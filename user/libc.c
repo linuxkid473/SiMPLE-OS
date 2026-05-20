@@ -73,3 +73,16 @@ int fd_write(int fd, const void* buf, int len) {
 
     return ret;
 }
+
+int seek(int fd, int offset, int whence) {
+    int ret;
+
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(9), "c"(fd), "d"(offset), "b"(whence)
+        : "memory"
+    );
+
+    return ret;
+}
