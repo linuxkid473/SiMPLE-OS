@@ -1,5 +1,6 @@
 #include "idt.h"
 #include "elf.h"
+#include "fd.h"
 #include "klog.h"
 #include "panic.h"
 #include "registers.h"
@@ -146,53 +147,66 @@ extern int process_exited;
 static void syscall_handler(registers_t* regs) {
     switch (regs->eax) {
     case 1: {
-        void sys_write(const char* buf, uint32_t len);
-        sys_write((const char*)regs->ecx, regs->edx);
+        /* SYS_WRITE: ecx = buf, edx = len */
+        int32_t sys_write(const char* buf, uint32_t len);
+        regs->eax = (uint32_t)sys_write((const char*)regs->ecx, regs->edx);
         break;
     }
     case 2:
         /*
          * SYS_EXIT — safe cooperative unwind via ISR frame patch.
          *
-         * This kernel runs entirely at ring 0 with IF=0 (no sti is ever
-         * called; the 8259A PIC is never remapped, so enabling interrupts
-         * would fire hardware IRQs at exception vectors 0-15 → #DF/panic).
-         *
-         * We patch regs->eip so isr_syscall's normal epilogue + iret jumps
-         * to exit_trampoline instead of back into user code.  We do NOT
-         * touch regs->eflags — iret restores the original EFLAGS which has
-         * IF=0.  exit_trampoline then restores kernel_esp and ret's back
-         * into exec_elf.
-         *
-         * IMPORTANT: do NOT set IF=1 here.  Doing so lets the unmasked PIC
-         * fire a timer IRQ at vector 8 (#DF handler) before the trampoline
-         * can restore the kernel stack — immediate hard freeze.
+         * Patch regs->eip so isr_syscall's iret jumps to exit_trampoline
+         * instead of back into user code.  Do NOT touch regs->eflags — this
+         * kernel never calls sti; the unremapped 8259A PIC would fire IRQs at
+         * exception vectors → double fault if IF were set here.
          */
         process_exited = 1;
         regs->eip      = (uint32_t)exit_trampoline;
         break;
     case 3: {
-        /*
-         * SYS_READ — blocking line input from the active terminal.
-         *
-         * ecx = destination char* buffer (in the shared address space)
-         * edx = max_len including the NUL terminator
-         *
-         * Delegates to console_read_line() which polls the keyboard,
-         * echoes characters, handles backspace/cursor editing, and routes
-         * Alt+Arrow / Alt+Tab to the WM so window management keeps working
-         * while the ELF program waits for input.
-         *
-         * regs->eax receives the byte count (excluding NUL).  popa in the
-         * ISR epilogue restores it into EAX, which is the user program's
-         * return register for the int 0x80 convention.
-         */
-        uint32_t sys_read(char* buf, uint32_t max_len);
-        regs->eax = sys_read((char*)regs->ecx, regs->edx);
+        /* SYS_READ: ecx = buf, edx = max_len */
+        int32_t sys_read(char* buf, uint32_t max_len);
+        regs->eax = (uint32_t)sys_read((char*)regs->ecx, regs->edx);
+        break;
+    }
+    case 4: {
+        /* SYS_YIELD: cooperative yield, no-op */
+        int32_t sys_yield(void);
+        regs->eax = (uint32_t)sys_yield();
+        break;
+    }
+    case 5: {
+        /* SYS_OPEN: ecx = path, edx = flags */
+        int32_t sys_open(const char* path, uint32_t flags);
+        regs->eax = (uint32_t)sys_open((const char*)regs->ecx, regs->edx);
+        break;
+    }
+    case 6: {
+        /* SYS_CLOSE: ecx = fd */
+        int32_t sys_close(int32_t fd);
+        regs->eax = (uint32_t)sys_close((int32_t)regs->ecx);
+        break;
+    }
+    case 7: {
+        /* SYS_FREAD: ecx = fd, edx = buf, ebx = max_len */
+        int32_t sys_fread(int32_t fd, char* buf, uint32_t max_len);
+        regs->eax = (uint32_t)sys_fread((int32_t)regs->ecx,
+                                         (char*)regs->edx,
+                                         regs->ebx);
+        break;
+    }
+    case 8: {
+        /* SYS_FWRITE: ecx = fd, edx = buf, ebx = len */
+        int32_t sys_fwrite(int32_t fd, const char* buf, uint32_t len);
+        regs->eax = (uint32_t)sys_fwrite((int32_t)regs->ecx,
+                                          (const char*)regs->edx,
+                                          regs->ebx);
         break;
     }
     default:
-        klog("syscall", "unknown syscall number");
+        klog_dec("syscall", "unknown syscall number", regs->eax);
+        regs->eax = (uint32_t)(-(int32_t)EINVAL);
         break;
     }
 }

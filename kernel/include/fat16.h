@@ -50,5 +50,7 @@ int fat16_write_file(fat16_fs_t* fs, uint16_t dir_cluster, const char* name, con
 int fat16_copy_file(fat16_fs_t* fs, uint16_t src_dir_cluster, const char* src_name, uint16_t dst_dir_cluster, const char* dst_name);
 int fat16_move_file(fat16_fs_t* fs, uint16_t src_dir_cluster, const char* src_name, uint16_t dst_dir_cluster, const char* dst_name);
 int fat16_remove(fat16_fs_t* fs, uint16_t dir_cluster, const char* name);
+int fat16_write_at(fat16_fs_t* fs, uint16_t dir_cluster, const char* name,
+                   uint32_t offset, const char* data, uint32_t len);
 
 #endif

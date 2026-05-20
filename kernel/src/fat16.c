@@ -1,5 +1,6 @@
 #include "fat16.h"
 #include "ata.h"
+#include "klog.h"
 #include "string.h"
 #include "vga.h"
 
@@ -1235,4 +1236,122 @@ int fat16_remove(fat16_fs_t* fs, uint16_t dir_cluster, const char* name) {
     }
 
     return mark_entry_deleted(slot.lba, slot.offset);
+}
+
+/*
+ * fat16_write_at — write len bytes from data into the file at byte offset.
+ *
+ * Supports:
+ *  - Partial overwrite within existing file data (read-modify-write per sector)
+ *  - Appending at EOF (offset == current size)
+ *  - Extending past EOF (new clusters allocated; gap is zero-filled by alloc_cluster)
+ *
+ * The directory entry file_size is updated to max(old_size, offset+len).
+ * Returns FAT16_OK on success, or a FAT16_ERR_* code on failure.
+ */
+int fat16_write_at(fat16_fs_t* fs, uint16_t dir_cluster, const char* name,
+                   uint32_t offset, const char* data, uint32_t len) {
+    if (len == 0) return FAT16_OK;
+
+    uint8_t name83[11];
+    int rc = fat_name_to_83(name, name83);
+    if (rc != FAT16_OK) return rc;
+
+    fat16_raw_dirent_t entry;
+    dir_slot_t slot;
+    rc = find_entry_in_dir(fs, dir_cluster, name83, &entry, &slot);
+    if (rc != FAT16_OK) return rc;
+    if (entry.attr & FAT16_ATTR_DIRECTORY) return FAT16_ERR_ISDIR;
+
+    uint32_t cluster_bytes = (uint32_t)fs->sectors_per_cluster * 512U;
+    uint32_t write_end     = offset + len;
+
+    /* Clusters needed to cover [0, write_end) */
+    uint32_t needed = (write_end + cluster_bytes - 1U) / cluster_bytes;
+
+    uint16_t first_cluster = entry.first_cluster_low;
+    uint16_t tail          = 0;
+    uint32_t chain_count   = 0;
+
+    /* Phase 1: walk existing chain, record count and tail */
+    if (first_cluster >= 2) {
+        uint16_t c = first_cluster;
+        while (c >= 2 && c < FAT16_EOC) {
+            chain_count++;
+            uint16_t next = read_fat_entry(fs, c);
+            if (next >= FAT16_EOC || next < 2) {
+                tail = c;
+                break;
+            }
+            tail = c;
+            c    = next;
+        }
+    }
+
+    /* Phase 2: extend chain with new clusters as needed */
+    while (chain_count < needed) {
+        uint16_t c = alloc_cluster(fs);
+        if (c == 0) {
+            klog("fat16", "fat16_write_at: out of clusters");
+            return FAT16_ERR_NOSPACE;
+        }
+        klog_dec("fat16", "fat16_write_at: alloc cluster", (uint32_t)c);
+
+        if (tail == 0) {
+            /* File was empty — this becomes the first cluster */
+            first_cluster = c;
+            /* alloc_cluster already wrote FAT[c] = 0xFFFF */
+        } else {
+            if (write_fat_entry(fs, tail, c) != FAT16_OK) {
+                /* Roll back the stray allocated cluster */
+                write_fat_entry(fs, c, 0x0000);
+                return FAT16_ERR_IO;
+            }
+            /* alloc_cluster already wrote FAT[c] = 0xFFFF */
+        }
+        tail = c;
+        chain_count++;
+    }
+
+    /* Phase 3: write data sector-by-sector, read-modify-write only where needed */
+    uint16_t cluster   = first_cluster;
+    uint32_t clust_off = 0;  /* file byte offset at the start of current cluster */
+
+    while (cluster >= 2 && cluster < FAT16_EOC && clust_off < write_end) {
+        uint32_t base_lba = cluster_to_lba(fs, cluster);
+
+        for (uint8_t s = 0; s < fs->sectors_per_cluster; s++) {
+            uint32_t sec_start = clust_off + (uint32_t)s * 512U;
+            uint32_t sec_end   = sec_start + 512U;
+
+            /* Skip sectors with no overlap against [offset, write_end) */
+            if (sec_end <= offset || sec_start >= write_end) continue;
+
+            /* Read sector to preserve bytes outside the written range */
+            if (read_sector(base_lba + (uint32_t)s, sector) != FAT16_OK)
+                return FAT16_ERR_IO;
+
+            uint32_t dst_start = (offset > sec_start) ? (offset - sec_start) : 0U;
+            uint32_t dst_end   = (write_end < sec_end) ? (write_end - sec_start) : 512U;
+            uint32_t src_off   = (sec_start + dst_start) - offset;
+
+            for (uint32_t i = 0; i < dst_end - dst_start; i++)
+                sector[dst_start + i] = (uint8_t)data[src_off + i];
+
+            if (write_sector(base_lba + (uint32_t)s, sector) != FAT16_OK)
+                return FAT16_ERR_IO;
+        }
+
+        clust_off += cluster_bytes;
+        if (clust_off >= write_end) break;
+
+        uint16_t next = read_fat_entry(fs, cluster);
+        if (next == cluster || next < 2) break;
+        cluster = next;
+    }
+
+    /* Phase 4: update directory entry */
+    if (write_end > entry.file_size) entry.file_size = write_end;
+    entry.first_cluster_low = first_cluster;
+    return write_dir_entry_at(slot.lba, slot.offset, &entry);
 }

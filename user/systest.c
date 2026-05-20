@@ -2,15 +2,18 @@
 
 #include <stdint.h>
 
-/* libc wrappers */
+/* libc */
 int write(const char* buf, int len);
 void exit(void);
 int open(const char* path, int flags);
 int close(int fd);
 int fd_read(int fd, void* buf, int len);
+int fd_write(int fd, const void* buf, int len);
 
-/* open flags */
+/* flags */
 #define O_READ   (1 << 0)
+#define O_WRITE  (1 << 1)
+#define O_CREATE (1 << 2)
 
 static int strlen(const char* s) {
     int n = 0;
@@ -23,57 +26,57 @@ static void puts(const char* s) {
     write(s, strlen(s));
 }
 
-static void put_hex_byte(uint8_t b) {
-    char out[3];
-    const char* hex = "0123456789ABCDEF";
-
-    out[0] = hex[(b >> 4) & 0xF];
-    out[1] = hex[b & 0xF];
-    out[2] = '\0';
-
-    puts(out);
-}
-
-static void put_num(int n) {
-    char buf[16];
-    int i = 0;
-
-    if (n == 0) {
-        puts("0");
-        return;
+static int strcmp(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b)
+            return *a - *b;
+        a++;
+        b++;
     }
 
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-
-    while (i--) {
-        char c[2];
-        c[0] = buf[i];
-        c[1] = '\0';
-        puts(c);
-    }
+    return *a - *b;
 }
 
 void _start(void) {
     int fd;
     int n;
-    uint8_t buf[16];
-    int i;
+    char buf[64];
+    const char* msg = "hello from userspace";
+    int msg_len = 21;
 
-    puts("SYS_FREAD test\n");
+    puts("SYS_FWRITE test\n");
 
-    fd = open("hello.elf", O_READ);
+    fd = open("write.txt", O_WRITE | O_CREATE);
 
     if (fd < 0) {
         puts("open failed\n");
         exit();
     }
 
-    puts("opened hello.elf\n");
+    puts("opened write.txt\n");
 
-    n = fd_read(fd, buf, sizeof(buf));
+    n = fd_write(fd, msg, msg_len);
+
+    if (n < 0) {
+        puts("fd_write failed\n");
+        close(fd);
+        exit();
+    }
+
+    puts("wrote 21 bytes\n");
+
+    close(fd);
+
+    fd = open("write.txt", O_READ);
+
+    if (fd < 0) {
+        puts("reopen failed\n");
+        exit();
+    }
+
+    puts("reopened file\n");
+
+    n = fd_read(fd, buf, sizeof(buf) - 1);
 
     if (n < 0) {
         puts("fd_read failed\n");
@@ -81,24 +84,16 @@ void _start(void) {
         exit();
     }
 
-    puts("read ");
-    put_num(n);
-    puts(" bytes\n");
+    buf[n] = '\0';
 
-    puts("first 16 bytes:\n");
-
-    for (i = 0; i < n; i++) {
-        put_hex_byte(buf[i]);
-        puts(" ");
-    }
-
+    puts("readback: ");
+    puts(buf);
     puts("\n");
 
-    n = fd_read(fd, buf, 8);
-
-    puts("second read returned ");
-    put_num(n);
-    puts(" bytes\n");
+    if (strcmp(buf, msg) == 0)
+        puts("verification success\n");
+    else
+        puts("verification FAILED\n");
 
     close(fd);
 

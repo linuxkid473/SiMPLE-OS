@@ -7,6 +7,7 @@
 #include "kmalloc.h"
 #include "power.h"
 #include "string.h"
+#include "syscall.h"
 #include "vga.h"
 
 #define SHELL_LINE_MAX 256
@@ -34,7 +35,7 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "write", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -766,6 +767,7 @@ static void shell_help(void) {
     vga_write_line("  rm <name>      - remove file or empty directory");
     vga_write_line("  cp <src> <dst> - copy file");
     vga_write_line("  mv <src> <dst> - move/rename file");
+    vga_write_line("  write <f> <t>  - write text to file");
     vga_write_line("  poweroff       - power off machine");
     vga_write_line("  reboot         - reboot machine");
     vga_write_line("  kmalloc-test   - test memory allocator");
@@ -1151,7 +1153,10 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
     char line[SHELL_LINE_MAX];
 
     cwd_cluster = 0;
-    cwd_depth = 0;
+    cwd_depth   = 0;
+
+    if (fs_ready)
+        syscall_set_fs(fs);
 
     while (1) {
         build_prompt();
@@ -1598,6 +1603,46 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             if (rc != FAT16_OK) {
                 print_generic_fs_error(rc);
             }
+            continue;
+        }
+
+        if (strcmp(command, "write") == 0) {
+            char* arg1 = next_token(&parse);
+            if (!arg1) {
+                vga_write_line("usage: write <file> <text>");
+                continue;
+            }
+
+            char* text = skip_spaces(parse);
+
+            uint16_t dir_cluster = cwd_cluster;
+            char file_name[SHELL_NAME_MAX];
+            int rc = resolve_parent_and_name(fs, arg1, &dir_cluster, file_name);
+            if (rc == FAT16_ERR_NOT_FOUND || rc == FAT16_ERR_NOTDIR) {
+                print_label_target("Directory not found: ", arg1);
+                continue;
+            }
+            if (rc != FAT16_OK) {
+                print_label_target("Invalid file name: ", arg1);
+                continue;
+            }
+
+            uint32_t text_len = (uint32_t)strlen(text);
+            rc = fat16_write_file(fs, dir_cluster, file_name, text, text_len);
+            if (rc == FAT16_ERR_ISDIR) {
+                print_label_target("Is a directory: ", arg1);
+                continue;
+            }
+            if (rc != FAT16_OK) {
+                print_generic_fs_error(rc);
+                continue;
+            }
+
+            vga_write("wrote ");
+            char num[12];
+            u32_to_dec(text_len, num, sizeof(num));
+            vga_write(num);
+            vga_write_line(" bytes");
             continue;
         }
 

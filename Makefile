@@ -27,7 +27,7 @@ OBJS := $(OBJ_ASM) $(OBJ_C)
 
 all: image
 
-user: user/hello.elf user/test.elf user/spam.elf user/systest.elf
+user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf
 
 # User program build flags: no libc, no PIC, flat binary via linker.ld
 USER_CC := $(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
@@ -45,6 +45,9 @@ user/spam.elf: user/spam.c user/libc.c user/linker.ld
 # systest is self-contained — no libc.c needed
 user/systest.elf: user/systest.c user/libc.c user/linker.ld
 	$(USER_CC) -o $@ user/systest.c user/libc.c
+
+user/fwritetest.elf: user/fwritetest.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/fwritetest.c user/libc.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -77,7 +80,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -93,6 +96,7 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf
 	mcopy -i $(IMAGE)@@1048576 user/test.elf ::test.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/spam.elf ::spam.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/systest.elf ::systest.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/fwritetest.elf ::fwrite.elf; \
 	$(LIMINE_DEPLOY) $(IMAGE)
 
 run: image
