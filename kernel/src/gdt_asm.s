@@ -1,4 +1,5 @@
 .global gdt_flush
+.global tss_flush
 
 gdt_flush:
     mov 4(%esp), %eax
@@ -14,4 +15,9 @@ gdt_flush:
     ljmp $0x08, $flush2
 
 flush2:
+    ret
+
+tss_flush:
+    mov $0x28, %ax      /* TSS selector (GDT index 5, RPL=0) */
+    ltr %ax
     ret

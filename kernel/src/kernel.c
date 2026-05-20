@@ -5,6 +5,7 @@
 #include "kmalloc.h"
 #include "klog.h"
 #include "mouse.h"
+#include "paging.h"
 #include "panic.h"
 #include "serial.h"
 #include "shell.h"
@@ -144,6 +145,9 @@ void kernel_main(struct stivale2_struct *s2) {
 
     gdt_init();
     klog_boot("GDT initialized");
+
+    paging_init();
+    klog_boot("paging initialized (ring3 protection active)");
 
     idt_init();
     klog_boot("IDT initialized");

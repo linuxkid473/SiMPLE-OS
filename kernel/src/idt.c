@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "elf.h"
 #include "fd.h"
+#include "gdt.h"
 #include "klog.h"
 #include "panic.h"
 #include "registers.h"
@@ -9,7 +10,7 @@
 #include "vga.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
-static idt_ptr_t idt_ptr;
+static idt_ptr_t   idt_ptr;
 
 extern void isr0(void);
 extern void isr1(void);
@@ -47,7 +48,7 @@ extern void isr34(void);
 extern void isr48(void);
 extern void isr_syscall(void);
 
-static const char* exception_names[] = {
+static const char *exception_names[] = {
     "Division By Zero",
     "Debug",
     "Non Maskable Interrupt",
@@ -83,17 +84,16 @@ static const char* exception_names[] = {
 };
 
 static void idt_set_gate(uint8_t num, uint32_t handler, uint8_t flags) {
-    idt[num].offset_low = (uint16_t)(handler & 0xFFFF);
-    idt[num].selector = 0x08;
-    idt[num].zero = 0;
-    idt[num].flags = flags;
+    idt[num].offset_low  = (uint16_t)(handler & 0xFFFF);
+    idt[num].selector    = SEG_KCODE;
+    idt[num].zero        = 0;
+    idt[num].flags       = flags;
     idt[num].offset_high = (uint16_t)((handler >> 16) & 0xFFFF);
 }
 
 void idt_init(void) {
-    for (uint32_t i = 0; i < IDT_ENTRIES; i++) {
+    for (uint32_t i = 0; i < IDT_ENTRIES; i++)
         idt_set_gate((uint8_t)i, 0, 0);
-    }
 
     idt_set_gate(0,  (uint32_t)isr0,  IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(1,  (uint32_t)isr1,  IDT_TYPE_INTERRUPT_GATE);
@@ -128,85 +128,128 @@ void idt_init(void) {
     idt_set_gate(30, (uint32_t)isr30, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(31, (uint32_t)isr31, IDT_TYPE_INTERRUPT_GATE);
 
-    /* software interrupt test vectors (inttest2=0x22, inttest=0x30) */
-    idt_set_gate(0x22, (uint32_t)isr34,  IDT_TYPE_INTERRUPT_GATE);
-    idt_set_gate(0x30, (uint32_t)isr48,  IDT_TYPE_INTERRUPT_GATE);
+    idt_set_gate(0x22, (uint32_t)isr34, IDT_TYPE_INTERRUPT_GATE);
+    idt_set_gate(0x30, (uint32_t)isr48, IDT_TYPE_INTERRUPT_GATE);
 
+    /* int 0x80 syscall gate: DPL=3 so ring3 can invoke it */
     idt_set_gate(0x80, (uint32_t)isr_syscall,
         IDT_FLAG_PRESENT | IDT_FLAG_32BIT | IDT_FLAG_DPL3 | IDT_FLAG_TRAP);
 
     idt_ptr.limit = (uint16_t)(sizeof(idt_entry_t) * IDT_ENTRIES - 1);
-    idt_ptr.base = (uint32_t)idt;
-
+    idt_ptr.base  = (uint32_t)idt;
     __asm__ volatile("lidt %0" : : "m"(idt_ptr));
 
-    klog("idt", "initialized with 32 exception handlers + syscall gate");
+    klog("idt", "initialized: 32 exception gates + ring3 syscall gate");
 }
 
-extern int process_exited;
+/* Declared in elf.c */
+extern int      process_exited;
+extern void     exit_trampoline(void);
 
-static void syscall_handler(registers_t* regs) {
+/* -------------------------------------------------------------------------
+   User-process fault handler
+   Patches the iret frame so the ISR epilogue returns to exit_trampoline
+   at ring0 instead of back into broken user code.
+   ---------------------------------------------------------------------- */
+static void kill_user_process(registers_t *regs, const char *reason) {
+    serial_write(COM1, "[SIMPLE] user process killed: ");
+    serial_write(COM1, reason);
+    serial_write(COM1, "\n");
+    serial_write(COM1, "[SIMPLE] INT=");   serial_write_dec(COM1, regs->int_no);
+    serial_write(COM1, " ERR=");           serial_write_hex(COM1, regs->err_code);
+    serial_write(COM1, " EIP=");           serial_write_hex(COM1, regs->eip);
+    serial_write(COM1, " CS=");            serial_write_hex(COM1, regs->cs);
+    serial_write(COM1, "\n");
+    serial_write(COM1, "[SIMPLE] EAX=");   serial_write_hex(COM1, regs->eax);
+    serial_write(COM1, " EBX=");           serial_write_hex(COM1, regs->ebx);
+    serial_write(COM1, " ECX=");           serial_write_hex(COM1, regs->ecx);
+    serial_write(COM1, " EDX=");           serial_write_hex(COM1, regs->edx);
+    serial_write(COM1, "\n");
+    serial_write(COM1, "[SIMPLE] ESP=");   serial_write_hex(COM1, regs->useresp);
+    serial_write(COM1, " EBP=");           serial_write_hex(COM1, regs->ebp);
+    serial_write(COM1, "\n");
+
+    if (regs->int_no == 14) {
+        uint32_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        serial_write(COM1, "[SIMPLE] CR2=");
+        serial_write_hex(COM1, cr2);
+        serial_write(COM1, "\n");
+        vga_write("User fault: ");
+        vga_write(reason);
+        vga_write("  CR2=");
+        vga_write_hex(cr2);
+        vga_putc('\n');
+    } else {
+        vga_write("User fault: ");
+        vga_write_line(reason);
+    }
+
+    process_exited = 1;
+    /*
+     * Patch the iret frame so the ISR epilogue (pop segs, popa, add $8, iret)
+     * jumps to exit_trampoline at ring0 (CS=0x08, RPL=0).
+     * iret will NOT pop useresp/ss when CS has RPL=0, leaving them on the
+     * TSS kernel stack; exit_trampoline immediately switches to kernel_esp so
+     * the abandoned words are harmless.
+     */
+    regs->eip    = (uint32_t)exit_trampoline;
+    regs->cs     = SEG_KCODE;
+    regs->eflags = 0x02; /* reserved bit 1 only; IF=0 */
+}
+
+/* -------------------------------------------------------------------------
+   Syscall dispatcher
+   ---------------------------------------------------------------------- */
+static void syscall_handler(registers_t *regs) {
     switch (regs->eax) {
     case 1: {
-        /* SYS_WRITE: ecx = buf, edx = len */
-        int32_t sys_write(const char* buf, uint32_t len);
-        regs->eax = (uint32_t)sys_write((const char*)regs->ecx, regs->edx);
+        int32_t sys_write(const char *buf, uint32_t len);
+        regs->eax = (uint32_t)sys_write((const char *)regs->ecx, regs->edx);
         break;
     }
     case 2:
-        /*
-         * SYS_EXIT — safe cooperative unwind via ISR frame patch.
-         *
-         * Patch regs->eip so isr_syscall's iret jumps to exit_trampoline
-         * instead of back into user code.  Do NOT touch regs->eflags — this
-         * kernel never calls sti; the unremapped 8259A PIC would fire IRQs at
-         * exception vectors → double fault if IF were set here.
-         */
-        process_exited = 1;
-        regs->eip      = (uint32_t)exit_trampoline;
+        /* SYS_EXIT: patch iret frame to return to exit_trampoline at ring0 */
+        process_exited   = 1;
+        regs->eip        = (uint32_t)exit_trampoline;
+        regs->cs         = SEG_KCODE;
+        regs->eflags     = 0x02;
         break;
     case 3: {
-        /* SYS_READ: ecx = buf, edx = max_len */
-        int32_t sys_read(char* buf, uint32_t max_len);
-        regs->eax = (uint32_t)sys_read((char*)regs->ecx, regs->edx);
+        int32_t sys_read(char *buf, uint32_t max_len);
+        regs->eax = (uint32_t)sys_read((char *)regs->ecx, regs->edx);
         break;
     }
     case 4: {
-        /* SYS_YIELD: cooperative yield, no-op */
         int32_t sys_yield(void);
         regs->eax = (uint32_t)sys_yield();
         break;
     }
     case 5: {
-        /* SYS_OPEN: ecx = path, edx = flags */
-        int32_t sys_open(const char* path, uint32_t flags);
-        regs->eax = (uint32_t)sys_open((const char*)regs->ecx, regs->edx);
+        int32_t sys_open(const char *path, uint32_t flags);
+        regs->eax = (uint32_t)sys_open((const char *)regs->ecx, regs->edx);
         break;
     }
     case 6: {
-        /* SYS_CLOSE: ecx = fd */
         int32_t sys_close(int32_t fd);
         regs->eax = (uint32_t)sys_close((int32_t)regs->ecx);
         break;
     }
     case 7: {
-        /* SYS_FREAD: ecx = fd, edx = buf, ebx = max_len */
-        int32_t sys_fread(int32_t fd, char* buf, uint32_t max_len);
+        int32_t sys_fread(int32_t fd, char *buf, uint32_t max_len);
         regs->eax = (uint32_t)sys_fread((int32_t)regs->ecx,
-                                         (char*)regs->edx,
+                                         (char *)regs->edx,
                                          regs->ebx);
         break;
     }
     case 8: {
-        /* SYS_FWRITE: ecx = fd, edx = buf, ebx = len */
-        int32_t sys_fwrite(int32_t fd, const char* buf, uint32_t len);
+        int32_t sys_fwrite(int32_t fd, const char *buf, uint32_t len);
         regs->eax = (uint32_t)sys_fwrite((int32_t)regs->ecx,
-                                          (const char*)regs->edx,
+                                          (const char *)regs->edx,
                                           regs->ebx);
         break;
     }
     case 9: {
-        /* SYS_SEEK: ecx = fd, edx = offset (signed), ebx = whence */
         int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence);
         regs->eax = (uint32_t)sys_seek((int32_t)regs->ecx,
                                         (int32_t)regs->edx,
@@ -214,21 +257,30 @@ static void syscall_handler(registers_t* regs) {
         break;
     }
     default:
-        klog_dec("syscall", "unknown syscall number", regs->eax);
+        klog_dec("syscall", "unknown syscall", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);
         break;
     }
 }
 
-void isr_handler(registers_t* regs) {
+/* -------------------------------------------------------------------------
+   Central ISR dispatcher
+   ---------------------------------------------------------------------- */
+void isr_handler(registers_t *regs) {
     if (regs->int_no == 0x80) {
         syscall_handler(regs);
         return;
     }
 
     if (regs->int_no < 32) {
-        const char* name = exception_names[regs->int_no];
-        kernel_panic_full(name, regs);
+        const char *name = exception_names[regs->int_no];
+        int from_user = (regs->cs & 3) == 3;
+
+        if (from_user) {
+            kill_user_process(regs, name);
+        } else {
+            kernel_panic_full(name, regs);
+        }
         return;
     }
 
