@@ -65,4 +65,8 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
 /* Draw a string at pixel coords with raw RGB fg/bg (title bar text). */
 void fb_draw_string_px(int x, int y, const char* s, uint32_t fg, uint32_t bg);
 
+/* Blit a w*h array of 32bpp pixels (row-major) at screen position (x,y).
+ * Clips to framebuffer bounds. Used by WM syscalls. */
+void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h);
+
 #endif

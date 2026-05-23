@@ -3,6 +3,8 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "string.h"
+#include "io.h"
+#include "kmalloc.h"
 
 /* ================================================================
  * Global window state
@@ -1052,4 +1054,275 @@ void wm_stext_handle_key(int key_type, char ch) {
         stext_move(key_type);
     }
     wm_draw_all();
+}
+
+/* ================================================================
+ * User-space WM — syscalls 20-26
+ *
+ * These syscalls let ring-3 programs create framebuffer windows,
+ * blit pixel buffers, receive keyboard/mouse events, and move
+ * windows without needing to know the framebuffer address.
+ *
+ * Data structures are entirely separate from the kernel-internal
+ * window manager above (wm_windows[], wm_active, etc.).
+ * ================================================================ */
+
+#define MAX_UW_WINDOWS  2      /* static cap; kmalloc has 1 MB headroom */
+#define UW_EQ_SIZE      32     /* power of two for cheap modulo          */
+#define USER_WM_ADDR_MIN 0x300000UL
+
+/* Per-user-window state.  pixels is kmalloc'd on create, never freed
+ * (kfree is a no-op in this OS) but stays valid for the process lifetime. */
+typedef struct {
+    int      active;     /* 1 = slot in use */
+    int16_t  x, y;       /* top-left screen position */
+    int16_t  w, h;       /* pixel dimensions */
+    uint32_t *pixels;    /* backing store (kernel copy of last blit) */
+} uw_window_t;
+
+static uw_window_t uw_windows[MAX_UW_WINDOWS];
+static wm_event_t  wm_eq[UW_EQ_SIZE];
+static uint8_t     wm_eq_head = 0;
+static uint8_t     wm_eq_tail = 0;
+static int         wm_focus_uw = -1;   /* focused user-window slot, or -1 */
+
+/* Ring-buffer push — drops silently when full. */
+static void wm_push_event_internal(wm_event_t e) {
+    uint8_t next = (uint8_t)((wm_eq_tail + 1u) % UW_EQ_SIZE);
+    if (next != wm_eq_head) {
+        wm_eq[wm_eq_tail] = e;
+        wm_eq_tail = next;
+    }
+}
+
+/* Called from keyboard.c after a raw PS/2 scancode is read. */
+void wm_push_key(uint8_t scancode) {
+    if (wm_focus_uw < 0) return;
+    wm_event_t e;
+    e.type = (scancode & 0x80u) ? 2u : 1u;   /* key_up : key_down */
+    e.wid  = (uint16_t)wm_focus_uw;
+    e.x    = (int16_t)scancode;
+    e.y    = 0;
+    e.btn  = 0;
+    wm_push_event_internal(e);
+}
+
+/* Called from mouse.c after a complete 3-byte packet is decoded. */
+void wm_push_mouse_event(int x, int y, uint8_t buttons, uint8_t prev) {
+    if (wm_focus_uw < 0) return;
+    wm_event_t e;
+    e.wid  = (uint16_t)wm_focus_uw;
+    e.x    = (int16_t)x;
+    e.y    = (int16_t)y;
+    e.btn  = buttons;
+    e.type = (buttons != prev) ? 4u : 3u;   /* mouse_btn : mouse_move */
+    wm_push_event_internal(e);
+}
+
+/*
+ * Drain available PS/2 bytes non-blocking.  Called at the start of
+ * SYS_WM_EVENT so the user sees fresh events without needing a
+ * blocking SYS_READ call.
+ *
+ * Keyboard bytes are injected directly into wm_eq via wm_push_key().
+ * Mouse bytes go through mouse_handle_byte() which calls both
+ * wm_handle_mouse() (kernel WM drag/click) and wm_push_mouse_event().
+ */
+static void wm_pump_input(void) {
+    int i;
+    for (i = 0; i < 32; i++) {
+        uint8_t st = inb(0x64);
+        if (!(st & 0x01u)) break;        /* output buffer empty — done    */
+        uint8_t data = inb(0x60);
+        if (st & 0x20u) {
+            mouse_handle_byte(data);     /* routes to wm_handle_mouse + push */
+        } else {
+            if (data != 0xE0u)           /* skip extended-key prefix byte  */
+                wm_push_key(data);
+        }
+    }
+}
+
+/* ---- helpers ---- */
+
+static int uw_valid(int wid) {
+    return wid >= 0 && wid < MAX_UW_WINDOWS && uw_windows[wid].active;
+}
+
+/* Blit a window's backing store to the physical framebuffer. */
+static void uw_blit_to_fb(int wid) {
+    uw_window_t *w = &uw_windows[wid];
+    if (!w->pixels) return;
+    fb_blit_pixels((int)w->x, (int)w->y, w->pixels, (int)w->w, (int)w->h);
+}
+
+/* Erase a window's screen region (fill with black). */
+static void uw_clear_region(uw_window_t *w) {
+    fb_fill_rect((int)w->x, (int)w->y, (int)w->w, (int)w->h, 0x000000u);
+}
+
+/* ---- wm_init extension: zero uw state (called from existing wm_init) ---- */
+/* NOTE: wm_init() is already defined above; we extend it via an init helper
+ * that we call at the END of wm_init().  But since we cannot split wm_init
+ * here, we rely on BSS zero-init for uw_windows[].active = 0 / pixels = NULL
+ * and wm_eq_head/tail = 0 / wm_focus_uw = -1.  This is safe because static
+ * storage in C is zero-initialized before main().  No explicit call needed. */
+
+/* ================================================================
+ * wm_syscall — dispatched from idt.c for eax = 20..26
+ *
+ * Arguments follow the int-0x80 ABI:
+ *   nr = eax   a = ecx   b = edx   c = ebx
+ * ================================================================ */
+int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
+    switch (nr) {
+
+    /* ----------------------------------------------------------
+     * SYS_WM_CREATE (20)
+     *   a = x,  b = y,  c = (w << 16) | h
+     * Returns wid (0..MAX_UW_WINDOWS-1) or -ENOMEM.
+     * ---------------------------------------------------------- */
+    case 20: {
+        int16_t wx = (int16_t)(a & 0xFFFFu);
+        int16_t wy = (int16_t)(b & 0xFFFFu);
+        int16_t ww = (int16_t)((c >> 16) & 0xFFFFu);
+        int16_t wh = (int16_t)(c & 0xFFFFu);
+
+        if (ww <= 0 || wh <= 0 || ww > 800 || wh > 600)
+            return -(int32_t)22;   /* -EINVAL */
+
+        /* Find free slot */
+        int slot = -1;
+        for (int i = 0; i < MAX_UW_WINDOWS; i++) {
+            if (!uw_windows[i].active) { slot = i; break; }
+        }
+        if (slot < 0) return -(int32_t)12;   /* -ENOMEM */
+
+        /* Allocate backing store — kmalloc has 1 MB, test window = 80 KB */
+        uint32_t sz = (uint32_t)ww * (uint32_t)wh * 4u;
+        uint32_t *buf = (uint32_t *)kmalloc((size_t)sz);
+        if (!buf) return -(int32_t)12;        /* -ENOMEM */
+
+        /* Zero the backing store */
+        for (uint32_t i = 0; i < (uint32_t)ww * (uint32_t)wh; i++) buf[i] = 0;
+
+        uw_windows[slot].active = 1;
+        uw_windows[slot].x      = wx;
+        uw_windows[slot].y      = wy;
+        uw_windows[slot].w      = ww;
+        uw_windows[slot].h      = wh;
+        uw_windows[slot].pixels = buf;
+
+        return (int32_t)slot;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_DESTROY (21)
+     *   a = wid
+     * Returns 0 or -EBADF.
+     * ---------------------------------------------------------- */
+    case 21: {
+        int wid = (int)a;
+        if (!uw_valid(wid)) return -(int32_t)9;   /* -EBADF */
+        uw_clear_region(&uw_windows[wid]);
+        uw_windows[wid].active = 0;
+        uw_windows[wid].pixels = (uint32_t *)0;   /* kfree is no-op; leak accepted */
+        if (wm_focus_uw == wid) wm_focus_uw = -1;
+        return 0;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_BLIT (22)
+     *   a = wid,  b = user_pixel_buf (ptr, 32bpp, w*h*4 bytes),  c = len
+     * Validates pointer >= 0x300000, copies pixels into backing
+     * store, then blits to framebuffer.
+     * Returns 0 or -EINVAL / -EBADF.
+     * ---------------------------------------------------------- */
+    case 22: {
+        int wid = (int)a;
+        if (!uw_valid(wid))              return -(int32_t)9;    /* -EBADF  */
+        if (b < USER_WM_ADDR_MIN)        return -(int32_t)22;   /* -EINVAL */
+        uw_window_t *w = &uw_windows[wid];
+        uint32_t expected = (uint32_t)w->w * (uint32_t)w->h * 4u;
+        if (c < expected)                return -(int32_t)22;   /* too small */
+
+        const uint32_t *src = (const uint32_t *)b;
+        uint32_t npix = (uint32_t)w->w * (uint32_t)w->h;
+        for (uint32_t i = 0; i < npix; i++) w->pixels[i] = src[i];
+
+        uw_blit_to_fb(wid);
+        return 0;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_MOVE (23)
+     *   a = wid,  b = new_x,  c = new_y
+     * Clears old position, moves, re-blits.
+     * Returns 0 or -EBADF.
+     * ---------------------------------------------------------- */
+    case 23: {
+        int wid = (int)a;
+        if (!uw_valid(wid)) return -(int32_t)9;   /* -EBADF */
+        uw_window_t *w = &uw_windows[wid];
+        uw_clear_region(w);
+        w->x = (int16_t)(b & 0xFFFFu);
+        w->y = (int16_t)(c & 0xFFFFu);
+        uw_blit_to_fb(wid);
+        return 0;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_EVENT (24)
+     *   a = user_event_buf (ptr to wm_event_t),  b = max_len
+     * Drains pending PS/2 input, then dequeues one event.
+     * Returns event type (> 0) or 0 if queue empty.
+     * Non-blocking.
+     * ---------------------------------------------------------- */
+    case 24: {
+        if (a < USER_WM_ADDR_MIN)       return -(int32_t)22;   /* -EINVAL */
+        if (b < sizeof(wm_event_t))     return -(int32_t)22;
+
+        wm_pump_input();   /* drain available PS/2 bytes first */
+
+        if (wm_eq_head == wm_eq_tail) return 0;   /* queue empty */
+
+        wm_event_t *dst = (wm_event_t *)a;
+        *dst = wm_eq[wm_eq_head];
+        wm_eq_head = (uint8_t)((wm_eq_head + 1u) % UW_EQ_SIZE);
+        return (int32_t)dst->type;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_FLUSH (25)
+     *   a = wid  (-1 = all windows)
+     * Composites user windows onto the physical framebuffer.
+     * Returns 0.
+     * ---------------------------------------------------------- */
+    case 25: {
+        int wid = (int)a;
+        if (wid == -1) {
+            for (int i = 0; i < MAX_UW_WINDOWS; i++)
+                if (uw_windows[i].active) uw_blit_to_fb(i);
+        } else if (uw_valid(wid)) {
+            uw_blit_to_fb(wid);
+        }
+        return 0;
+    }
+
+    /* ----------------------------------------------------------
+     * SYS_WM_SETFOCUS (26)
+     *   a = wid
+     * Routes keyboard events to this window.
+     * Returns 0 or -EBADF.
+     * ---------------------------------------------------------- */
+    case 26: {
+        int wid = (int)a;
+        if (!uw_valid(wid)) return -(int32_t)9;   /* -EBADF */
+        wm_focus_uw = wid;
+        return 0;
+    }
+
+    default:
+        return -(int32_t)22;   /* -EINVAL */
+    }
 }

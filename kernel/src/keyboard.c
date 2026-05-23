@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "io.h"
 #include "mouse.h"
+#include "wm.h"
 
 static int shift_pressed    = 0;
 static int alt_pressed      = 0;
@@ -70,6 +71,12 @@ void keyboard_read_event(key_event_t* event) {
             extended_prefix = 1;
             continue;
         }
+
+        /* Inject raw scancode into the user WM event queue.
+         * Extended-key prefixes (0xE0) are filtered above; all other
+         * scancodes — presses (bit7=0) and releases (bit7=1) — are
+         * forwarded so user programs get the full PS/2 stream. */
+        wm_push_key(scancode);
 
         if (extended_prefix) {
             extended_prefix = 0;

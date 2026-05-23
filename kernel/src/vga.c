@@ -150,6 +150,21 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
+/* Blit a row-major w*h 32bpp pixel array to (x,y) on the framebuffer. */
+void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h) {
+    if (!fb_addr || !src || w <= 0 || h <= 0) return;
+    uint32_t stride = fb_pitch / 4;
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || (uint32_t)dy >= fb_height) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || (uint32_t)dx >= fb_width) continue;
+            fb_addr[(uint32_t)dy * stride + (uint32_t)dx] = src[row * w + col];
+        }
+    }
+}
+
 /*
  * Draw a string at a raw pixel position with explicit RGB fg/bg.
  * Used by wm.c to render the title bar text outside the cell grid.

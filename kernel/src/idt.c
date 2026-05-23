@@ -291,6 +291,14 @@ static void syscall_handler(registers_t *regs) {
         regs->eax = (uint32_t)sys_sbrk((int32_t)regs->ecx);
         break;
     }
+    case 20: case 21: case 22: case 23: case 24: case 25: case 26: {
+        /* SYS_WM_CREATE..SYS_WM_SETFOCUS
+         * ABI: eax=nr  ecx=a  edx=b  ebx=c */
+        int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
+        regs->eax = (uint32_t)wm_syscall(regs->eax, regs->ecx,
+                                          regs->edx, regs->ebx);
+        break;
+    }
     default:
         klog_dec("syscall", "unknown syscall", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);

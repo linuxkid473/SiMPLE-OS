@@ -166,5 +166,6 @@ void mouse_handle_byte(uint8_t data) {
      * which draws the cursor as its very last step using mouse_get_x/y.
      */
     wm_handle_mouse(mx, my, buttons, prev_btns);
+    wm_push_mouse_event(mx, my, buttons, prev_btns);
     prev_btns = buttons;
 }

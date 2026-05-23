@@ -3,6 +3,36 @@
 
 #include "types.h"
 
+/* -----------------------------------------------------------------------
+ * WM event — keyboard / mouse event delivered to ring-3 user programs
+ * via SYS_WM_EVENT (syscall 24).  Identical layout in user/wm.h.
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    uint8_t  type;   /* 0=none  1=key_down  2=key_up  3=mouse_move  4=mouse_btn */
+    uint16_t wid;    /* target user-window id (0xFFFF = broadcast)  */
+    int16_t  x, y;  /* mouse screen coords  OR  raw PS/2 scancode in x */
+    uint8_t  btn;    /* mouse button mask: bit0=left  bit1=right        */
+} __attribute__((packed)) wm_event_t;
+
+/* -----------------------------------------------------------------------
+ * Event injection — called from keyboard.c and mouse.c
+ * ----------------------------------------------------------------------- */
+
+/* Inject a raw PS/2 scancode into the WM event ring.
+ * type = key_down (bit7=0) or key_up (bit7=1), x = scancode.
+ * No-op when no user window is focused. */
+void wm_push_key(uint8_t scancode);
+
+/* Inject a mouse event.  Emits type=3 (move) if only position changed,
+ * type=4 (button) if the button mask changed.
+ * No-op when no user window is focused. */
+void wm_push_mouse_event(int x, int y, uint8_t buttons, uint8_t prev);
+
+/* -----------------------------------------------------------------------
+ * Syscall dispatcher — wired into int 0x80 for syscalls 20-26
+ * ----------------------------------------------------------------------- */
+int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
+
 /*
  * Minimal TempleOS-style pseudo window manager.
  *

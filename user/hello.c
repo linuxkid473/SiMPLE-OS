@@ -1,171 +1,211 @@
-// user/malloctest.c
-#include <stddef.h>
-#include <stdint.h>
+/*
+ * wm.c — SiMPLE-OS ring-3 window manager demo
+ *
+ * Compile:
+ *   gcc -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
+ *       -Wl,-T,user/linker.ld -Wl,-N \
+ *       -o user/wm.elf user/wm.c user/libc.c
+ *
+ * Then add to Makefile and mcopy as ::wm.elf
+ * Run from shell: run wm.elf
+ */
 
-#define SYS_WRITE   1
-#define SYS_EXIT    2
-#define SYS_SBRK    15
+#include "wm.h"
 
-// Syscall wrappers
-static inline int syscall1(int num, int a) {
-    int ret;
-    __asm__ volatile (
-        "mov %1, %%eax\n"
-        "mov %2, %%ecx\n"
-        "int $0x80\n"
-        "mov %%eax, %0\n"
-        : "=r"(ret)
-        : "r"(num), "r"(a)
-        : "eax", "ecx"
-    );
-    return ret;
+/* ------------------------------------------------------------------ */
+/* Minimal libc.h declarations (matches what libc.c already exports)  */
+/* ------------------------------------------------------------------ */
+int   write(const char *buf, int len);
+void  exit(void);
+int   wm_create(int x, int y, int w, int h);
+int   wm_destroy(int wid);
+int   wm_blit(int wid, unsigned int *buf, int len);
+int   wm_move(int wid, int x, int y);
+int   wm_event(wm_event_t *ev, int max);
+int   wm_flush(int wid);
+int   wm_setfocus(int wid);
+
+/* ------------------------------------------------------------------ */
+/* Config                                                              */
+/* ------------------------------------------------------------------ */
+#define SCREEN_W   800
+#define SCREEN_H   600
+
+#define WIN_W      200
+#define WIN_H      120
+#define WIN_X       50
+#define WIN_Y       50
+
+#define WIN2_W     160
+#define WIN2_H     100
+#define WIN2_X     300
+#define WIN2_Y     200
+
+/* pixel buffer for each window (static — lives in BSS at 0x300000+) */
+static unsigned int buf1[WIN_W  * WIN_H ];
+static unsigned int buf2[WIN2_W * WIN2_H];
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+static void fill(unsigned int *buf, int w, int h, unsigned int color)
+{
+    int n = w * h;
+    for (int i = 0; i < n; i++) buf[i] = color;
 }
 
-static inline int syscall2(int num, int a, int b) {
-    int ret;
-    __asm__ volatile (
-        "mov %1, %%eax\n"
-        "mov %2, %%ecx\n"
-        "mov %3, %%edx\n"
-        "int $0x80\n"
-        "mov %%eax, %0\n"
-        : "=r"(ret)
-        : "r"(num), "r"(a), "r"(b)
-        : "eax", "ecx", "edx"
-    );
-    return ret;
+/* draw a 1-px border inside the buffer */
+static void border(unsigned int *buf, int w, int h, unsigned int color)
+{
+    for (int x = 0; x < w; x++) {
+        buf[x]               = color;   /* top row    */
+        buf[(h-1)*w + x]     = color;   /* bottom row */
+    }
+    for (int y = 0; y < h; y++) {
+        buf[y*w]             = color;   /* left col   */
+        buf[y*w + (w-1)]     = color;   /* right col  */
+    }
 }
 
-// Minimal malloc/free
-typedef struct {
-    size_t size;
-} alloc_header_t;
-
-static void *malloc(size_t size) {
-    if (size == 0) return 0;
-    
-    // Request size + header from sbrk
-    size_t total = size + sizeof(alloc_header_t);
-    void *ptr = (void *)syscall1(SYS_SBRK, (int)total);
-    
-    if (ptr == (void *)-1) return 0;
-    
-    // Store size in header
-    alloc_header_t *header = (alloc_header_t *)ptr;
-    header->size = size;
-    
-    // Return pointer after header
-    return (void *)((char *)ptr + sizeof(alloc_header_t));
+/* draw a filled rect inside the buffer */
+static void rect(unsigned int *buf, int bw,
+                 int rx, int ry, int rw, int rh,
+                 unsigned int color)
+{
+    for (int y = ry; y < ry + rh; y++)
+        for (int x = rx; x < rx + rw; x++)
+            buf[y * bw + x] = color;
 }
 
-static void free(void *ptr) {
-    // For now, just a no-op
-    // Real implementation would track free list
-    (void)ptr;
-}
-
-// Utilities
-static void print(const char *s) {
+static void print(const char *s)
+{
     int len = 0;
     while (s[len]) len++;
-    syscall2(SYS_WRITE, (int)s, len);
+    write(s, len);
 }
 
-static void print_int(int n) {
-    if (n < 0) { print("-"); n = -n; }
-    char buf[12];
+static void print_int(int n)
+{
+    if (n < 0) { write("-", 1); n = -n; }
+    char tmp[12];
     int i = 11;
-    buf[i] = '\0';
-    if (n == 0) { print("0"); return; }
-    while (n > 0) {
-        buf[--i] = '0' + (n % 10);
-        n /= 10;
-    }
-    print(&buf[i]);
+    tmp[i] = 0;
+    if (n == 0) { write("0", 1); return; }
+    while (n && i > 0) { tmp[--i] = '0' + (n % 10); n /= 10; }
+    print(tmp + i);
 }
 
-static void memcpy(void *dst, const void *src, size_t size) {
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
-    for (size_t i = 0; i < size; i++) {
-        d[i] = s[i];
-    }
-}
+/* ------------------------------------------------------------------ */
+/* _start                                                              */
+/* ------------------------------------------------------------------ */
+void _start(void)
+{
+    print("[wm] starting ring-3 WM demo\n");
 
-static int memcmp(const void *a, const void *b, size_t size) {
-    const char *ca = (const char *)a;
-    const char *cb = (const char *)b;
-    for (size_t i = 0; i < size; i++) {
-        if (ca[i] != cb[i]) return ca[i] - cb[i];
-    }
-    return 0;
-}
+    /* ---- window 1: blue with white border ------------------------- */
+    fill(buf1, WIN_W, WIN_H, 0xFF1155AA);
+    border(buf1, WIN_W, WIN_H, 0xFFFFFFFF);
+    /* small red square in corner as a visual marker */
+    rect(buf1, WIN_W, 4, 4, 20, 20, 0xFFDD3333);
 
-void _start(void) {
-    print("=== malloc test ===\n");
-
-    // Test 1: allocate and write to first buffer
-    print("test 1: allocate 32 bytes\n");
-    char *buf1 = (char *)malloc(32);
-    if (!buf1) {
-        print("FAILED: malloc returned null\n");
-        syscall1(SYS_EXIT, 1);
+    int w1 = wm_create(WIN_X, WIN_Y, WIN_W, WIN_H);
+    if (w1 < 0) {
+        print("[wm] ERROR: wm_create w1 failed: ");
+        print_int(w1);
+        print("\n");
+        exit();
     }
-    const char *str1 = "hello from malloc";
-    memcpy(buf1, str1, 16);
-    print("wrote: ");
-    syscall2(SYS_WRITE, (int)buf1, 16);
+    print("[wm] window 1 created, wid=");
+    print_int(w1);
     print("\n");
 
-    // Test 2: allocate second buffer
-    print("test 2: allocate 64 bytes\n");
-    char *buf2 = (char *)malloc(64);
-    if (!buf2) {
-        print("FAILED: malloc returned null\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    const char *str2 = "second allocation";
-    memcpy(buf2, str2, 16);
-    print("wrote: ");
-    syscall2(SYS_WRITE, (int)buf2, 16);
-    print("\n");
+    wm_setfocus(w1);
+    wm_blit(w1, buf1, WIN_W * WIN_H * 4);
+    wm_flush(w1);
+    print("[wm] window 1 blitted (blue, white border, red corner)\n");
 
-    // Test 3: allocate third buffer
-    print("test 3: allocate 16 bytes\n");
-    char *buf3 = (char *)malloc(16);
-    if (!buf3) {
-        print("FAILED: malloc returned null\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    const char *str3 = "tiny";
-    memcpy(buf3, str3, 4);
-    print("wrote: ");
-    syscall2(SYS_WRITE, (int)buf3, 4);
-    print("\n");
+    /* ---- window 2: green with yellow border ----------------------- */
+    fill(buf2, WIN2_W, WIN2_H, 0xFF226622);
+    border(buf2, WIN2_W, WIN2_H, 0xFFFFDD00);
+    /* cyan stripe across the middle */
+    rect(buf2, WIN2_W, 0, WIN2_H/2 - 4, WIN2_W, 8, 0xFF00CCCC);
 
-    // Test 4: verify data integrity
-    print("test 4: verify data integrity\n");
-    if (memcmp(buf1, "hello from malloc", 16) != 0) {
-        print("FAILED: buf1 corrupted\n");
-        syscall1(SYS_EXIT, 1);
+    int w2 = wm_create(WIN2_X, WIN2_Y, WIN2_W, WIN2_H);
+    if (w2 < 0) {
+        print("[wm] ERROR: wm_create w2 failed: ");
+        print_int(w2);
+        print("\n");
+        /* still continue with just one window */
+    } else {
+        print("[wm] window 2 created, wid=");
+        print_int(w2);
+        print("\n");
+        wm_blit(w2, buf2, WIN2_W * WIN2_H * 4);
+        wm_flush(w2);
+        print("[wm] window 2 blitted (green, yellow border, cyan stripe)\n");
     }
-    if (memcmp(buf2, "second allocation", 16) != 0) {
-        print("FAILED: buf2 corrupted\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    if (memcmp(buf3, "tiny", 4) != 0) {
-        print("FAILED: buf3 corrupted\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    print("all buffers intact\n");
 
-    // Test 5: free (no-op for now)
-    print("test 5: free buffers\n");
-    free(buf1);
-    free(buf2);
-    free(buf3);
-    print("freed\n");
+    /* ---- event loop ----------------------------------------------- */
+    print("[wm] event loop: move mouse to drag w1, press any key to exit\n");
 
-    print("MALLOC TEST PASSED\n");
-    syscall1(SYS_EXIT, 0);
+    wm_event_t ev;
+    int running = 1;
+    int mx = WIN_X, my = WIN_Y;   /* track w1 position */
+
+    while (running) {
+        int type = wm_event(&ev, sizeof(wm_event_t));
+
+        if (type == WM_EV_KEY_DOWN) {
+            print("[wm] key down scancode=");
+            print_int((int)(unsigned short)ev.x);
+            print(" — exiting\n");
+            running = 0;
+        }
+        else if (type == WM_EV_MOUSE_MOV) {
+            int nx = (int)(short)ev.x - WIN_W / 2;
+            int ny = (int)(short)ev.y - WIN_H / 2;
+
+            /* clamp to screen */
+            if (nx < 0)                  nx = 0;
+            if (ny < 0)                  ny = 0;
+            if (nx + WIN_W > SCREEN_W)   nx = SCREEN_W - WIN_W;
+            if (ny + WIN_H > SCREEN_H)   ny = SCREEN_H - WIN_H;
+
+            if (nx != mx || ny != my) {
+                mx = nx;
+                my = ny;
+                wm_move(w1, mx, my);
+                /* re-blit because move only re-draws old backing store */
+                wm_blit(w1, buf1, WIN_W * WIN_H * 4);
+                wm_flush(w1);
+            }
+        }
+        else if (type == WM_EV_MOUSE_BTN) {
+            /* right-click cycles window 1 colour */
+            if (ev.btn & 0x02) {
+                static unsigned int colors[] = {
+                    0xFF1155AA,   /* blue   */
+                    0xFFAA2211,   /* red    */
+                    0xFF117733,   /* green  */
+                    0xFF885500,   /* orange */
+                };
+                static int ci = 0;
+                ci = (ci + 1) & 3;
+                fill(buf1, WIN_W, WIN_H, colors[ci]);
+                border(buf1, WIN_W, WIN_H, 0xFFFFFFFF);
+                rect(buf1, WIN_W, 4, 4, 20, 20, 0xFFDD3333);
+                wm_blit(w1, buf1, WIN_W * WIN_H * 4);
+                wm_flush(w1);
+                print("[wm] right-click: changed w1 colour\n");
+            }
+        }
+        /* type == 0 → queue empty, tight-loop is fine for a demo */
+    }
+
+    /* ---- cleanup -------------------------------------------------- */
+    wm_destroy(w1);
+    if (w2 >= 0) wm_destroy(w2);
+    print("[wm] windows destroyed, done\n");
+    exit();
 }
