@@ -71,6 +71,9 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     else
         fd_table_init(&proc_table[0].fd_table);
     current_proc = 0;
+    /* Restore CR3 to this process's page directory.  After a multi-process
+     * run, CR3 may still point to a dead child's page directory. */
+    paging_switch_dir(page_dir);
     /* Switch ISR stack to proc_kstacks[0] for this process */
     tss_set_esp0((uint32_t)(proc_kstacks[0] + 4096));
 

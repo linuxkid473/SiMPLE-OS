@@ -160,6 +160,17 @@ int exec_elf(void *data) {
         }
     }
 
+    /*
+     * Reset CR3 to the kernel's global page directory before touching user
+     * space.  After multi-process runs (e.g. multi.elf), proc_exit() returns
+     * to exec_elf via exit_trampoline without restoring CR3.  CR3 is left
+     * pointing at the last dying child's page directory, which maps
+     * 0x300000–0x3FFFFF to a different physical frame.  Any write to user
+     * space (ELF copy, stack setup) or sbrk mapping would silently target
+     * the wrong physical memory, causing page faults on the next run.
+     */
+    paging_switch_dir(paging_get_page_dir());
+
     /* Copy segments and zero BSS. */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
