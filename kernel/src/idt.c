@@ -284,6 +284,13 @@ static void syscall_handler(registers_t *regs) {
          */
         regs->eax = (uint32_t)proc_wait(regs);
         break;
+    case 15: {
+        /* SYS_SBRK — ecx = increment in bytes (>0 to grow heap).
+         * Returns old break (start of newly usable memory), or -1 on error. */
+        int32_t sys_sbrk(int32_t increment);
+        regs->eax = (uint32_t)sys_sbrk((int32_t)regs->ecx);
+        break;
+    }
     default:
         klog_dec("syscall", "unknown syscall", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);

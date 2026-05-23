@@ -35,7 +35,7 @@ OBJS := $(OBJ_ASM) $(OBJ_C)
 
 all: image
 
-user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf
+user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf
 
 # User program build flags: no libc, no PIC, flat binary via linker.ld
 USER_CC := $(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
@@ -75,6 +75,9 @@ user/multitest.elf: user/multitest.c user/libc.c user/linker.ld
 user/forkwait.elf: user/forkwait.c user/libc.c user/linker.ld
 	$(USER_CC) -o $@ user/forkwait.c user/libc.c
 
+user/malloctest.elf: user/malloctest.c user/malloc.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/malloctest.c user/malloc.c user/libc.c
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -106,7 +109,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -129,6 +132,7 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf
 	mcopy -i $(IMAGE)@@1048576 user/hog.elf ::hog.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/multitest.elf ::multi.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/forkwait.elf ::fwait.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/malloctest.elf ::malloc.elf; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% set 1 boot on 2>/dev/null || true; \
         $(LIMINE_DEPLOY) $(IMAGE)
 

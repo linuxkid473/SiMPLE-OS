@@ -31,6 +31,7 @@
 #include "fd.h"
 #include "gdt.h"
 #include "klog.h"
+#include "paging.h"
 #include "process.h"
 #include "registers.h"
 #include "serial.h"
@@ -499,4 +500,56 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     /* Return value ends up in regs->eax via popa, but the new _start
      * never inspects eax, so the value is irrelevant. */
     return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_SBRK (15): ecx = increment (bytes, must be > 0)
+ *
+ * Grows the calling process's heap by `increment` bytes.
+ * Returns the old break value (start of newly usable memory).
+ * Returns -1 if the heap would exceed 0x700000 or physical pages run out.
+ *
+ * Each process starts with brk = 0x400000.  Pages are lazily mapped into
+ * the process's PDE[1] page table as user-accessible (ring-3 R/W).
+ * ----------------------------------------------------------------------- */
+#define PROC_BRK_MAX 0x700000U
+
+int32_t sys_sbrk(int32_t increment) {
+    if (current_proc < 0) {
+        klog("syscall", "SYS_SBRK: no current process");
+        return -1;
+    }
+
+    process_t *proc = &proc_table[current_proc];
+    uint32_t old_brk = proc->brk;
+
+    if (increment <= 0) return (int32_t)old_brk;
+
+    uint32_t new_brk = old_brk + (uint32_t)increment;
+
+    if (new_brk > PROC_BRK_MAX || new_brk < old_brk) {
+        klog("syscall", "SYS_SBRK: heap limit exceeded");
+        return -1;
+    }
+
+    /* Map any 4 KB pages newly required to cover [old_brk, new_brk). */
+    for (uint32_t addr = old_brk & ~0xFFFU; addr < new_brk; addr += 0x1000U) {
+        if (paging_page_mapped(proc->page_dir, addr)) continue;
+        uint32_t phys = paging_alloc_phys_page();
+        if (!phys) {
+            klog("syscall", "SYS_SBRK: out of physical pages");
+            return -1;
+        }
+        paging_map_page(proc->page_dir, addr, phys, 1 /*user*/);
+    }
+
+    proc->brk = new_brk;
+
+    serial_write(COM1, "[sbrk] old=");
+    serial_write_hex(COM1, old_brk);
+    serial_write(COM1, " new=");
+    serial_write_hex(COM1, new_brk);
+    serial_write(COM1, "\n");
+
+    return (int32_t)old_brk;
 }

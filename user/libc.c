@@ -146,3 +146,16 @@ int yield(void) {
     );
     return ret;
 }
+
+/* sbrk — grow heap by increment bytes.
+ * Returns old break (pointer to start of new region), or -1 on failure. */
+int sbrk(int increment) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(15), "c"(increment)
+        : "memory"
+    );
+    return ret;
+}

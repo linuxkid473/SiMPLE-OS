@@ -33,10 +33,12 @@ int       current_proc = -1;
 /*
  * Per-process page directories, page tables, and ISR kernel stacks.
  * All must be page-aligned; static in BSS guarantees zero-init.
- * Total: 4*(4+4+4) = 48 KB — well within kernel BSS.
+ * proc_ptabs1: per-process page table for PDE[1] (0x400000–0x7FFFFF),
+ * used to map heap pages via SYS_SBRK.
  */
 static uint32_t proc_pdirs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
 static uint32_t proc_ptabs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
+static uint32_t proc_ptabs1 [MAX_PROCS][1024] __attribute__((aligned(4096)));
 static uint8_t  proc_kstacks[MAX_PROCS][4096] __attribute__((aligned(16)));
 
 void proc_init(void) {
@@ -63,6 +65,7 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     proc_table[0].page_dir        = page_dir;
     proc_table[0].exit_code       = 0;
     proc_table[0].ticks_remaining = PROC_TIMESLICE;
+    proc_table[0].brk             = 0x400000U;
     if (fdt)
         proc_table[0].fd_table = *fdt;
     else
@@ -86,6 +89,7 @@ static int alloc_child_slot(void) {
             proc_table[i].state           = PROC_RUNNABLE;
             proc_table[i].exit_code       = 0;
             proc_table[i].ticks_remaining = PROC_TIMESLICE;
+            proc_table[i].brk             = 0x400000U;
             fd_table_init(&proc_table[i].fd_table);
             return i;
         }
@@ -232,7 +236,8 @@ int proc_fork(registers_t *regs) {
         dst[i] = src[i];
 
     /* 2. Build child's page directory: kernel mappings shared, user remapped. */
-    paging_clone(proc_pdirs[child_slot], proc_ptabs[child_slot], child_phys);
+    paging_clone(proc_pdirs[child_slot], proc_ptabs[child_slot],
+                 proc_ptabs1[child_slot], child_phys);
     child->page_dir = proc_pdirs[child_slot];
 
     /* 3. Clone fd table from parent. */

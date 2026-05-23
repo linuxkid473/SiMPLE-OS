@@ -39,6 +39,7 @@ typedef struct {
     fd_table_t   fd_table;
     int          exit_code;
     uint32_t     ticks_remaining;  /* preemption countdown; reset on each switch-in */
+    uint32_t     brk;              /* user heap break: next free virtual byte        */
 } process_t;
 
 extern process_t proc_table[MAX_PROCS];
