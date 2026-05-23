@@ -123,6 +123,18 @@ int fork(void) {
     return ret;
 }
 
+/* wait — block until any child exits; returns child's exit code, or -1. */
+int wait(void) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(12)
+        : "memory"
+    );
+    return ret;
+}
+
 /* yield — cooperatively hand CPU to the next runnable process. */
 int yield(void) {
     int ret;

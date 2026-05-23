@@ -1,10 +1,18 @@
 CROSS ?= i686-elf
+# Use the cross compiler if available, otherwise fall back to native gcc -m32
+ifneq ($(shell command -v $(CROSS)-gcc 2>/dev/null),)
 CC := $(CROSS)-gcc
+else ifneq ($(shell command -v i686-linux-gnu-gcc 2>/dev/null),)
+CC := i686-linux-gnu-gcc
+else
+CC := gcc
+endif
 AS := $(CC)
 
-CFLAGS := -std=gnu99 -m32 -ffreestanding -fno-stack-protector -fno-pic -nostdlib -Wall -Wextra -O2 -Ikernel/include
+CFLAGS := -std=gnu99 -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -nostdlib -Wall -Wextra -O2 -Ikernel/include
 ASFLAGS := -m32 -ffreestanding -nostdlib
-LDFLAGS := -m32 -ffreestanding -nostdlib -T kernel/linker.ld
+LDFLAGS := -m32 -ffreestanding -nostdlib -no-pie -static -T kernel/linker.ld \
+	-Wl,--no-dynamic-linker -Wl,--build-id=none
 
 BUILD_DIR := build
 KERNEL_ELF := $(BUILD_DIR)/kernel.bin
@@ -27,7 +35,7 @@ OBJS := $(OBJ_ASM) $(OBJ_C)
 
 all: image
 
-user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf
+user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf
 
 # User program build flags: no libc, no PIC, flat binary via linker.ld
 USER_CC := $(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
@@ -64,6 +72,9 @@ user/hog.elf: user/hog.c user/libc.c user/linker.ld
 user/multitest.elf: user/multitest.c user/libc.c user/linker.ld
 	$(USER_CC) -o $@ user/multitest.c user/libc.c
 
+user/forkwait.elf: user/forkwait.c user/libc.c user/linker.ld
+	$(USER_CC) -o $@ user/forkwait.c user/libc.c
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -95,7 +106,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -117,7 +128,9 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf
 	mcopy -i $(IMAGE)@@1048576 user/forktest.elf ::fork.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/hog.elf ::hog.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/multitest.elf ::multi.elf; \
-	$(LIMINE_DEPLOY) $(IMAGE)
+	mcopy -i $(IMAGE)@@1048576 user/forkwait.elf ::fwait.elf; \
+	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% set 1 boot on 2>/dev/null || true; \
+        $(LIMINE_DEPLOY) $(IMAGE)
 
 run: image
 	qemu-system-x86_64 -drive format=raw,file=$(IMAGE) -serial stdio -no-reboot -no-shutdown

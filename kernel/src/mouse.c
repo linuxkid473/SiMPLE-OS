@@ -89,7 +89,7 @@ void mouse_init(void) {
     if (!wait_read())  return;
     uint8_t ccb = inb(0x60);
     ccb |=  0x02;              /* enable IRQ12 in CCB */
-    ccb &= ~0x20;              /* clear "mouse disabled" bit */
+    ccb &= ~0x30;              /* clear bit4 (keyboard-disable) AND bit5 (mouse-disable) */
     if (!wait_write()) return;
     outb(0x64, 0x60);          /* write CCB */
     if (!wait_write()) return;

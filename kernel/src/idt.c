@@ -274,6 +274,16 @@ static void syscall_handler(registers_t *regs) {
          */
         regs->eax = (uint32_t)proc_fork(regs);
         break;
+    case 12:
+        /*
+         * SYS_WAIT — block until any child exits, then reap it.
+         * Returns child's exit code, or -1 if no children exist.
+         * When blocking: do_switch runs child; proc_exit() patches
+         * saved_regs.eax with the exit code before switching back,
+         * so the ISR epilogue delivers the correct value to ring3.
+         */
+        regs->eax = (uint32_t)proc_wait(regs);
+        break;
     default:
         klog_dec("syscall", "unknown syscall", regs->eax);
         regs->eax = (uint32_t)(-(int32_t)EINVAL);

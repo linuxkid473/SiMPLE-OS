@@ -53,7 +53,12 @@ void proc_init(void) {
  * Called by exec_elf() before launch_ring3().
  */
 void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
+    /* Reset any leftover zombie child slots from a previous run. */
+    for (int i = 1; i < MAX_PROCS; i++)
+        proc_table[i].state = PROC_DEAD;
+
     proc_table[0].pid             = 1;
+    proc_table[0].parent_pid      = -1;
     proc_table[0].state           = PROC_RUNNING;
     proc_table[0].page_dir        = page_dir;
     proc_table[0].exit_code       = 0;
@@ -77,6 +82,7 @@ static int alloc_child_slot(void) {
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_DEAD) {
             proc_table[i].pid             = i + 1;
+            proc_table[i].parent_pid      = (current_proc >= 0) ? proc_table[current_proc].pid : -1;
             proc_table[i].state           = PROC_RUNNABLE;
             proc_table[i].exit_code       = 0;
             proc_table[i].ticks_remaining = PROC_TIMESLICE;
@@ -162,8 +168,25 @@ void proc_exit(registers_t *regs, int code) {
     int dying = current_proc;
 
     if (dying >= 0) {
-        proc_table[dying].state     = PROC_DEAD;
+        proc_table[dying].state     = PROC_ZOMBIE;
         proc_table[dying].exit_code = code;
+
+        /* If parent is blocked in wait(), reap immediately and wake it. */
+        int ppid = proc_table[dying].parent_pid;
+        if (ppid >= 0) {
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (proc_table[i].pid == ppid &&
+                    proc_table[i].state == PROC_BLOCKED) {
+                    proc_table[dying].state          = PROC_DEAD;
+                    proc_table[i].saved_regs.eax     = (uint32_t)code;
+                    proc_table[i].state              = PROC_RUNNABLE;
+                    klog_dec("proc", "exit: woke blocked parent pid",
+                             (uint32_t)ppid);
+                    break;
+                }
+            }
+        }
+
         serial_write(COM1, "[proc] exit pid=");
         serial_write_dec(COM1, (uint32_t)proc_table[dying].pid);
         serial_write(COM1, "\n");
@@ -233,6 +256,54 @@ int proc_fork(registers_t *regs) {
 
     /* Parent gets child pid as fork() return value. */
     return child->pid;
+}
+
+int proc_wait(registers_t *regs) {
+    if (current_proc < 0) return -1;
+
+    int my_pid = proc_table[current_proc].pid;
+
+    /* Reap any zombie child immediately. */
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_ZOMBIE &&
+            proc_table[i].parent_pid == my_pid) {
+            int code = proc_table[i].exit_code;
+            proc_table[i].state = PROC_DEAD;
+            klog_dec("proc", "wait: reaped zombie pid",
+                     (uint32_t)proc_table[i].pid);
+            return code;
+        }
+    }
+
+    /* No zombie yet — check if any children are still alive. */
+    int has_child = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].parent_pid == my_pid &&
+            proc_table[i].state != PROC_DEAD) {
+            has_child = 1;
+            break;
+        }
+    }
+    if (!has_child) return -1;
+
+    /* Block until a child exits; proc_exit() will wake us and set
+     * saved_regs.eax to the child's exit code before do_switch back. */
+    proc_table[current_proc].saved_regs = *regs;
+    proc_table[current_proc].state      = PROC_BLOCKED;
+
+    int next = sched_next_after(current_proc);
+    if (next < 0) {
+        /* Deadlock: no other runnable process. Return -1 to avoid hanging. */
+        proc_table[current_proc].state = PROC_RUNNING;
+        return -1;
+    }
+
+    klog_dec("proc", "wait: blocking, switching to",
+             (uint32_t)proc_table[next].pid);
+    do_switch(next, regs);
+    /* Actual return value is already in saved_regs.eax (set by proc_exit);
+     * do_switch restored it into *regs, so the ISR epilogue returns it. */
+    return 0;
 }
 
 /*

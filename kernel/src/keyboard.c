@@ -32,6 +32,18 @@ void keyboard_init(void) {
     shift_pressed   = 0;
     alt_pressed     = 0;
     extended_prefix = 0;
+
+    /* Re-enable the keyboard port (command 0xAE to the PS/2 controller).
+     * Limine and some firmware leave the port disabled before handoff. */
+    for (uint32_t i = 0; i < 100000; i++)
+        if ((inb(0x64) & 0x02) == 0) break;
+    outb(0x64, 0xAE);
+
+    /* Flush any stale bytes left in the output buffer by the bootloader. */
+    for (uint32_t i = 0; i < 32; i++) {
+        if ((inb(0x64) & 0x01) == 0) break;
+        (void)inb(0x60);
+    }
 }
 
 int keyboard_is_alt_pressed(void) {

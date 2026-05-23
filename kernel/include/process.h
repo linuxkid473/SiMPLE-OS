@@ -32,6 +32,7 @@ typedef enum {
 
 typedef struct {
     int          pid;
+    int          parent_pid;       /* pid of creating process, or -1 if none        */
     proc_state_t state;
     registers_t  saved_regs;       /* saved user-side CPU state (iret frame + gprs) */
     uint32_t    *page_dir;         /* pointer to this process's 4KB page directory  */
@@ -57,6 +58,10 @@ void proc_exit(registers_t *regs, int code);
 /* Fork: duplicate current process. Returns child pid to parent (in regs->eax),
  * child will see eax=0 when it first runs. Returns -1 on failure. */
 int proc_fork(registers_t *regs);
+
+/* Wait: block until any child exits, reap it, return its exit code.
+ * Returns -1 immediately if no children exist. */
+int proc_wait(registers_t *regs);
 
 /*
  * Called from the PIT timer IRQ handler (pit_timer_tick).
