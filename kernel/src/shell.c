@@ -6,7 +6,9 @@
 #include "fd.h"
 #include "keyboard.h"
 #include "kmalloc.h"
+#include "pit.h"
 #include "power.h"
+#include "process.h"
 #include "string.h"
 #include "syscall.h"
 #include "vga.h"
@@ -36,7 +38,10 @@ static int boot_multiboot_ok = 0;
 static uint32_t creepy_rng_state = 0xC0FFEE12U;
 
 static const char* command_names[] = {
-    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch", "mkdir", "rm", "cp", "mv", "write", "seek", "poweroff", "reboot", "kmalloc-test", "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop"
+    "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch",
+    "mkdir", "rm", "cp", "mv", "write", "seek", "poweroff", "reboot", "kmalloc-test",
+    "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop",
+    "getpid", "sleep", "stat", "getticks"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -779,6 +784,10 @@ static void shell_help(void) {
     vga_write_line("  inttest2       - test interrupt 0x22");
     vga_write_line("  div0           - trigger divide by zero");
     vga_write_line("  badop          - trigger invalid opcode");
+    vga_write_line("  getpid         - print current process PID");
+    vga_write_line("  sleep <ticks>  - sleep for N PIT ticks (100 Hz)");
+    vga_write_line("  stat <file>    - print file/dir size and type");
+    vga_write_line("  getticks       - print global PIT tick counter");
 }
 
 static void shell_kmalloc_test(void) {
@@ -1308,9 +1317,30 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 }
             }
 
-            int rc = fat16_list_dir(fs, target_cluster);
-            if (rc != FAT16_OK) {
-                print_generic_fs_error(rc);
+            /* Use fat16_list_entries — the same enumeration path as SYS_READDIR */
+            #define LS_MAX_ENTRIES 64
+            fat16_dirent_t ls_entries[LS_MAX_ENTRIES];
+            int ls_count = 0;
+            int ls_rc = fat16_list_entries(fs, target_cluster,
+                                           ls_entries, LS_MAX_ENTRIES, &ls_count);
+            if (ls_rc != FAT16_OK) {
+                print_generic_fs_error(ls_rc);
+                continue;
+            }
+            for (int i = 0; i < ls_count; i++) {
+                int is_dir = (ls_entries[i].attr & FAT16_ATTR_DIRECTORY) != 0;
+                if (is_dir) {
+                    vga_write("[DIR]  ");
+                    vga_write_line(ls_entries[i].name);
+                } else {
+                    vga_write("       ");
+                    vga_write(ls_entries[i].name);
+                    vga_write("  (");
+                    char ls_num[12];
+                    u32_to_dec(ls_entries[i].size, ls_num, sizeof(ls_num));
+                    vga_write(ls_num);
+                    vga_write_line(" bytes)");
+                }
             }
             continue;
         }
@@ -1800,6 +1830,110 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 continue;
             }
             __asm__ volatile("ud2");
+            continue;
+        }
+
+        if (strcmp(command, "getpid") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: getpid");
+                continue;
+            }
+            vga_write("pid: ");
+            if (current_proc >= 0) {
+                char num[12];
+                u32_to_dec((uint32_t)proc_table[current_proc].pid, num, sizeof(num));
+                vga_write_line(num);
+            } else {
+                vga_write_line("-1 (no active process — running in shell context)");
+            }
+            continue;
+        }
+
+        if (strcmp(command, "sleep") == 0) {
+            char* arg1 = next_token(&parse);
+            if (!arg1 || next_token(&parse)) {
+                vga_write_line("usage: sleep <ticks>");
+                continue;
+            }
+            uint32_t ticks = 0;
+            int valid = 1;
+            for (int i = 0; arg1[i]; i++) {
+                if (arg1[i] < '0' || arg1[i] > '9') { valid = 0; break; }
+                ticks = ticks * 10U + (uint32_t)(arg1[i] - '0');
+            }
+            if (!valid) {
+                vga_write_line("sleep: invalid tick count");
+                continue;
+            }
+            /*
+             * Kernel-side spin-halt — mirrors SYS_SLEEP's alone path exactly.
+             * PIT interrupts keep firing (trap gate, IF=1) so pit_ticks()
+             * increments normally; hlt avoids burning 100% CPU.
+             */
+            uint32_t t_before = pit_ticks();
+            uint32_t target   = t_before + ticks;
+            while (pit_ticks() < target)
+                __asm__ volatile("hlt");
+            uint32_t t_after = pit_ticks();
+            char sl_num[12];
+            vga_write("awake  requested=");
+            u32_to_dec(ticks, sl_num, sizeof(sl_num));
+            vga_write(sl_num);
+            vga_write("  actual=");
+            u32_to_dec(t_after - t_before, sl_num, sizeof(sl_num));
+            vga_write(sl_num);
+            vga_write_line(" ticks");
+            continue;
+        }
+
+        if (strcmp(command, "stat") == 0) {
+            char* arg1 = next_token(&parse);
+            if (!arg1 || next_token(&parse)) {
+                vga_write_line("usage: stat <file>");
+                continue;
+            }
+            uint16_t dir_cluster = cwd_cluster;
+            char stat_name[SHELL_NAME_MAX];
+            int rc = resolve_parent_and_name(fs, arg1, &dir_cluster, stat_name);
+            if (rc == FAT16_ERR_NOT_FOUND || rc == FAT16_ERR_NOTDIR) {
+                print_label_target("Directory not found: ", arg1);
+                continue;
+            }
+            if (rc != FAT16_OK) {
+                print_label_target("Invalid path: ", arg1);
+                continue;
+            }
+            fat16_dirent_t st_entry;
+            rc = fat16_stat(fs, dir_cluster, stat_name, &st_entry);
+            if (rc == FAT16_ERR_NOT_FOUND) {
+                print_label_target("Not found: ", arg1);
+                continue;
+            }
+            if (rc != FAT16_OK) {
+                print_generic_fs_error(rc);
+                continue;
+            }
+            int st_is_dir = (st_entry.attr & FAT16_ATTR_DIRECTORY) != 0;
+            vga_write("name: "); vga_write_line(st_entry.name);
+            vga_write("type: "); vga_write_line(st_is_dir ? "directory" : "file");
+            vga_write("size: ");
+            char st_num[12];
+            u32_to_dec(st_entry.size, st_num, sizeof(st_num));
+            vga_write(st_num);
+            vga_write_line(" bytes");
+            continue;
+        }
+
+        if (strcmp(command, "getticks") == 0) {
+            if (next_token(&parse)) {
+                vga_write_line("usage: getticks");
+                continue;
+            }
+            uint32_t t = pit_ticks();
+            char num[12];
+            u32_to_dec(t, num, sizeof(num));
+            vga_write("ticks: ");
+            vga_write_line(num);
             continue;
         }
 

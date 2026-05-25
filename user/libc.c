@@ -12,12 +12,10 @@ int write(const char* buf, int len) {
 }
 
 void exit(int code) {
-    (void)code;
-
     __asm__ volatile(
         "int $0x80"
         :
-        : "a"(2)
+        : "a"(2), "c"(code)
     );
 
     for (;;);
@@ -252,6 +250,81 @@ int wm_setfocus(int wid) {
         "int $0x80"
         : "=a"(ret)
         : "a"(26), "c"(wid)
+        : "memory"
+    );
+    return ret;
+}
+
+/* getpid — return the calling process's PID. */
+int getpid(void) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(13)
+    );
+    return ret;
+}
+
+/* sleep — sleep for `ticks` PIT ticks (100 Hz → 100 ticks ≈ 1 second).
+ * Returns 0 when the sleep completes. */
+int sleep(unsigned int ticks) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(14), "c"(ticks)
+        : "memory"
+    );
+    return ret;
+}
+
+/* getticks — return the global PIT tick counter. */
+unsigned int getticks(void) {
+    unsigned int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(19)
+    );
+    return ret;
+}
+
+/* stat — fill *out with metadata for path; returns 0 or -1 if not found.
+ * Caller must provide a pointer to a stat_t struct (see user/syscall.h). */
+int stat(const char *path, void *out) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(16), "c"(path), "d"(out)
+        : "memory"
+    );
+    return ret;
+}
+
+/* readdir — enumerate directory path into buf[]; max_entries is array size.
+ * Each entry is a dirent_t (see user/syscall.h).
+ * Returns entry count (>= 0) or -1 on error. */
+int readdir(const char *path, void *buf, int max_entries) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(17), "c"(path), "d"(buf), "b"(max_entries)
+        : "memory"
+    );
+    return ret;
+}
+
+/* rename — rename old_path to new_path (root-relative paths).
+ * Returns 0 on success, -1 on error. */
+int rename(const char *old_path, const char *new_path) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(18), "c"(old_path), "d"(new_path)
         : "memory"
     );
     return ret;

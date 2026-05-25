@@ -23,6 +23,7 @@
 #include "gdt.h"      /* tss_set_esp0, SEG_KCODE */
 #include "klog.h"
 #include "paging.h"
+#include "pit.h"      /* pit_ticks() — used by proc_sleep and proc_timer_tick */
 #include "process.h"
 #include "serial.h"
 #include "types.h"
@@ -203,14 +204,48 @@ void proc_exit(registers_t *regs, int code) {
     if (next >= 0) {
         current_proc = -1;  /* clear before do_switch sets it */
         do_switch(next, regs);
-    } else {
-        /* No more runnable processes — return to exec_elf via exit_trampoline */
-        current_proc  = -1;
-        process_exited = 1;
-        regs->eip    = (uint32_t)exit_trampoline;
-        regs->cs     = SEG_KCODE;
-        regs->eflags = 0x02;
+        return;
     }
+
+    /*
+     * No RUNNABLE process found.  Check whether any SLEEPING processes
+     * are still waiting — if so we must not go to exit_trampoline or they
+     * would be orphaned (nobody left to reschedule them).
+     *
+     * Spin with hlt until the nearest sleeper's deadline arrives, wake it,
+     * and switch into it.  This is safe only when called from a trap-gate
+     * context (SYS_EXIT, IF=1).  When called from a fault handler (IF=0)
+     * sleeping processes are simply dropped — a fault in a concurrent
+     * program is already a fatal error for that process.
+     */
+    int sleeper = -1;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_SLEEPING) {
+            if (sleeper < 0 ||
+                proc_table[i].sleep_until < proc_table[sleeper].sleep_until)
+                sleeper = i;
+        }
+    }
+
+    if (sleeper >= 0) {
+        serial_write(COM1, "[proc] exit: spinning for sleeper pid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[sleeper].pid);
+        serial_write(COM1, "\n");
+        current_proc = -1;
+        /* Spin-wait with hlt; requires IF=1 (trap gate). */
+        while (pit_ticks() < proc_table[sleeper].sleep_until)
+            __asm__ volatile("hlt");
+        proc_table[sleeper].state = PROC_RUNNABLE;
+        do_switch(sleeper, regs);
+        return;
+    }
+
+    /* No more runnable or sleeping processes — return to exec_elf */
+    current_proc  = -1;
+    process_exited = 1;
+    regs->eip    = (uint32_t)exit_trampoline;
+    regs->cs     = SEG_KCODE;
+    regs->eflags = 0x02;
 }
 
 int proc_fork(registers_t *regs) {
@@ -315,11 +350,75 @@ int proc_wait(registers_t *regs) {
 }
 
 /*
+ * proc_sleep — called from SYS_SLEEP.
+ *
+ * Two paths depending on whether other processes are runnable:
+ *
+ * A) Another process is runnable: save registers with saved_regs.eax = 0
+ *    (so the sleeper sees return value 0 when rescheduled), mark SLEEPING,
+ *    context-switch.  proc_timer_tick's wake sweep will flip state back to
+ *    RUNNABLE; the preemptive scheduler will reschedule us from ring3.
+ *
+ * B) No other runnable process (alone or only sleeping siblings): do NOT
+ *    mark PROC_SLEEPING and do NOT context-switch.  Spin with hlt so the
+ *    PIT keeps firing and g_ticks keeps incrementing; exit the loop when
+ *    the deadline is reached.  This is safe because the syscall gate is a
+ *    trap gate (IF=1 on entry), so hlt actually waits for the next tick.
+ *    Never changing process state means no orphan scenario is possible.
+ */
+void proc_sleep(registers_t *regs, uint32_t ticks) {
+    if (current_proc < 0) return;
+
+    if (ticks == 0) {
+        regs->eax = 0;
+        return;
+    }
+
+    uint32_t wake_at = pit_ticks() + ticks;
+    proc_table[current_proc].sleep_until = wake_at;
+
+    /*
+     * Check BEFORE touching state.  If no other process is runnable we
+     * must NOT mark ourselves SLEEPING — there would be nobody to ever
+     * reschedule us and proc_exit on the last peer would go straight to
+     * exit_trampoline, orphaning a PROC_SLEEPING process permanently.
+     */
+    int next = sched_next_after(current_proc);
+    if (next < 0) {
+        /* Alone (or only SLEEPING siblings): busy-wait.
+         * Stay PROC_RUNNING so proc_exit and the scheduler see us. */
+        serial_write(COM1, "[proc] sleep alone pid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
+        serial_write(COM1, " until=");
+        serial_write_dec(COM1, wake_at);
+        serial_write(COM1, "\n");
+        while (pit_ticks() < wake_at)
+            __asm__ volatile("hlt");
+        regs->eax = 0;
+        return;
+    }
+
+    /* Save state; set eax=0 now so the sleeper sees 0 when rescheduled
+     * (we never return through idt.c's `regs->eax = 0` line for this path). */
+    proc_table[current_proc].saved_regs      = *regs;
+    proc_table[current_proc].saved_regs.eax  = 0;
+    proc_table[current_proc].state           = PROC_SLEEPING;
+
+    serial_write(COM1, "[proc] sleep pid=");
+    serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
+    serial_write(COM1, " until=");
+    serial_write_dec(COM1, wake_at);
+    serial_write(COM1, "\n");
+
+    do_switch(next, regs);
+}
+
+/*
  * proc_timer_tick — called from the PIT IRQ0 handler once per tick.
  *
- * Only preempts ring3 code (CS.RPL = 3).  Kernel-mode execution (ring0 CS)
- * is never preempted here: the CS check guards against interrupting a
- * syscall handler or other kernel code that's not safe to switch away from.
+ * First wakes any SLEEPING processes whose sleep_until has passed.
+ * Then, only preempts ring3 code (CS.RPL = 3).  Kernel-mode execution is
+ * never preempted here.
  *
  * If the current process's time slice has expired and another RUNNABLE
  * process exists, saves current state and switches to the next process.
@@ -327,8 +426,31 @@ int proc_wait(registers_t *regs) {
  * the new process into execution.
  */
 void proc_timer_tick(registers_t *regs) {
+    /* Wake any sleeping processes whose deadline has passed */
+    uint32_t now = pit_ticks();
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_SLEEPING && now >= proc_table[i].sleep_until)
+            proc_table[i].state = PROC_RUNNABLE;
+    }
+
+    /*
+     * Safety net: if no process is currently scheduled but a freshly-woken
+     * (or otherwise RUNNABLE) process exists, schedule it now.  This covers
+     * the rare path where kill_user_process (IF=0) called proc_exit with a
+     * sleeping sibling — proc_exit can't spin there, so the sleeper ends up
+     * RUNNABLE with current_proc == -1 until the next tick picks it up.
+     */
+    if (current_proc < 0) {
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (proc_table[i].state == PROC_RUNNABLE) {
+                do_switch(i, regs);
+                return;
+            }
+        }
+        return;
+    }
+
     /* Nothing running or interrupted from kernel mode: nothing to preempt */
-    if (current_proc < 0)           return;
     if ((regs->cs & 3) != 3)        return;
     if (proc_alive_count() < 2)     return;  /* alone — no point switching */
 

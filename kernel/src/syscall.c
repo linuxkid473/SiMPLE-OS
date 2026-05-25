@@ -32,6 +32,7 @@
 #include "gdt.h"
 #include "klog.h"
 #include "paging.h"
+#include "pit.h"
 #include "process.h"
 #include "registers.h"
 #include "serial.h"
@@ -70,12 +71,18 @@ fd_table_t* syscall_get_fd_table(void) {
     return &g_fd_table;
 }
 
+/* Upper bound of the user address space: heap can grow to PROC_BRK_MAX.
+ * User code+data starts at USER_ADDR_MIN; stack sits just below 0x400000;
+ * heap runs from 0x400000 up to PROC_BRK_MAX.  Anything above is kernel. */
+#define USER_ADDR_MAX 0x700000UL   /* must equal PROC_BRK_MAX in syscall.c */
+
 /* Returns 1 if [ptr, ptr+len) is a plausible userspace buffer. */
 static int user_ptr_ok(const void* ptr, uint32_t len) {
     uint32_t addr = (uint32_t)ptr;
-    if (!ptr)                         return 0;
-    if (addr < USER_ADDR_MIN)         return 0;
-    if (len > 0 && (addr + len) < addr) return 0;  /* wrap-around */
+    if (!ptr)                              return 0;
+    if (addr < USER_ADDR_MIN)              return 0;
+    if (len > 0 && (addr + len) < addr)   return 0;  /* integer wrap */
+    if (len > 0 && (addr + len) > USER_ADDR_MAX) return 0;  /* above heap */
     return 1;
 }
 
@@ -552,4 +559,212 @@ int32_t sys_sbrk(int32_t increment) {
     serial_write(COM1, "\n");
 
     return (int32_t)old_brk;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_GETPID (13): no arguments
+ *
+ * Returns the PID of the calling process.  Returns -1 if no process is
+ * active (should not happen from ring3, but handle gracefully).
+ * ----------------------------------------------------------------------- */
+int32_t sys_getpid(void) {
+    if (current_proc < 0 || current_proc >= MAX_PROCS) return -1;
+    return (int32_t)proc_table[current_proc].pid;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_GETTICKS (19): no arguments
+ *
+ * Returns the global PIT tick counter (100 Hz, same counter used by
+ * SYS_SLEEP).  Useful for busy-wait timers and benchmarking from user space.
+ * ----------------------------------------------------------------------- */
+int32_t sys_getticks(void) {
+    return (int32_t)pit_ticks();
+}
+
+/* -----------------------------------------------------------------------
+ * Stat and readdir struct layouts — must match user/syscall.h exactly.
+ *
+ * sys_stat_t  (SYS_STAT result):
+ *   uint32_t size    — file size in bytes (0 for dirs)
+ *   uint8_t  is_dir  — 1 if directory, 0 if regular file
+ *   uint8_t  exists  — 1 if the path was found, 0 if not
+ *
+ * sys_dirent_t  (SYS_READDIR per-entry):
+ *   char     name[64] — null-terminated filename (8.3 format)
+ *   uint8_t  is_dir   — 1 if directory
+ *   uint8_t  _pad[3]  — alignment padding (compiler inserts this anyway)
+ *   uint32_t size     — file size in bytes
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    uint32_t size;
+    uint8_t  is_dir;
+    uint8_t  exists;
+} sys_stat_t;
+
+typedef struct {
+    char     name[64];
+    uint8_t  is_dir;
+    uint8_t  _pad[3];
+    uint32_t size;
+} sys_dirent_t;
+
+/* -----------------------------------------------------------------------
+ * SYS_STAT (16): ecx = path (user ptr), edx = pointer to sys_stat_t
+ *
+ * Fills the caller's stat struct from the FAT16 directory entry.
+ * Always looks up from the root directory (cluster 0).
+ * Returns 0 on success, -1 if not found.
+ * ----------------------------------------------------------------------- */
+int32_t sys_stat(const char *path, sys_stat_t *out) {
+    if (!user_ptr_ok(path, 1)) {
+        klog("syscall", "SYS_STAT: invalid path pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (!user_ptr_ok(out, (uint32_t)sizeof(sys_stat_t))) {
+        klog("syscall", "SYS_STAT: invalid out pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (!g_fs) {
+        klog("syscall", "SYS_STAT: filesystem not mounted");
+        return -(int32_t)EIO;
+    }
+
+    const char *name = path;
+    if (name[0] == '/') name++;
+
+    fat16_dirent_t entry;
+    int rc = fat16_stat(g_fs, 0, name, &entry);
+
+    if (rc == FAT16_ERR_NOT_FOUND) {
+        out->size   = 0;
+        out->is_dir = 0;
+        out->exists = 0;
+        return 0;
+    }
+    if (rc != FAT16_OK) {
+        klog("syscall", "SYS_STAT: fat16_stat failed");
+        return -(int32_t)EIO;
+    }
+
+    out->size   = entry.size;
+    out->is_dir = (entry.attr & FAT16_ATTR_DIRECTORY) ? 1 : 0;
+    out->exists = 1;
+    return 0;
+}
+
+/* Kernel-side scratch buffer for SYS_READDIR — avoids holding a large
+ * array on the stack and prevents user pointer from reaching fat16 directly. */
+#define READDIR_KERNEL_MAX 64
+static fat16_dirent_t readdir_kbuf[READDIR_KERNEL_MAX];
+
+/* -----------------------------------------------------------------------
+ * SYS_READDIR (17): ecx = path (user ptr), edx = sys_dirent_t[] (user ptr),
+ *                   ebx = max entries
+ *
+ * Enumerates the directory at `path` (root-relative; "/" means root).
+ * Writes up to max_entries entries into the caller's buffer.
+ * Returns the number of entries written, or -1 on error.
+ * ----------------------------------------------------------------------- */
+int32_t sys_readdir(const char *path, sys_dirent_t *out, uint32_t max_entries) {
+    if (!user_ptr_ok(path, 1)) {
+        klog("syscall", "SYS_READDIR: invalid path pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (max_entries == 0) return 0;
+    if (max_entries > READDIR_KERNEL_MAX) max_entries = READDIR_KERNEL_MAX;
+    if (!user_ptr_ok(out, max_entries * (uint32_t)sizeof(sys_dirent_t))) {
+        klog("syscall", "SYS_READDIR: invalid out pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (!g_fs) {
+        klog("syscall", "SYS_READDIR: filesystem not mounted");
+        return -(int32_t)EIO;
+    }
+
+    /* Resolve directory cluster from path */
+    uint16_t dir_cluster = 0;
+    const char *dname = path;
+    if (dname[0] == '/') dname++;
+
+    if (*dname != '\0') {
+        fat16_dirent_t de;
+        int rc = fat16_stat(g_fs, 0, dname, &de);
+        if (rc != FAT16_OK) {
+            klog("syscall", "SYS_READDIR: directory not found");
+            return -1;
+        }
+        if (!(de.attr & FAT16_ATTR_DIRECTORY)) {
+            klog("syscall", "SYS_READDIR: path is not a directory");
+            return -(int32_t)EINVAL;
+        }
+        dir_cluster = de.first_cluster;
+    }
+
+    int count = 0;
+    int rc = fat16_list_entries(g_fs, dir_cluster, readdir_kbuf,
+                                (int)max_entries, &count);
+    if (rc != FAT16_OK) {
+        klog("syscall", "SYS_READDIR: fat16_list_entries failed");
+        return -1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        /* Copy 8.3 name — fat16_dirent_t.name is already null-terminated */
+        uint32_t j = 0;
+        while (readdir_kbuf[i].name[j] && j < 63) {
+            out[i].name[j] = readdir_kbuf[i].name[j];
+            j++;
+        }
+        out[i].name[j] = '\0';
+        out[i].is_dir  = (readdir_kbuf[i].attr & FAT16_ATTR_DIRECTORY) ? 1 : 0;
+        out[i]._pad[0] = 0;
+        out[i]._pad[1] = 0;
+        out[i]._pad[2] = 0;
+        out[i].size    = readdir_kbuf[i].size;
+    }
+
+    return (int32_t)count;
+}
+
+/* -----------------------------------------------------------------------
+ * SYS_RENAME (18): ecx = old_path (user ptr), edx = new_path (user ptr)
+ *
+ * Renames a file or directory within the root directory.
+ * Uses fat16_move_file with the same source and destination directory
+ * (cluster 0) to perform an in-place rename.
+ * Returns 0 on success, -1 on error.
+ * ----------------------------------------------------------------------- */
+int32_t sys_rename(const char *old_path, const char *new_path) {
+    if (!user_ptr_ok(old_path, 1)) {
+        klog("syscall", "SYS_RENAME: invalid old_path pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (!user_ptr_ok(new_path, 1)) {
+        klog("syscall", "SYS_RENAME: invalid new_path pointer");
+        return -(int32_t)EINVAL;
+    }
+    if (!g_fs) {
+        klog("syscall", "SYS_RENAME: filesystem not mounted");
+        return -(int32_t)EIO;
+    }
+
+    const char *old_name = old_path;
+    if (old_name[0] == '/') old_name++;
+    const char *new_name = new_path;
+    if (new_name[0] == '/') new_name++;
+
+    if (!*old_name || !*new_name) {
+        klog("syscall", "SYS_RENAME: empty path component");
+        return -(int32_t)EINVAL;
+    }
+
+    fat16_dirent_t old_entry;
+    if (fat16_stat(g_fs, 0, old_name, &old_entry) != FAT16_OK) {
+        klog("syscall", "SYS_RENAME: old path not found");
+        return -(int32_t)ENOENT;
+    }
+
+    int rc = fat16_move_file(g_fs, 0, old_name, 0, new_name);
+    return (rc == FAT16_OK) ? 0 : -1;
 }

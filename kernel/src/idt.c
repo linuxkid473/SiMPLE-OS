@@ -291,6 +291,50 @@ static void syscall_handler(registers_t *regs) {
         regs->eax = (uint32_t)sys_sbrk((int32_t)regs->ecx);
         break;
     }
+    case 13: {
+        /* SYS_GETPID — no arguments. Returns current process PID. */
+        int32_t sys_getpid(void);
+        regs->eax = (uint32_t)sys_getpid();
+        break;
+    }
+    case 14:
+        /* SYS_SLEEP — ecx = ticks (PIT ticks at 100 Hz).
+         * proc_sleep owns eax=0: alone/ticks=0 paths set it before returning;
+         * context-switch path sets saved_regs.eax=0 before do_switch overwrites
+         * *regs with the next process's state — we must NOT touch eax after. */
+        proc_sleep(regs, regs->ecx);
+        break;
+    case 16: {
+        /* SYS_STAT — ecx = path (user ptr), edx = sys_stat_t* (user ptr).
+         * Fills stat struct; returns 0 on success, -1 if not found. */
+        int32_t sys_stat(const char *path, void *out);
+        regs->eax = (uint32_t)sys_stat((const char *)regs->ecx,
+                                        (void *)regs->edx);
+        break;
+    }
+    case 17: {
+        /* SYS_READDIR — ecx = path, edx = sys_dirent_t[] buf, ebx = max.
+         * Returns number of entries written, or -1 on error. */
+        int32_t sys_readdir(const char *path, void *buf, uint32_t max);
+        regs->eax = (uint32_t)sys_readdir((const char *)regs->ecx,
+                                           (void *)regs->edx,
+                                           regs->ebx);
+        break;
+    }
+    case 18: {
+        /* SYS_RENAME — ecx = old_path, edx = new_path.
+         * Returns 0 on success, -1 on error. */
+        int32_t sys_rename(const char *old_path, const char *new_path);
+        regs->eax = (uint32_t)sys_rename((const char *)regs->ecx,
+                                          (const char *)regs->edx);
+        break;
+    }
+    case 19: {
+        /* SYS_GETTICKS — no arguments. Returns global PIT tick counter. */
+        int32_t sys_getticks(void);
+        regs->eax = (uint32_t)sys_getticks();
+        break;
+    }
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: {
         /* SYS_WM_CREATE..SYS_WM_SETFOCUS
          * ABI: eax=nr  ecx=a  edx=b  ebx=c */

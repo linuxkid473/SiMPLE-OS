@@ -1,211 +1,356 @@
-/*
- * wm.c — SiMPLE-OS ring-3 window manager demo
- *
- * Compile:
- *   gcc -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
- *       -Wl,-T,user/linker.ld -Wl,-N \
- *       -o user/wm.elf user/wm.c user/libc.c
- *
- * Then add to Makefile and mcopy as ::wm.elf
- * Run from shell: run wm.elf
- */
+/* user/test_each.c - individual verbose test for each syscall 13-19 with 5s delays */
+#include "syscall.h"
 
-#include "wm.h"
+int write(const char *buf, int len);
+void exit(int code);
+int open(const char *path, int flags);
+int close(int fd);
+int fd_write(int fd, const void *buf, int len);
+int fork(void);
+int wait(void);
 
-/* ------------------------------------------------------------------ */
-/* Minimal libc.h declarations (matches what libc.c already exports)  */
-/* ------------------------------------------------------------------ */
-int   write(const char *buf, int len);
-void  exit(void);
-int   wm_create(int x, int y, int w, int h);
-int   wm_destroy(int wid);
-int   wm_blit(int wid, unsigned int *buf, int len);
-int   wm_move(int wid, int x, int y);
-int   wm_event(wm_event_t *ev, int max);
-int   wm_flush(int wid);
-int   wm_setfocus(int wid);
+#define O_WRITE  2
+#define O_CREATE 4
 
-/* ------------------------------------------------------------------ */
-/* Config                                                              */
-/* ------------------------------------------------------------------ */
-#define SCREEN_W   800
-#define SCREEN_H   600
+static void print(const char *s) { int l=0; while(s[l]) l++; write(s,l); }
+static void println(const char *s) { print(s); print("\n"); }
+static char *itoa(int n, char *buf) {
+    if(!n){buf[0]='0';buf[1]=0;return buf;}
+    int neg=0,i=0; char t[16];
+    if(n<0){neg=1;n=-n;}
+    while(n){t[i++]='0'+(n%10);n/=10;}
+    if(neg)t[i++]='-';
+    int j=0; while(i--)buf[j++]=t[i]; buf[j]=0; return buf;
+}
+static void print_int(int n) { char b[16]; print(itoa(n,b)); }
+static void print_uint(unsigned int n) { char b[16]; print(itoa((int)n,b)); }
 
-#define WIN_W      200
-#define WIN_H      120
-#define WIN_X       50
-#define WIN_Y       50
-
-#define WIN2_W     160
-#define WIN2_H     100
-#define WIN2_X     300
-#define WIN2_Y     200
-
-/* pixel buffer for each window (static — lives in BSS at 0x300000+) */
-static unsigned int buf1[WIN_W  * WIN_H ];
-static unsigned int buf2[WIN2_W * WIN2_H];
-
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
-
-static void fill(unsigned int *buf, int w, int h, unsigned int color)
-{
-    int n = w * h;
-    for (int i = 0; i < n; i++) buf[i] = color;
+static void delay_5s(void) {
+    println("  [waiting 5 seconds...]");
+    sys_sleep(500);  /* 500 ticks at 100 Hz = 5 seconds */
 }
 
-/* draw a 1-px border inside the buffer */
-static void border(unsigned int *buf, int w, int h, unsigned int color)
-{
-    for (int x = 0; x < w; x++) {
-        buf[x]               = color;   /* top row    */
-        buf[(h-1)*w + x]     = color;   /* bottom row */
-    }
-    for (int y = 0; y < h; y++) {
-        buf[y*w]             = color;   /* left col   */
-        buf[y*w + (w-1)]     = color;   /* right col  */
-    }
-}
-
-/* draw a filled rect inside the buffer */
-static void rect(unsigned int *buf, int bw,
-                 int rx, int ry, int rw, int rh,
-                 unsigned int color)
-{
-    for (int y = ry; y < ry + rh; y++)
-        for (int x = rx; x < rx + rw; x++)
-            buf[y * bw + x] = color;
-}
-
-static void print(const char *s)
-{
-    int len = 0;
-    while (s[len]) len++;
-    write(s, len);
-}
-
-static void print_int(int n)
-{
-    if (n < 0) { write("-", 1); n = -n; }
-    char tmp[12];
-    int i = 11;
-    tmp[i] = 0;
-    if (n == 0) { write("0", 1); return; }
-    while (n && i > 0) { tmp[--i] = '0' + (n % 10); n /= 10; }
-    print(tmp + i);
-}
-
-/* ------------------------------------------------------------------ */
-/* _start                                                              */
-/* ------------------------------------------------------------------ */
-void _start(void)
-{
-    print("[wm] starting ring-3 WM demo\n");
-
-    /* ---- window 1: blue with white border ------------------------- */
-    fill(buf1, WIN_W, WIN_H, 0xFF1155AA);
-    border(buf1, WIN_W, WIN_H, 0xFFFFFFFF);
-    /* small red square in corner as a visual marker */
-    rect(buf1, WIN_W, 4, 4, 20, 20, 0xFFDD3333);
-
-    int w1 = wm_create(WIN_X, WIN_Y, WIN_W, WIN_H);
-    if (w1 < 0) {
-        print("[wm] ERROR: wm_create w1 failed: ");
-        print_int(w1);
-        print("\n");
-        exit();
-    }
-    print("[wm] window 1 created, wid=");
-    print_int(w1);
-    print("\n");
-
-    wm_setfocus(w1);
-    wm_blit(w1, buf1, WIN_W * WIN_H * 4);
-    wm_flush(w1);
-    print("[wm] window 1 blitted (blue, white border, red corner)\n");
-
-    /* ---- window 2: green with yellow border ----------------------- */
-    fill(buf2, WIN2_W, WIN2_H, 0xFF226622);
-    border(buf2, WIN2_W, WIN2_H, 0xFFFFDD00);
-    /* cyan stripe across the middle */
-    rect(buf2, WIN2_W, 0, WIN2_H/2 - 4, WIN2_W, 8, 0xFF00CCCC);
-
-    int w2 = wm_create(WIN2_X, WIN2_Y, WIN2_W, WIN2_H);
-    if (w2 < 0) {
-        print("[wm] ERROR: wm_create w2 failed: ");
-        print_int(w2);
-        print("\n");
-        /* still continue with just one window */
+/* ═══════════════════════════════════════════════════════════════
+   TEST 13: SYS_GETPID
+   ═════════════════════════════════════════════════════════════════ */
+void test_13_getpid(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 13: SYS_GETPID       ║");
+    println("╚═══════════════════════════╝");
+    
+    int pid = getpid();
+    print("  returned: ");
+    print_int(pid);
+    println("");
+    
+    if (pid > 0) {
+        print("  [PASS] getpid returned valid pid ");
+        print_int(pid);
+        println("");
     } else {
-        print("[wm] window 2 created, wid=");
-        print_int(w2);
-        print("\n");
-        wm_blit(w2, buf2, WIN2_W * WIN2_H * 4);
-        wm_flush(w2);
-        print("[wm] window 2 blitted (green, yellow border, cyan stripe)\n");
+        println("  [FAIL] getpid returned invalid pid");
+    }
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEST 14: SYS_SLEEP
+   ═════════════════════════════════════════════════════════════════ */
+void test_14_sleep(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 14: SYS_SLEEP        ║");
+    println("╚═══════════════════════════╝");
+    
+    unsigned int before = getticks();
+    print("  before: ");
+    print_uint(before);
+    println("");
+    
+    println("  sleeping 30 ticks...");
+    sys_sleep(30);
+    
+    unsigned int after = getticks();
+    print("  after:  ");
+    print_uint(after);
+    println("");
+    
+    unsigned int delta = after - before;
+    print("  delta:  ");
+    print_uint(delta);
+    println("");
+    
+    if (delta >= 30) {
+        print("  [PASS] slept at least 30 ticks (got ");
+        print_uint(delta);
+        println(")");
+    } else {
+        print("  [FAIL] woke too early (only ");
+        print_uint(delta);
+        println(" ticks)");
+    }
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEST 16: SYS_STAT
+   ═════════════════════════════════════════════════════════════════ */
+void test_16_stat(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 16: SYS_STAT         ║");
+    println("╚═══════════════════════════╝");
+    
+    println("  creating TEST13.TXT...");
+    int fd = open("TEST13.TXT", O_WRITE | O_CREATE);
+    if (fd < 0) {
+        println("  [FAIL] could not create file");
+        delay_5s();
+        return;
+    }
+    fd_write(fd, "stat test data", 14);
+    close(fd);
+    println("  file created (14 bytes)");
+    
+    println("  calling stat(\"TEST13.TXT\", &st)...");
+    stat_t st;
+    int r = stat("TEST13.TXT", &st);
+    
+    print("  result: ");
+    print_int(r);
+    println("");
+    print("  exists: ");
+    print_int(st.exists);
+    println("");
+    print("  is_dir: ");
+    print_int(st.is_dir);
+    println("");
+    print("  size:   ");
+    print_uint(st.size);
+    println("");
+    
+    if (r == 0 && st.exists && st.size == 14) {
+        println("  [PASS] stat found file with correct size");
+    } else {
+        println("  [FAIL] stat returned wrong data");
+    }
+    
+    println("  calling stat(\"NOFILE.TXT\", &st)...");
+    stat_t st2;
+    int r2 = stat("NOFILE.TXT", &st2);
+    print("  exists: ");
+    print_int(st2.exists);
+    println("");
+    
+    if (!st2.exists) {
+        println("  [PASS] stat correctly reports file not found");
+    } else {
+        println("  [FAIL] stat reports non-existent file as existing");
+    }
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEST 17: SYS_READDIR
+   ═════════════════════════════════════════════════════════════════ */
+void test_17_readdir(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 17: SYS_READDIR      ║");
+    println("╚═══════════════════════════╝");
+    
+    println("  calling readdir(\"/\", entries, 32)...");
+    dirent_t entries[32];
+    int count = readdir("/", entries, 32);
+    
+    print("  returned: ");
+    print_int(count);
+    println(" entries");
+    
+    if (count <= 0) {
+        println("  [FAIL] readdir returned no entries");
+        delay_5s();
+        return;
+    }
+    
+    println("  entries found:");
+    for (int i = 0; i < count && i < 5; i++) {
+        print("    ");
+        print(entries[i].is_dir ? "[DIR]  " : "[FILE] ");
+        print(entries[i].name);
+        print(" (");
+        print_uint(entries[i].size);
+        println(" bytes)");
+    }
+    
+    if (count > 5) {
+        print("    ... and ");
+        print_int(count - 5);
+        println(" more");
+    }
+    
+    println("  [PASS] readdir returned entries");
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEST 18: SYS_RENAME
+   ═════════════════════════════════════════════════════════════════ */
+void test_18_rename(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 18: SYS_RENAME       ║");
+    println("╚═══════════════════════════╝");
+    
+    println("  creating OLDNAME.TXT...");
+    int fd = open("OLDNAME.TXT", O_WRITE | O_CREATE);
+    if (fd < 0) {
+        println("  [FAIL] could not create file");
+        delay_5s();
+        return;
+    }
+    fd_write(fd, "rename test", 11);
+    close(fd);
+    println("  file created");
+
+    println("  calling rename(\"OLDNAME.TXT\", \"NEWNAME.TXT\")...");
+    int r = rename("OLDNAME.TXT", "NEWNAME.TXT");
+    print("  result: ");
+    print_int(r);
+    println("");
+
+    if (r != 0) {
+        println("  [FAIL] rename returned non-zero");
+        delay_5s();
+        return;
     }
 
-    /* ---- event loop ----------------------------------------------- */
-    print("[wm] event loop: move mouse to drag w1, press any key to exit\n");
+    println("  checking old name...");
+    stat_t old_st;
+    stat("OLDNAME.TXT", &old_st);
+    print("  old file exists: ");
+    print_int(old_st.exists);
+    println("");
 
-    wm_event_t ev;
-    int running = 1;
-    int mx = WIN_X, my = WIN_Y;   /* track w1 position */
+    println("  checking new name...");
+    stat_t new_st;
+    stat("NEWNAME.TXT", &new_st);
+    print("  new file exists: ");
+    print_int(new_st.exists);
+    println("");
 
-    while (running) {
-        int type = wm_event(&ev, sizeof(wm_event_t));
-
-        if (type == WM_EV_KEY_DOWN) {
-            print("[wm] key down scancode=");
-            print_int((int)(unsigned short)ev.x);
-            print(" — exiting\n");
-            running = 0;
-        }
-        else if (type == WM_EV_MOUSE_MOV) {
-            int nx = (int)(short)ev.x - WIN_W / 2;
-            int ny = (int)(short)ev.y - WIN_H / 2;
-
-            /* clamp to screen */
-            if (nx < 0)                  nx = 0;
-            if (ny < 0)                  ny = 0;
-            if (nx + WIN_W > SCREEN_W)   nx = SCREEN_W - WIN_W;
-            if (ny + WIN_H > SCREEN_H)   ny = SCREEN_H - WIN_H;
-
-            if (nx != mx || ny != my) {
-                mx = nx;
-                my = ny;
-                wm_move(w1, mx, my);
-                /* re-blit because move only re-draws old backing store */
-                wm_blit(w1, buf1, WIN_W * WIN_H * 4);
-                wm_flush(w1);
-            }
-        }
-        else if (type == WM_EV_MOUSE_BTN) {
-            /* right-click cycles window 1 colour */
-            if (ev.btn & 0x02) {
-                static unsigned int colors[] = {
-                    0xFF1155AA,   /* blue   */
-                    0xFFAA2211,   /* red    */
-                    0xFF117733,   /* green  */
-                    0xFF885500,   /* orange */
-                };
-                static int ci = 0;
-                ci = (ci + 1) & 3;
-                fill(buf1, WIN_W, WIN_H, colors[ci]);
-                border(buf1, WIN_W, WIN_H, 0xFFFFFFFF);
-                rect(buf1, WIN_W, 4, 4, 20, 20, 0xFFDD3333);
-                wm_blit(w1, buf1, WIN_W * WIN_H * 4);
-                wm_flush(w1);
-                print("[wm] right-click: changed w1 colour\n");
-            }
-        }
-        /* type == 0 → queue empty, tight-loop is fine for a demo */
+    if (r == 0 && !old_st.exists && new_st.exists) {
+        println("  [PASS] rename worked correctly");
+    } else {
+        println("  [FAIL] rename did not work as expected");
     }
+    
+    delay_5s();
+}
 
-    /* ---- cleanup -------------------------------------------------- */
-    wm_destroy(w1);
-    if (w2 >= 0) wm_destroy(w2);
-    print("[wm] windows destroyed, done\n");
-    exit();
+/* ═══════════════════════════════════════════════════════════════
+   TEST 19: SYS_GETTICKS
+   ═════════════════════════════════════════════════════════════════ */
+void test_19_getticks(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 19: SYS_GETTICKS     ║");
+    println("╚═══════════════════════════╝");
+    
+    unsigned int t1 = getticks();
+    print("  t1 = ");
+    print_uint(t1);
+    println("");
+    
+    volatile int x = 0;
+    for (int i = 0; i < 300000; i++) x += i;
+    
+    unsigned int t2 = getticks();
+    print("  t2 = ");
+    print_uint(t2);
+    println("");
+    
+    print("  delta = ");
+    print_uint(t2 - t1);
+    println("");
+    
+    if (t2 >= t1) {
+        println("  [PASS] tick counter is monotonic");
+    } else {
+        println("  [FAIL] tick counter went backwards");
+    }
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEST 11/12: SYS_FORK + SYS_WAIT
+   ═════════════════════════════════════════════════════════════════ */
+void test_11_12_fork_wait(void) {
+    println("\n╔═══════════════════════════╗");
+    println("║ TEST 11/12: FORK + WAIT   ║");
+    println("╚═══════════════════════════╝");
+    
+    int parent_pid = getpid();
+    print("  parent pid = ");
+    print_int(parent_pid);
+    println("");
+    
+    println("  calling fork()...");
+    int child_pid = fork();
+    
+    if (child_pid == 0) {
+        /* child */
+        int my_pid = getpid();
+        print("  [CHILD] my pid = ");
+        print_int(my_pid);
+        println("");
+        
+        println("  [CHILD] exiting with code 99...");
+        exit(99);
+    } else if (child_pid > 0) {
+        /* parent */
+        print("  [PARENT] child pid = ");
+        print_int(child_pid);
+        println("");
+        
+        println("  [PARENT] calling wait()...");
+        int exit_code = wait();
+        print("  [PARENT] child exited with code ");
+        print_int(exit_code);
+        println("");
+        
+        if (child_pid > 0 && exit_code == 99) {
+            println("  [PASS] fork and wait worked correctly");
+        } else {
+            println("  [FAIL] fork or wait returned wrong values");
+        }
+    } else {
+        println("  [FAIL] fork returned negative (failed)");
+    }
+    
+    delay_5s();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MAIN
+   ═════════════════════════════════════════════════════════════════ */
+void _start(void) {
+    println("\n╔════════════════════════════════════╗");
+    println("║  SiMPLE OS Syscalls 13-19 Tests   ║");
+    println("║   (5 second delays between tests)  ║");
+    println("╚════════════════════════════════════╝");
+    
+    test_13_getpid();
+    test_14_sleep();
+    test_16_stat();
+    test_17_readdir();
+    test_18_rename();
+    test_19_getticks();
+    test_11_12_fork_wait();
+    
+    println("\n╔════════════════════════════════════╗");
+    println("║         ALL TESTS DONE             ║");
+    println("╚════════════════════════════════════╝\n");
+    
+    exit(0);
 }

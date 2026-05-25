@@ -23,11 +23,12 @@
 #define PROC_TIMESLICE 10U
 
 typedef enum {
-    PROC_DEAD     = 0,   /* slot is free, may be reused           */
-    PROC_RUNNING  = 1,   /* currently executing on CPU            */
-    PROC_RUNNABLE = 2,   /* ready to run, waiting for CPU         */
-    PROC_ZOMBIE   = 3,   /* exited, waiting to be reaped (future) */
-    PROC_BLOCKED  = 4,   /* sleeping / waiting for I/O (future)   */
+    PROC_DEAD     = 0,   /* slot is free, may be reused              */
+    PROC_RUNNING  = 1,   /* currently executing on CPU               */
+    PROC_RUNNABLE = 2,   /* ready to run, waiting for CPU            */
+    PROC_ZOMBIE   = 3,   /* exited, waiting to be reaped             */
+    PROC_BLOCKED  = 4,   /* blocked in wait() for a child            */
+    PROC_SLEEPING = 5,   /* sleeping until sleep_until ticks         */
 } proc_state_t;
 
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct {
     int          exit_code;
     uint32_t     ticks_remaining;  /* preemption countdown; reset on each switch-in */
     uint32_t     brk;              /* user heap break: next free virtual byte        */
+    uint32_t     sleep_until;      /* PIT tick at which PROC_SLEEPING process wakes  */
 } process_t;
 
 extern process_t proc_table[MAX_PROCS];
@@ -64,10 +66,15 @@ int proc_fork(registers_t *regs);
  * Returns -1 immediately if no children exist. */
 int proc_wait(registers_t *regs);
 
+/* Sleep: mark process SLEEPING for `ticks` PIT ticks, switch to next runnable.
+ * If no other process is runnable, spin-halts until the sleep expires. */
+void proc_sleep(registers_t *regs, uint32_t ticks);
+
 /*
  * Called from the PIT timer IRQ handler (pit_timer_tick).
- * Decrements the current process's time slice and preempts if expired and
- * another RUNNABLE process exists.  Only preempts ring3 code (CS.RPL=3).
+ * Wakes any SLEEPING processes whose sleep_until has passed, then decrements
+ * the current process's time slice and preempts if expired.
+ * Only preempts ring3 code (CS.RPL=3).
  */
 void proc_timer_tick(registers_t *regs);
 
