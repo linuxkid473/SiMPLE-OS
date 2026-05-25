@@ -89,18 +89,21 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
 typedef enum {
     WM_TYPE_TERMINAL = 0,
     WM_TYPE_CALC,
-    WM_TYPE_STEXT
+    WM_TYPE_STEXT,
+    WM_TYPE_USER    /* ring-3 pixel-buffer window created via SYS_WM_CREATE */
 } wm_win_type_t;
 
 /* ---- window descriptor ---- */
 typedef struct {
     int            x, y;        /* top-left pixel on the screen           */
     int            width, height;
-    const char    *title;
+    const char    *title;       /* points to title_buf for USER, literal otherwise */
+    char           title_buf[32]; /* mutable title for USER windows        */
     wm_win_type_t  type;
-    int            instance;    /* index into the per-type instance pool  */
+    int            instance;    /* index into the per-type pool (unused for USER) */
     int            hidden;      /* 1 = not rendered, not focusable,
                                  *     not hit-tested by mouse             */
+    uint32_t      *pixels;      /* backing store for WM_TYPE_USER only    */
 } wm_window_t;
 
 /* ---- global state (read-only outside wm.c) ---- */

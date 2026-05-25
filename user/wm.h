@@ -14,5 +14,8 @@ typedef struct {
 #define WM_EV_KEY_UP    2
 #define WM_EV_MOUSE_MOV 3
 #define WM_EV_MOUSE_BTN 4
+#define WM_EV_CLOSE     5   /* user closed the window via the [X] button */
+
+#define SC_ESC  0x01   /* PS/2 scancode for Escape */
 
 #endif

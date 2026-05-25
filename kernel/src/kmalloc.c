@@ -33,3 +33,7 @@ void* kmalloc(size_t size) {
 void kfree(void* ptr) {
     (void)ptr;
 }
+
+void kmalloc_reset(void) {
+    heap_ptr = heap_start;
+}

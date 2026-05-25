@@ -1782,6 +1782,7 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 continue;
             }
 
+            kmalloc_reset();
             char* buf = (char*)kmalloc(65536);
             uint32_t out_len = 0;
             rc = fat16_read_file(fs, dir_cluster, file_name, buf, 65536, &out_len);
