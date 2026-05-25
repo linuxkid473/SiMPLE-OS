@@ -22,6 +22,7 @@
 #include "fd.h"
 #include "gdt.h"      /* tss_set_esp0, SEG_KCODE */
 #include "klog.h"
+#include "kmalloc.h"
 #include "paging.h"
 #include "pit.h"      /* pit_ticks() — used by proc_sleep and proc_timer_tick */
 #include "process.h"
@@ -59,6 +60,9 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     /* Reset any leftover zombie child slots from a previous run. */
     for (int i = 1; i < MAX_PROCS; i++)
         proc_table[i].state = PROC_DEAD;
+
+    /* Reclaim heap from the previous program run. */
+    kmalloc_reset();
 
     proc_table[0].pid             = 1;
     proc_table[0].parent_pid      = -1;
