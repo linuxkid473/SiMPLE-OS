@@ -93,8 +93,8 @@ user/desktop.elf: user/desktop.c user/libc.c user/linker.ld
 # stdio.c can be linked with any user program that needs FILE*/printf
 USER_STDIO := user/libc.c user/stdio.c
 
-# crt0.c + stdio + env: for programs that define main() instead of _start()
-USER_CRT := user/crt0.c user/libc.c user/stdio.c user/env.c
+# crt0.c + stdio + env + setjmp: for programs that define main()
+USER_CRT := user/crt0.c user/libc.c user/stdio.c user/env.c user/setjmp.S
 
 user/posixtest.elf: user/posixtest.c $(USER_CRT) user/linker.ld
 	$(USER_CC) -o $@ user/posixtest.c $(USER_CRT)
