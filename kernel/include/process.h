@@ -59,6 +59,9 @@ typedef struct {
     uint32_t      sleep_until;
     uint32_t      brk;
 
+    /* Blocking — which pipe index this process is waiting on (-1 = none) */
+    int           pipe_wait_idx;
+
     /* File descriptors */
     fd_table_t    fd_table;
 
@@ -102,7 +105,11 @@ void proc_deliver_signals(registers_t *regs);
 void proc_send_signal_group(pgid_t pgid, int sig);
 
 /* Helpers */
-int proc_find_by_pid(pid_t pid);
+int  proc_find_by_pid(pid_t pid);
+
+/* Pipe blocking: block current process waiting for pipe idx; wake waiters */
+void proc_block_on_pipe(int pipe_idx, registers_t *regs);
+void proc_wake_pipe_waiters(int pipe_idx);
 
 /* Used by elf.c */
 extern uint32_t kernel_esp;

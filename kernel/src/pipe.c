@@ -102,5 +102,9 @@ int pipe_write(int idx, const char *buf, uint32_t len) {
         p->write_pos = (p->write_pos + 1) % PIPE_BUF_SIZE;
     }
     p->count += to_write;
+
+    if (to_write > 0)
+        proc_wake_pipe_waiters(idx);
+
     return (int)to_write;
 }

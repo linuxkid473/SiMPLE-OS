@@ -29,8 +29,9 @@ void proc_init(void) {
         proc_table[i].pid        = -1;
         proc_table[i].state      = PROC_DEAD;
         proc_table[i].page_dir   = (uint32_t *)0;
-        proc_table[i].sig_pending = 0;
-        proc_table[i].sig_mask   = 0;
+        proc_table[i].sig_pending    = 0;
+        proc_table[i].sig_mask       = 0;
+        proc_table[i].pipe_wait_idx  = -1;
         for (int s = 0; s < NSIG; s++) {
             proc_table[i].sig_actions[s].sa_handler = SIG_DFL;
             proc_table[i].sig_actions[s].sa_flags   = 0;
@@ -98,6 +99,7 @@ static int alloc_child_slot(void) {
             proc_table[i].ticks_remaining = PROC_TIMESLICE;
             proc_table[i].brk             = 0x400000U;
             proc_table[i].sig_pending     = 0;
+            proc_table[i].pipe_wait_idx   = -1;
             proc_table[i].sig_mask        = (current_proc >= 0) ? proc_table[current_proc].sig_mask : 0;
             for (int s = 0; s < NSIG; s++) {
                 if (current_proc >= 0)
@@ -578,4 +580,37 @@ void proc_timer_tick(registers_t *regs) {
     proc_table[current_proc].state      = PROC_RUNNABLE;
 
     do_switch(next, regs);
+}
+
+/*
+ * Block the current process waiting for data in pipe pipe_idx.
+ * We save EIP-2 so that when the process is woken it re-executes int $0x80
+ * and retries the read syscall from scratch.
+ */
+void proc_block_on_pipe(int pipe_idx, registers_t *regs) {
+    if (current_proc < 0) return;
+
+    proc_table[current_proc].pipe_wait_idx  = pipe_idx;
+    proc_table[current_proc].saved_regs     = *regs;
+    proc_table[current_proc].saved_regs.eip -= 2;  /* re-execute int $0x80 */
+    proc_table[current_proc].state          = PROC_BLOCKED;
+
+    int next = sched_next_after(current_proc);
+    if (next < 0) {
+        /* No other process to run — busy-spin by staying runnable */
+        proc_table[current_proc].state = PROC_RUNNABLE;
+        return;
+    }
+    do_switch(next, regs);
+}
+
+/* Wake any process blocked on pipe pipe_idx. */
+void proc_wake_pipe_waiters(int pipe_idx) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_BLOCKED &&
+            proc_table[i].pipe_wait_idx == pipe_idx) {
+            proc_table[i].pipe_wait_idx  = -1;
+            proc_table[i].state          = PROC_RUNNABLE;
+        }
+    }
 }

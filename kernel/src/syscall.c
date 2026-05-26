@@ -531,7 +531,20 @@ int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
     }
 
     if (f->type == FD_PIPE_R) {
-        return (int32_t)pipe_read(f->pipe.pipe_idx, buf, len);
+        int idx = f->pipe.pipe_idx;
+        int r   = pipe_read(idx, buf, len);
+        if (r == 0 && g_pipes[idx].writer_open > 0) {
+            /* No data yet but write end is open — block until writer writes */
+            if (current_proc >= 0) {
+                if (proc_table[current_proc].sig_pending &
+                    ~proc_table[current_proc].sig_mask)
+                    return -(int32_t)EINTR;
+                proc_block_on_pipe(idx, regs);
+                /* After wake-up we retry via eip-2 re-entry; fall through
+                 * returning 0 handles the single-process edge case. */
+            }
+        }
+        return (int32_t)r;
     }
 
     if (f->type == FD_FILE) {
