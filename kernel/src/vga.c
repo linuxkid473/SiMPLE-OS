@@ -42,6 +42,17 @@ static uint32_t cursor_row = 0;
 static uint32_t cursor_col = 0;
 static uint8_t  vga_color  = 0x0F;   /* white fg, black bg */
 
+/* ANSI / VT100 escape state machine */
+typedef enum { ANSI_NORMAL, ANSI_ESC, ANSI_CSI } ansi_state_t;
+#define ANSI_MAX_PARAMS 8
+static ansi_state_t ansi_state = ANSI_NORMAL;
+static int          ansi_params[ANSI_MAX_PARAMS];
+static int          ansi_nparams = 0;
+static int          ansi_priv = 0;   /* '?' flag seen after CSI */
+
+/* ANSI color index → VGA CGA palette index */
+static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+
 static const uint32_t vga_palette[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
     0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
@@ -365,8 +376,165 @@ void vga_clear(void) {
     vga_update_cursor();
 }
 
+/* ------------------------------------------------------------------ */
+/* ANSI helpers                                                         */
+/* ------------------------------------------------------------------ */
+
+static void ansi_erase_line(int mode) {
+    uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+    uint32_t start = 0, end = max_cols;
+    if (mode == 0) start = cursor_col;          /* to end */
+    else if (mode == 1) end = cursor_col + 1;   /* to beginning */
+    for (uint32_t c = start; c < end; c++)
+        draw_char(' ', c, cursor_row, vga_color);
+}
+
+static void ansi_erase_display(int mode) {
+    uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+    uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
+    if (mode == 2 || mode == 3) {
+        for (uint32_t r = 0; r < max_rows; r++)
+            for (uint32_t c = 0; c < max_cols; c++)
+                draw_char(' ', c, r, vga_color);
+        cursor_row = 0; cursor_col = 0;
+    } else if (mode == 0) {
+        /* from cursor to end */
+        ansi_erase_line(0);
+        uint32_t max_r = fb_addr ? fb_rows : VGA_HEIGHT;
+        for (uint32_t r = cursor_row + 1; r < max_r; r++)
+            for (uint32_t c = 0; c < max_cols; c++)
+                draw_char(' ', c, r, vga_color);
+    } else if (mode == 1) {
+        /* from beginning to cursor */
+        for (uint32_t r = 0; r < cursor_row; r++)
+            for (uint32_t c = 0; c < max_cols; c++)
+                draw_char(' ', c, r, vga_color);
+        ansi_erase_line(1);
+    }
+}
+
+static void ansi_set_color(int p) {
+    if (p == 0) { vga_color = 0x0F; return; }  /* reset */
+    if (p == 1) { vga_color |= 0x08; return; }  /* bold → high intensity fg */
+    if (p == 7) {                                /* reverse */
+        uint8_t fg = vga_color & 0x0F;
+        uint8_t bg = (vga_color >> 4) & 0x0F;
+        vga_color = (uint8_t)(fg << 4) | bg;
+        return;
+    }
+    if (p >= 30 && p <= 37) {
+        vga_color = (vga_color & 0xF0) | ansi_to_vga[p - 30];
+    } else if (p >= 90 && p <= 97) {
+        vga_color = (vga_color & 0xF0) | (ansi_to_vga[p - 90] | 0x08);
+    } else if (p >= 40 && p <= 47) {
+        vga_color = (vga_color & 0x0F) | (uint8_t)(ansi_to_vga[p - 40] << 4);
+    } else if (p >= 100 && p <= 107) {
+        vga_color = (vga_color & 0x0F) | (uint8_t)((ansi_to_vga[p - 100] | 0x08) << 4);
+    }
+}
+
+static void ansi_dispatch(char cmd) {
+    uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+    uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
+    int p0 = ansi_nparams > 0 ? ansi_params[0] : 0;
+    int p1 = ansi_nparams > 1 ? ansi_params[1] : 0;
+
+    switch (cmd) {
+    case 'A':   /* cursor up */
+        if (p0 < 1) p0 = 1;
+        cursor_row = (cursor_row >= (uint32_t)p0) ? cursor_row - (uint32_t)p0 : 0;
+        break;
+    case 'B':   /* cursor down */
+        if (p0 < 1) p0 = 1;
+        cursor_row += (uint32_t)p0;
+        if (cursor_row >= max_rows) cursor_row = max_rows - 1;
+        break;
+    case 'C':   /* cursor forward */
+        if (p0 < 1) p0 = 1;
+        cursor_col += (uint32_t)p0;
+        if (cursor_col >= max_cols) cursor_col = max_cols - 1;
+        break;
+    case 'D':   /* cursor back */
+        if (p0 < 1) p0 = 1;
+        cursor_col = (cursor_col >= (uint32_t)p0) ? cursor_col - (uint32_t)p0 : 0;
+        break;
+    case 'H':   /* cursor position (1-based) */
+    case 'f':
+        cursor_row = (p0 > 0 ? (uint32_t)(p0 - 1) : 0);
+        cursor_col = (p1 > 0 ? (uint32_t)(p1 - 1) : 0);
+        if (cursor_row >= max_rows) cursor_row = max_rows - 1;
+        if (cursor_col >= max_cols) cursor_col = max_cols - 1;
+        break;
+    case 'J':   /* erase display */
+        ansi_erase_display(p0);
+        break;
+    case 'K':   /* erase line */
+        ansi_erase_line(p0);
+        break;
+    case 'm':   /* SGR — set graphics rendition */
+        if (ansi_nparams == 0) {
+            ansi_set_color(0);
+        } else {
+            for (int i = 0; i < ansi_nparams; i++)
+                ansi_set_color(ansi_params[i]);
+        }
+        break;
+    case 's':   /* save cursor */
+        break;
+    case 'u':   /* restore cursor */
+        break;
+    case 'l':   /* private mode reset (e.g. ?25l hide cursor) — ignore */
+    case 'h':   /* private mode set  — ignore */
+        break;
+    default:
+        break;
+    }
+}
+
 void vga_putc(char c) {
     uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+
+    /* ANSI / VT100 state machine */
+    if (ansi_state == ANSI_ESC) {
+        if (c == '[') {
+            ansi_state   = ANSI_CSI;
+            ansi_nparams = 0;
+            ansi_priv    = 0;
+            ansi_params[0] = 0;
+        } else {
+            ansi_state = ANSI_NORMAL;
+        }
+        return;
+    }
+
+    if (ansi_state == ANSI_CSI) {
+        if (c == '?') {
+            ansi_priv = 1;
+        } else if (c >= '0' && c <= '9') {
+            if (ansi_nparams == 0) ansi_nparams = 1;
+            ansi_params[ansi_nparams - 1] =
+                ansi_params[ansi_nparams - 1] * 10 + (c - '0');
+        } else if (c == ';') {
+            ansi_nparams++;
+            if (ansi_nparams < ANSI_MAX_PARAMS)
+                ansi_params[ansi_nparams - 1] = 0;
+            else
+                ansi_nparams = ANSI_MAX_PARAMS;
+        } else {
+            /* Final byte */
+            ansi_dispatch(c);
+            ansi_state = ANSI_NORMAL;
+        }
+        vga_scroll();
+        vga_update_cursor();
+        return;
+    }
+
+    /* ANSI_NORMAL */
+    if (c == '\033') {
+        ansi_state = ANSI_ESC;
+        return;
+    }
 
     if (c == '\n') {
         cursor_col = 0;
@@ -381,6 +549,10 @@ void vga_putc(char c) {
             cursor_col = max_cols - 1;
         }
         draw_char(' ', cursor_col, cursor_row, vga_color);
+    } else if (c == '\t') {
+        uint32_t next = (cursor_col + 8) & ~7U;
+        while (cursor_col < next && cursor_col < max_cols)
+            draw_char(' ', cursor_col++, cursor_row, vga_color);
     } else {
         draw_char(c, cursor_col, cursor_row, vga_color);
         cursor_col++;
