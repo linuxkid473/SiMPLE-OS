@@ -38,8 +38,9 @@ typedef struct {
     uint32_t p_align;
 } Elf32_Phdr;
 
-int  elf_validate(void* data);
-int  exec_elf(void* data);
+int      elf_validate(void* data);
+int      exec_elf(void* data);
+uint32_t build_posix_stack(const char *path);
 
 /*
  * exit_trampoline — iret lands here after SYS_EXIT patches the ISR frame.

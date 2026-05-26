@@ -5,6 +5,7 @@
 #include "process.h"
 #include "serial.h"
 #include "signal.h"
+#include "string.h"
 #include "vga.h"
 #include "types.h"
 
@@ -115,6 +116,52 @@ launch_ring3(uint32_t entry   __attribute__((unused)),
 }
 
 /* -------------------------------------------------------------------------
+   POSIX initial stack builder
+   ---------------------------------------------------------------------- */
+/*
+ * Build the Linux i386 initial stack layout just below USER_INITIAL_SP:
+ *
+ *   [esp]          argc        (always 1 — argv[0] = program path)
+ *   [esp+4]        argv[0]     (pointer to path string below)
+ *   [esp+8]        NULL        (argv terminator)
+ *   [esp+12]       NULL        (envp terminator — no environment)
+ *   [esp+16]       AT_NULL(0)  (auxv type)
+ *   [esp+20]       0           (auxv value)
+ *   [esp+24...]    path string
+ *
+ * Returns the new user ESP (points at argc).
+ */
+uint32_t build_posix_stack(const char *path) {
+    uint8_t *top = (uint8_t *)USER_INITIAL_SP;
+    uint8_t *p   = top;
+
+    /* Copy path string just below the stack top */
+    size_t len = strlen(path) + 1;
+    p -= len;
+    for (size_t i = 0; i < len; i++) p[i] = path[i];
+    uint32_t argv0_addr = (uint32_t)p;
+
+    /* Align down to 4 bytes */
+    p = (uint8_t *)((uint32_t)p & ~3U);
+
+    /* auxv: AT_NULL (type=0, value=0) */
+    p -= 4; *(uint32_t *)p = 0;
+    p -= 4; *(uint32_t *)p = 0;
+
+    /* envp: NULL terminator (no environment variables) */
+    p -= 4; *(uint32_t *)p = 0;
+
+    /* argv: argv[0] pointer, NULL terminator */
+    p -= 4; *(uint32_t *)p = 0;
+    p -= 4; *(uint32_t *)p = argv0_addr;
+
+    /* argc = 1 */
+    p -= 4; *(uint32_t *)p = 1;
+
+    return (uint32_t)p;
+}
+
+/* -------------------------------------------------------------------------
    ELF validation
    ---------------------------------------------------------------------- */
 int elf_validate(void *data) {
@@ -210,9 +257,8 @@ int exec_elf(void *data) {
     uint8_t *exit_ptr = (uint8_t *)EXIT_STUB_ADDR;
     for (uint32_t i = 0; i < sizeof(exit_stub); i++) exit_ptr[i] = exit_stub[i];
 
-    /* Plant exit stub address as _start's return address. */
-    uint32_t user_sp = EXIT_STUB_ADDR - 4U;
-    *(uint32_t *)(user_sp) = EXIT_STUB_ADDR;
+    /* Build POSIX initial stack (argc/argv/envp/auxv). */
+    uint32_t user_sp = build_posix_stack("kernel");
 
     klog_hex("elf", "entry",       entry);
     klog_hex("elf", "user_sp",     user_sp);

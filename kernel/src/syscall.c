@@ -279,9 +279,8 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     /* Plant stubs */
     plant_user_stubs();
 
-    /* Set up stack */
-    uint32_t new_sp = EXIT_STUB_ADDR - 4U;
-    *(uint32_t *)new_sp = EXIT_STUB_ADDR;  /* return addr */
+    /* Build POSIX initial stack (argc/argv/envp/auxv) */
+    uint32_t new_sp = build_posix_stack(name);
 
     regs->eip     = entry;
     regs->cs      = SEG_UCODE;

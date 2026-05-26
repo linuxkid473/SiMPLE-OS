@@ -35,7 +35,7 @@ OBJS := $(OBJ_ASM) $(OBJ_C)
 
 all: image
 
-user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf user/wmtest.elf user/calc.elf user/term.elf user/desktop.elf
+user: user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf user/wmtest.elf user/calc.elf user/term.elf user/desktop.elf user/posixtest.elf
 
 # User program build flags: no libc, no PIC, flat binary via linker.ld
 USER_CC := $(CC) -m32 -ffreestanding -nostdlib -fno-pic -fno-pie -O0 \
@@ -90,6 +90,15 @@ user/term.elf: user/term.c user/libc.c user/linker.ld
 user/desktop.elf: user/desktop.c user/libc.c user/linker.ld
 	$(USER_CC) -o $@ user/desktop.c user/libc.c
 
+# stdio.c can be linked with any user program that needs FILE*/printf
+USER_STDIO := user/libc.c user/stdio.c
+
+# crt0.c + stdio: for programs that define main() instead of _start()
+USER_CRT := user/crt0.c user/libc.c user/stdio.c
+
+user/posixtest.elf: user/posixtest.c $(USER_CRT) user/linker.ld
+	$(USER_CC) -o $@ user/posixtest.c $(USER_CRT)
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -121,7 +130,7 @@ $(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf user/wmtest.elf user/calc.elf user/term.elf user/desktop.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
+image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf user/fwritetest.elf user/seektest.elf user/exectest.elf user/forktest.elf user/hog.elf user/multitest.elf user/forkwait.elf user/malloctest.elf user/wmtest.elf user/calc.elf user/term.elf user/desktop.elf user/posixtest.elf $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
 	truncate -s $(IMAGE_SIZE_MB)M $(IMAGE); \
@@ -149,6 +158,7 @@ image: $(KERNEL_ELF) user/hello.elf user/test.elf user/spam.elf user/systest.elf
 	mcopy -i $(IMAGE)@@1048576 user/calc.elf ::calc.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/term.elf ::term.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/desktop.elf ::desktop.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/posixtest.elf ::posix.elf; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% set 1 boot on 2>/dev/null || true; \
         $(LIMINE_DEPLOY) $(IMAGE)
 
