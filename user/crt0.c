@@ -15,6 +15,9 @@
 void exit(int code);
 int  main(int argc, char **argv, char **envp);
 
+/* Defined in env.c; set here so getenv() works before main() runs */
+extern char **environ;
+
 __attribute__((naked)) void _start(void) {
     __asm__ volatile (
         /* esp points to argc */
@@ -29,6 +32,8 @@ __attribute__((naked)) void _start(void) {
         "pushl %%edx\n\t"   /* envp */
         "pushl %%ecx\n\t"   /* argv */
         "pushl %%eax\n\t"   /* argc */
+        /* Store envp into environ before calling main */
+        "movl  %%edx, environ\n\t"
         "call  main\n\t"
         /* main returned — call exit(eax) */
         "pushl %%eax\n\t"
