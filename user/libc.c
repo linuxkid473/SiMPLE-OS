@@ -469,7 +469,7 @@ int stat(const char *path, void *out) {
     return (int)ret;
 }
 
-int readdir(const char *path, void *buf, int max_entries) {
+int readdir_path(const char *path, void *buf, int max_entries) {
     long ret = syscall3(410, (long)path, (long)buf, max_entries);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
@@ -582,5 +582,5 @@ int stat_simple(const char *path, void *out) {
 }
 
 int readdir_simple(const char *path, void *buf, int max) {
-    return readdir(path, buf, max);
+    return readdir_path(path, buf, max);
 }
