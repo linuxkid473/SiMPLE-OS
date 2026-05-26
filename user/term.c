@@ -38,7 +38,11 @@ int          fd_read(int fd, void *buf, int len);
 int          fd_write(int fd, const void *buf, int len);
 int          seek(int fd, int offset, int whence);
 unsigned int getticks(void);
-int          sys_sleep(unsigned int ticks);
+int          sleep_ticks(unsigned int ticks);
+int          mkdir(const char *path, int mode);
+int          unlink(const char *path);
+void         sys_powerctl(int mode);
+int          rename(const char *old_path, const char *new_path);
 
 /* ---- open flags (must match kernel/include/fd.h) ---- */
 #define O_READ   1
@@ -515,23 +519,28 @@ static void make_abs(const char *name, char *out, int cap) {
 static void cmd_help(void) {
     tp("Commands:", C_PROMPT);
     tp("  help              list commands", C_INFO);
+    tp("  about             system info", C_INFO);
     tp("  ls [dir]          list directory", C_INFO);
     tp("  cd <dir>          change directory", C_INFO);
     tp("  pwd               print working directory", C_INFO);
     tp("  cat <file>        print file contents", C_INFO);
     tp("  stat <file>       show file/dir metadata", C_INFO);
     tp("  touch <file>      create empty file", C_INFO);
+    tp("  mkdir <dir>       create directory", C_INFO);
+    tp("  rm <name>         delete file or empty dir", C_INFO);
+    tp("  cp <src> <dst>    copy file", C_INFO);
+    tp("  mv <src> <dst>    rename/move file", C_INFO);
     tp("  write <f> <text>  write text to file", C_INFO);
     tp("  run <file.elf>    run ELF (terminal stays)", C_INFO);
-    tp("  <prog.elf>        exec directly (replaces term)", C_INFO);
+    tp("  <prog.elf>        exec directly", C_INFO);
     tp("  echo <text>       print text", C_INFO);
     tp("  clear             clear screen", C_INFO);
     tp("  getpid            print process ID", C_INFO);
     tp("  getticks          print PIT tick counter", C_INFO);
-    tp("  sleep <n>         sleep n PIT ticks (100Hz)", C_INFO);
+    tp("  sleep <n>         sleep n PIT ticks", C_INFO);
+    tp("  poweroff          power off the system", C_INFO);
+    tp("  reboot            reboot the system", C_INFO);
     tp("  exit              close terminal", C_INFO);
-    tp("Note: mkdir/rm not available (no user syscall).", C_WARN);
-    tp("Note: open/stat are root-level only.", C_WARN);
 }
 
 static void cmd_ls(const char *arg) {
@@ -761,7 +770,7 @@ static void cmd_sleep(const char *arg) {
     if (!arg) { tp("sleep: missing argument", C_ERROR); return; }
     int t = str_to_int(arg);
     if (t < 0) { tp("sleep: invalid tick count", C_ERROR); return; }
-    sys_sleep((unsigned int)t);
+    sleep_ticks((unsigned int)t);
     char msg[32]; char ns[12]; u32_to_str((unsigned int)t, ns);
     msg[0]='\0'; t_strcat(msg,"slept "); t_strcat(msg,ns); t_strcat(msg," ticks");
     tp(msg, C_TEXT);
@@ -769,12 +778,75 @@ static void cmd_sleep(const char *arg) {
 
 static void cmd_getpid(void) {
     char msg[32]; char ns[12];
-    /* SYS_GETPID is declared in syscall.h as inline getpid() */
     int pid = 0;
     __asm__ volatile("int $0x80" : "=a"(pid) : "a"(13));
     u32_to_str((unsigned int)pid, ns);
     msg[0]='\0'; t_strcat(msg,"pid: "); t_strcat(msg,ns);
     tp(msg, C_TEXT);
+}
+
+static void cmd_mkdir(const char *name) {
+    if (!name || !*name) { tp("mkdir: missing name", C_ERROR); return; }
+    int rc = mkdir(name, 0755);
+    if (rc < 0) tp("mkdir: failed (root-level only, 8.3 name required)", C_ERROR);
+    else { char m[COLS+1]; m[0]='\0'; t_strcat(m,"created: "); t_strcat(m,name); tp(m,C_TEXT); }
+}
+
+static void cmd_rm(const char *name) {
+    if (!name || !*name) { tp("rm: missing name", C_ERROR); return; }
+    int rc = unlink(name);
+    if (rc < 0) tp("rm: failed (not found or not empty)", C_ERROR);
+    else { char m[COLS+1]; m[0]='\0'; t_strcat(m,"removed: "); t_strcat(m,name); tp(m,C_TEXT); }
+}
+
+static void cmd_cp(const char *src, const char *dst) {
+    if (!src || !*src) { tp("cp: missing source", C_ERROR); return; }
+    if (!dst || !*dst) { tp("cp: missing destination", C_ERROR); return; }
+
+    int in = open(src, O_READ);
+    if (in < 0) { tp("cp: cannot open source", C_ERROR); return; }
+
+    int out = open(dst, O_WRITE | O_CREATE);
+    if (out < 0) { close(in); tp("cp: cannot create dest", C_ERROR); return; }
+
+    static char cpbuf[512];
+    int total = 0, n;
+    while ((n = fd_read(in, cpbuf, sizeof(cpbuf))) > 0) {
+        fd_write(out, cpbuf, n);
+        total += n;
+    }
+    close(in); close(out);
+    char m[COLS+1]; char ns[12]; u32_to_str((unsigned int)total, ns);
+    m[0]='\0'; t_strcat(m,"copied "); t_strcat(m,ns); t_strcat(m," bytes");
+    tp(m, C_TEXT);
+}
+
+static void cmd_mv(const char *src, const char *dst) {
+    if (!src || !*src) { tp("mv: missing source", C_ERROR); return; }
+    if (!dst || !*dst) { tp("mv: missing destination", C_ERROR); return; }
+    int rc = rename(src, dst);
+    if (rc < 0) tp("mv: rename failed", C_ERROR);
+    else { char m[COLS+1]; m[0]='\0'; t_strcat(m,src); t_strcat(m," -> "); t_strcat(m,dst); tp(m,C_TEXT); }
+}
+
+static void cmd_about(void) {
+    tp("SiMPLE OS — a hobby 32-bit x86 kernel", C_PROMPT);
+    tp("  Architecture : i686 protected mode, ring-3 processes", C_INFO);
+    tp("  Scheduler    : preemptive round-robin (PIT 100 Hz)", C_INFO);
+    tp("  Filesystem   : FAT16 on ATA PIO", C_INFO);
+    tp("  Display      : 800x600 32bpp framebuffer via Stivale2", C_INFO);
+    tp("  Window Mgr   : pixel-buffer WM, user-space windows", C_INFO);
+    tp("  Terminal     : this program (term.elf)", C_INFO);
+}
+
+static void cmd_poweroff(void) {
+    tp("Powering off...", C_WARN);
+    sys_powerctl(0);
+}
+
+static void cmd_reboot(void) {
+    tp("Rebooting...", C_WARN);
+    sys_powerctl(1);
 }
 
 static void cmd_getticks(void) {
@@ -848,6 +920,7 @@ static void dispatch(int wid, char *line_in, unsigned int *px) {
     if (!cmd) return;
 
     if (t_strcmp(cmd,"help")     == 0) { cmd_help(); }
+    else if (t_strcmp(cmd,"about") == 0) { cmd_about(); }
     else if (t_strcmp(cmd,"clear") == 0) { sb_count = 0; }
     else if (t_strcmp(cmd,"pwd")   == 0) { cmd_pwd(); }
     else if (t_strcmp(cmd,"exit")  == 0) { wm_destroy(wid); exit(0); }
@@ -888,6 +961,32 @@ static void dispatch(int wid, char *line_in, unsigned int *px) {
         else cmd_touch(arg);
     }
 
+    else if (t_strcmp(cmd,"mkdir") == 0) {
+        char *arg = next_tok(&p);
+        if (!arg || next_tok(&p)) { tp("usage: mkdir <dir>", C_ERROR); }
+        else cmd_mkdir(arg);
+    }
+
+    else if (t_strcmp(cmd,"rm") == 0) {
+        char *arg = next_tok(&p);
+        if (!arg || next_tok(&p)) { tp("usage: rm <name>", C_ERROR); }
+        else cmd_rm(arg);
+    }
+
+    else if (t_strcmp(cmd,"cp") == 0) {
+        char *src = next_tok(&p);
+        char *dst = next_tok(&p);
+        if (!src || !dst || next_tok(&p)) { tp("usage: cp <src> <dst>", C_ERROR); }
+        else cmd_cp(src, dst);
+    }
+
+    else if (t_strcmp(cmd,"mv") == 0) {
+        char *src = next_tok(&p);
+        char *dst = next_tok(&p);
+        if (!src || !dst || next_tok(&p)) { tp("usage: mv <src> <dst>", C_ERROR); }
+        else cmd_mv(src, dst);
+    }
+
     else if (t_strcmp(cmd,"write") == 0) {
         char *file = next_tok(&p);
         if (!file) { tp("usage: write <file> <text>", C_ERROR); }
@@ -899,28 +998,23 @@ static void dispatch(int wid, char *line_in, unsigned int *px) {
 
     else if (t_strcmp(cmd,"run") == 0) {
         char *arg = next_tok(&p);
-        if (!arg || next_tok(&p)) { tp("usage: run <file.elf>", C_ERROR); }
+        if (!arg) { tp("usage: run <file.elf>", C_ERROR); }
         else cmd_run(wid, arg, px);
     }
 
     else if (t_strcmp(cmd,"getpid")   == 0) cmd_getpid();
     else if (t_strcmp(cmd,"getticks") == 0) cmd_getticks();
+    else if (t_strcmp(cmd,"poweroff") == 0) cmd_poweroff();
+    else if (t_strcmp(cmd,"reboot")   == 0) cmd_reboot();
 
     else if (t_strcmp(cmd,"sleep") == 0) {
         char *arg = next_tok(&p);
         cmd_sleep(arg);
     }
 
-    else if (t_strcmp(cmd,"mkdir") == 0 || t_strcmp(cmd,"rm") == 0 ||
-             t_strcmp(cmd,"cp")    == 0 || t_strcmp(cmd,"mv") == 0) {
-        tp("Not available: no kernel syscall for this operation.", C_WARN);
-    }
-
     else {
         /* Unknown command: try to exec it as a program */
         try_exec_unknown(wid, cmd, px);
-        /* try_exec_unknown only returns if exec failed — we've lost the window
-         * so the process exits */
     }
 }
 

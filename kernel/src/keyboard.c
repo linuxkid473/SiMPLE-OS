@@ -5,6 +5,7 @@
 
 static int shift_pressed    = 0;
 static int alt_pressed      = 0;
+static int ctrl_pressed     = 0;
 static int extended_prefix  = 0;
 
 static const char keymap[128] = {
@@ -32,6 +33,7 @@ static const char shift_keymap[128] = {
 void keyboard_init(void) {
     shift_pressed   = 0;
     alt_pressed     = 0;
+    ctrl_pressed    = 0;
     extended_prefix = 0;
 
     /* Re-enable the keyboard port (command 0xAE to the PS/2 controller).
@@ -49,6 +51,10 @@ void keyboard_init(void) {
 
 int keyboard_is_alt_pressed(void) {
     return alt_pressed;
+}
+
+int keyboard_is_ctrl_pressed(void) {
+    return ctrl_pressed;
 }
 
 void keyboard_read_event(key_event_t* event) {
@@ -112,6 +118,10 @@ void keyboard_read_event(key_event_t* event) {
         if (scancode == 0x38) { alt_pressed = 1; return; }
         if (scancode == 0xB8) { alt_pressed = 0; return; }
 
+        /* Left Ctrl press / release (0x1D press, 0x9D release) */
+        if (scancode == 0x1D) { ctrl_pressed = 1; return; }
+        if (scancode == 0x9D) { ctrl_pressed = 0; return; }
+
         if (scancode & 0x80) return;
 
         if (scancode == 0x1C) {
@@ -127,6 +137,12 @@ void keyboard_read_event(key_event_t* event) {
         if (scancode < 128) {
             char c = shift_pressed ? shift_keymap[scancode] : keymap[scancode];
             if (c) {
+                /* If Ctrl is pressed and it's a letter, convert to control character */
+                if (ctrl_pressed && c >= 'a' && c <= 'z') {
+                    c = (char)(c - 'a' + 1);
+                } else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
+                    c = (char)(c - 'A' + 1);
+                }
                 event->type = KEY_EVENT_CHAR;
                 event->ch = c;
                 return;

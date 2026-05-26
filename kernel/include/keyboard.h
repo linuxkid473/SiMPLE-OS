@@ -24,9 +24,10 @@ void keyboard_init(void);
 void keyboard_read_event(key_event_t* event);
 char keyboard_getchar(void);
 
-/* Returns 1 if either Alt key is currently held, 0 otherwise.
- * Used by console.c to distinguish Alt+Arrow (move window) from
- * plain Arrow (cursor/history navigation). */
+/* Returns 1 if either Alt key is currently held, 0 otherwise. */
 int keyboard_is_alt_pressed(void);
+
+/* Returns 1 if Ctrl key is currently held, 0 otherwise. */
+int keyboard_is_ctrl_pressed(void);
 
 #endif

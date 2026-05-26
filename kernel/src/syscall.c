@@ -1,28 +1,7 @@
 /*
  * syscall.c — kernel-side syscall implementations.
  *
- * Dispatched from idt.c's syscall_handler() on int 0x80.
- *
- * ABI (int 0x80):
- *   eax = syscall number
- *   ecx = arg0
- *   edx = arg1
- *   ebx = arg2   (3-argument syscalls only)
- *   return value in eax (set via regs->eax; restored by popa in ISR epilogue)
- *
- * Syscall table:
- *   1  SYS_WRITE  — write bytes to the active terminal
- *   2  SYS_EXIT   — terminate program (handled in idt.c via exit_trampoline)
- *   3  SYS_READ   — blocking line input
- *   4  SYS_YIELD  — cooperative yield (no-op)
- *   5  SYS_OPEN   — open file → fd
- *   6  SYS_CLOSE  — release fd
- *   7  SYS_FREAD  — read from fd
- *   8  SYS_FWRITE — write to fd
- *   9  SYS_SEEK   — reposition fd offset
- *  10  SYS_EXEC   — replace current process image with a new ELF
- *                   ecx = path (const char*, user pointer)
- *                   does not return on success; returns -errno on failure
+ * Linux i386 ABI: ebx=arg0, ecx=arg1, edx=arg2, esi=arg3, edi=arg4
  */
 
 #include "console.h"
@@ -30,28 +9,30 @@
 #include "fat16.h"
 #include "fd.h"
 #include "gdt.h"
+#include "keyboard.h"
 #include "klog.h"
 #include "paging.h"
+#include "pipe.h"
 #include "pit.h"
+#include "posix_errno.h"
 #include "process.h"
 #include "registers.h"
 #include "serial.h"
+#include "signal.h"
 #include "string.h"
-#include "vga.h"
+#include "tty.h"
 #include "types.h"
+#include "vga.h"
 
-/*
- * Minimum valid userspace pointer.  Must match USER_BASE in elf.c.
- * User programs load at 0x300000; their stack is below 0x400000.
- * Pointers below 0x300000 are into kernel or heap space — reject them.
- */
+/* Minimum valid userspace pointer */
 #define USER_ADDR_MIN 0x300000UL
+#define USER_ADDR_MAX 0xF00000UL
 
-static fat16_fs_t* g_fs          = NULL;
+static fat16_fs_t *g_fs          = NULL;
 static fd_table_t  g_fd_table;
 static int         g_fd_table_ok = 0;
 
-void syscall_set_fs(fat16_fs_t* fs) {
+void syscall_set_fs(fat16_fs_t *fs) {
     g_fs = fs;
     if (!g_fd_table_ok) {
         fd_table_init(&g_fd_table);
@@ -59,11 +40,9 @@ void syscall_set_fs(fat16_fs_t* fs) {
     }
 }
 
-fd_table_t* syscall_get_fd_table(void) {
-    /* If a process is running, use its per-process fd table. */
+fd_table_t *syscall_get_fd_table(void) {
     if (current_proc >= 0 && proc_table[current_proc].state != PROC_DEAD)
         return &proc_table[current_proc].fd_table;
-    /* Fallback for kernel-only context (e.g. shell-level operations). */
     if (!g_fd_table_ok) {
         fd_table_init(&g_fd_table);
         g_fd_table_ok = 1;
@@ -71,375 +50,203 @@ fd_table_t* syscall_get_fd_table(void) {
     return &g_fd_table;
 }
 
-/* Upper bound of the user address space: heap can grow to PROC_BRK_MAX.
- * User code+data starts at USER_ADDR_MIN; stack sits just below 0x400000;
- * heap runs from 0x400000 up to PROC_BRK_MAX.  Anything above is kernel. */
-#define USER_ADDR_MAX 0x700000UL   /* must equal PROC_BRK_MAX in syscall.c */
-
-/* Returns 1 if [ptr, ptr+len) is a plausible userspace buffer. */
-static int user_ptr_ok(const void* ptr, uint32_t len) {
+static int user_ptr_ok(const void *ptr, uint32_t len) {
     uint32_t addr = (uint32_t)ptr;
-    if (!ptr)                              return 0;
-    if (addr < USER_ADDR_MIN)              return 0;
-    if (len > 0 && (addr + len) < addr)   return 0;  /* integer wrap */
-    if (len > 0 && (addr + len) > USER_ADDR_MAX) return 0;  /* above heap */
+    if (!ptr)                       return 0;
+    if (addr < USER_ADDR_MIN)       return 0;
+    if (len > 0 && (addr + len) < addr) return 0;
     return 1;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_WRITE (1): ecx = buf, edx = len
- * ----------------------------------------------------------------------- */
-int32_t sys_write(const char* buf, uint32_t len) {
+/* ---- LEGACY syscalls (kept for elf.c / old code paths) ---- */
+
+int32_t sys_write(const char *buf, uint32_t len) {
     if (len == 0) return 0;
     if (len > 0x8000) len = 0x8000;
-    if (!user_ptr_ok(buf, len)) {
-        klog("syscall", "SYS_WRITE: invalid buf pointer");
-        return -(int32_t)EINVAL;
-    }
     for (uint32_t i = 0; i < len; i++)
         vga_putc(buf[i]);
     return (int32_t)len;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_READ (3): ecx = buf, edx = max_len
- * ----------------------------------------------------------------------- */
-int32_t sys_read(char* buf, uint32_t max_len) {
+int32_t sys_read(char *buf, uint32_t max_len) {
     if (max_len == 0) return 0;
-    if (!user_ptr_ok(buf, max_len)) {
-        klog("syscall", "SYS_READ: invalid buf pointer");
-        return -(int32_t)EINVAL;
-    }
+    if (!user_ptr_ok(buf, max_len)) return -(int32_t)EINVAL;
     console_read_line(buf, max_len);
     return (int32_t)strlen(buf);
 }
 
-/* -----------------------------------------------------------------------
- * SYS_YIELD (4): handled directly in idt.c's syscall_handler via proc_yield().
- * This stub is kept so nothing breaks if called directly.
- * ----------------------------------------------------------------------- */
-int32_t sys_yield(void) {
-    return 0;
+static const char *strip_slash(const char *path) {
+    if (path && path[0] == '/') return path + 1;
+    return path;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_OPEN (5): ecx = path, edx = flags
- *
- * Accepts a root-relative 8.3 filename (leading '/' is stripped).
- * O_CREATE creates the file when it doesn't already exist.
- * ----------------------------------------------------------------------- */
-int32_t sys_open(const char* path, uint32_t flags) {
-    klog("syscall", "SYS_OPEN");
+int32_t sys_open(const char *path, uint32_t flags) {
+    if (!path || !user_ptr_ok(path, 1)) return -(int32_t)EINVAL;
+    if (!*path) return -(int32_t)EINVAL;
+    /* Map old flags to new: if neither read nor write set, default to read */
+    if (!(flags & (O_READ | O_WRITE | O_RDONLY | O_WRONLY | O_RDWR)))
+        flags |= O_RDONLY;
+    if (!g_fs) return -(int32_t)EIO;
 
-    if (!path || !user_ptr_ok(path, 1)) {
-        klog("syscall", "SYS_OPEN: invalid path pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!*path) {
-        klog("syscall", "SYS_OPEN: empty path");
-        return -(int32_t)EINVAL;
-    }
-    if (!(flags & (O_READ | O_WRITE))) {
-        klog("syscall", "SYS_OPEN: no access mode in flags");
-        return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_OPEN: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
 
-    const char* name = path;
-    if (name[0] == '/') name++;
-    if (!*name) {
-        klog("syscall", "SYS_OPEN: path is just '/'");
-        return -(int32_t)EINVAL;
-    }
-
-    const uint16_t dir_cluster = 0;  /* always root for now */
     fat16_dirent_t entry;
-    int rc = fat16_stat(g_fs, dir_cluster, name, &entry);
+    int rc = fat16_stat(g_fs, 0, name, &entry);
 
     if (rc == FAT16_ERR_NOT_FOUND) {
-        if (!(flags & O_CREATE)) {
-            klog("syscall", "SYS_OPEN: not found");
-            return -(int32_t)ENOENT;
-        }
-        rc = fat16_touch(g_fs, dir_cluster, name);
-        if (rc == FAT16_ERR_INVALID)  return -(int32_t)EINVAL;
-        if (rc == FAT16_ERR_NOSPACE)  return -(int32_t)ENOSPC;
-        if (rc != FAT16_OK)           return -(int32_t)EIO;
-
-        rc = fat16_stat(g_fs, dir_cluster, name, &entry);
-        if (rc != FAT16_OK)           return -(int32_t)EIO;
-    } else if (rc == FAT16_ERR_INVALID) {
-        return -(int32_t)EINVAL;
+        if (!(flags & (O_CREATE | O_CREAT))) return -(int32_t)ENOENT;
+        rc = fat16_touch(g_fs, 0, name);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
+        rc = fat16_stat(g_fs, 0, name, &entry);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
     } else if (rc != FAT16_OK) {
         return -(int32_t)EIO;
     }
 
-    if (entry.attr & FAT16_ATTR_DIRECTORY)
-        return -(int32_t)EISDIR;
+    if (entry.attr & FAT16_ATTR_DIRECTORY) return -(int32_t)EISDIR;
 
-    int fd = fd_alloc(syscall_get_fd_table(), dir_cluster, entry.name, flags, entry.size);
-    klog_dec("syscall", "SYS_OPEN fd", (uint32_t)(fd >= 0 ? fd : 0));
+    int fd = fd_alloc(syscall_get_fd_table(), 0, entry.name, flags, entry.size);
     return (int32_t)fd;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_CLOSE (6): ecx = fd
- * ----------------------------------------------------------------------- */
 int32_t sys_close(int32_t fd) {
-    klog_dec("syscall", "SYS_CLOSE fd", (uint32_t)fd);
     return (int32_t)fd_close(syscall_get_fd_table(), (int)fd);
 }
 
-/* Static kernel buffer for SYS_FREAD — prevents user pointer from being
- * passed directly to fat16_read_file so we can bounds-check first. */
 #define FREAD_BUF_SIZE (8 * 1024)
 static char fread_buf[FREAD_BUF_SIZE];
 
-/* -----------------------------------------------------------------------
- * SYS_FREAD (7): ecx = fd, edx = buf, ebx = max_len
- *
- * Reads up to max_len bytes from fd at fd->offset.
- * Advances fd->offset by the number of bytes returned.
- * Returns 0 at EOF.
- * ----------------------------------------------------------------------- */
-int32_t sys_fread(int32_t fd, char* buf, uint32_t max_len) {
-    klog_dec("syscall", "SYS_FREAD fd", (uint32_t)fd);
-
+int32_t sys_fread(int32_t fd, char *buf, uint32_t max_len) {
     if (max_len == 0) return 0;
-    if (!user_ptr_ok(buf, max_len)) {
-        klog("syscall", "SYS_FREAD: invalid buf pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_FREAD: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    if (!user_ptr_ok(buf, max_len)) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
 
-    file_descriptor_t* f = fd_get(syscall_get_fd_table(), (int)fd);
-    if (!f) {
-        klog("syscall", "SYS_FREAD: invalid fd");
-        return -(int32_t)EBADF;
-    }
-    if (!(f->flags & O_READ)) {
-        klog("syscall", "SYS_FREAD: fd not readable");
-        return -(int32_t)EACCES;
-    }
+    file_desc_t *f = fd_get(syscall_get_fd_table(), (int)fd);
+    if (!f || f->type != FD_FILE) return -(int32_t)EBADF;
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -(int32_t)EACCES;
 
-    /* Re-stat to pick up any size changes (e.g. written by SYS_FWRITE) */
     fat16_dirent_t dirent;
-    if (fat16_stat(g_fs, f->dir_cluster, f->name, &dirent) == FAT16_OK)
-        f->size = dirent.size;
+    if (fat16_stat(g_fs, f->file.dir_cluster, f->file.name, &dirent) == FAT16_OK)
+        f->file.size = dirent.size;
 
-    klog_dec("syscall", "SYS_FREAD offset", f->offset);
-    klog_dec("syscall", "SYS_FREAD size",   f->size);
-
-    if (f->offset >= f->size) return 0;  /* EOF */
+    if (f->file.offset >= f->file.size) return 0;
 
     uint32_t out_len = 0;
-    int rc = fat16_read_file(g_fs, f->dir_cluster, f->name,
+    int rc = fat16_read_file(g_fs, f->file.dir_cluster, f->file.name,
                              fread_buf, FREAD_BUF_SIZE, &out_len);
-    if (rc != FAT16_OK) {
-        klog("syscall", "SYS_FREAD: fat16_read_file failed");
-        return -(int32_t)EIO;
-    }
+    if (rc != FAT16_OK) return -(int32_t)EIO;
 
-    uint32_t avail = (out_len > f->offset) ? (out_len - f->offset) : 0U;
+    uint32_t avail = (out_len > f->file.offset) ? (out_len - f->file.offset) : 0U;
     uint32_t n     = (avail < max_len) ? avail : max_len;
 
     for (uint32_t i = 0; i < n; i++)
-        buf[i] = fread_buf[f->offset + i];
+        buf[i] = fread_buf[f->file.offset + i];
 
-    f->offset += n;
-    klog_dec("syscall", "SYS_FREAD bytes", n);
+    f->file.offset += n;
     return (int32_t)n;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_FWRITE (8): ecx = fd, edx = buf, ebx = len
- *
- * Writes len bytes from buf into the file at fd->offset using
- * fat16_write_at(), which supports partial overwrite, append, and
- * extension beyond EOF.  fd->offset and fd->size are advanced/updated
- * on success.
- * ----------------------------------------------------------------------- */
-int32_t sys_fwrite(int32_t fd, const char* buf, uint32_t len) {
-    klog_dec("syscall", "SYS_FWRITE fd",  (uint32_t)fd);
-    klog_dec("syscall", "SYS_FWRITE len", len);
-
+int32_t sys_fwrite(int32_t fd, const char *buf, uint32_t len) {
     if (len == 0) return 0;
-    if (len > 0x8000) len = 0x8000;  /* cap at 32 KB per call */
-    if (!user_ptr_ok(buf, len)) {
-        klog("syscall", "SYS_FWRITE: invalid buf pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_FWRITE: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    if (len > 0x8000) len = 0x8000;
+    if (!user_ptr_ok(buf, len)) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
 
-    file_descriptor_t* f = fd_get(syscall_get_fd_table(), (int)fd);
-    if (!f) {
-        klog("syscall", "SYS_FWRITE: invalid fd");
-        return -(int32_t)EBADF;
-    }
-    if (!(f->flags & O_WRITE)) {
-        klog("syscall", "SYS_FWRITE: fd not writable");
-        return -(int32_t)EACCES;
-    }
+    file_desc_t *f = fd_get(syscall_get_fd_table(), (int)fd);
+    if (!f || f->type != FD_FILE) return -(int32_t)EBADF;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int32_t)EACCES;
 
-    klog_dec("syscall", "SYS_FWRITE offset", f->offset);
+    int rc = fat16_write_at(g_fs, f->file.dir_cluster, f->file.name,
+                            f->file.offset, buf, len);
+    if (rc != FAT16_OK) return -(int32_t)EIO;
 
-    int rc = fat16_write_at(g_fs, f->dir_cluster, f->name, f->offset, buf, len);
-    if (rc != FAT16_OK) {
-        klog("syscall", "SYS_FWRITE: fat16_write_at failed");
-        return -(int32_t)EIO;
-    }
-
-    f->offset += len;
-    if (f->offset > f->size) f->size = f->offset;
-
-    klog_dec("syscall", "SYS_FWRITE wrote", len);
+    f->file.offset += len;
+    if (f->file.offset > f->file.size) f->file.size = f->file.offset;
     return (int32_t)len;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_SEEK (9): ecx = fd, edx = offset (signed), ebx = whence
- *
- * Repositions fd->offset according to whence:
- *   SEEK_SET(0): new offset = offset
- *   SEEK_CUR(1): new offset = fd->offset + offset
- *   SEEK_END(2): new offset = file_size + offset
- *
- * Seeking beyond EOF is allowed (no cluster allocation).
- * Negative final offsets are rejected with -EINVAL.
- * fd->size is NOT modified by seek.
- * ----------------------------------------------------------------------- */
 int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence) {
-    klog_dec("syscall", "SYS_SEEK fd",     (uint32_t)fd);
-    klog_dec("syscall", "SYS_SEEK offset", (uint32_t)offset);
-    klog_dec("syscall", "SYS_SEEK whence", (uint32_t)whence);
-
-    file_descriptor_t* f = fd_get(syscall_get_fd_table(), (int)fd);
-    if (!f) {
-        klog("syscall", "SYS_SEEK: invalid fd");
-        return -(int32_t)EBADF;
-    }
+    file_desc_t *f = fd_get(syscall_get_fd_table(), (int)fd);
+    if (!f || f->type != FD_FILE) return -(int32_t)EBADF;
 
     int32_t new_pos;
-
     if (whence == SEEK_SET) {
-        if (offset < 0) {
-            klog("syscall", "SYS_SEEK: negative SEEK_SET offset");
-            return -(int32_t)EINVAL;
-        }
+        if (offset < 0) return -(int32_t)EINVAL;
         new_pos = offset;
     } else if (whence == SEEK_CUR) {
-        new_pos = (int32_t)f->offset + offset;
-        if (new_pos < 0) {
-            klog("syscall", "SYS_SEEK: negative result from SEEK_CUR");
-            return -(int32_t)EINVAL;
-        }
+        new_pos = (int32_t)f->file.offset + offset;
+        if (new_pos < 0) return -(int32_t)EINVAL;
     } else if (whence == SEEK_END) {
-        /* Re-stat to pick up the latest on-disk size */
         if (g_fs) {
             fat16_dirent_t dirent;
-            if (fat16_stat(g_fs, f->dir_cluster, f->name, &dirent) == FAT16_OK)
-                f->size = dirent.size;
+            if (fat16_stat(g_fs, f->file.dir_cluster, f->file.name, &dirent) == FAT16_OK)
+                f->file.size = dirent.size;
         }
-        new_pos = (int32_t)f->size + offset;
-        if (new_pos < 0) {
-            klog("syscall", "SYS_SEEK: negative result from SEEK_END");
-            return -(int32_t)EINVAL;
-        }
+        new_pos = (int32_t)f->file.size + offset;
+        if (new_pos < 0) return -(int32_t)EINVAL;
     } else {
-        klog("syscall", "SYS_SEEK: invalid whence");
         return -(int32_t)EINVAL;
     }
 
-    uint32_t old_offset = f->offset;
-    f->offset = (uint32_t)new_pos;
-    klog_dec("syscall", "SYS_SEEK old", old_offset);
-    klog_dec("syscall", "SYS_SEEK new", f->offset);
+    f->file.offset = (uint32_t)new_pos;
     return new_pos;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_EXEC (10): ecx = path (const char*, user pointer)
- *
- * Replaces the current user-space image with a new ELF executable loaded
- * from the FAT16 filesystem.  On success this syscall does NOT return to
- * the calling program — the ISR's iret frame is patched to jump directly
- * to the new ELF entry point at ring3.  On failure -errno is returned
- * normally and the original program continues.
- *
- * The kernel stack context (kernel_esp, saved_ebp/ebx/esi/edi) saved by
- * launch_ring3() is preserved across exec, so when the new program
- * eventually calls SYS_EXIT, exit_trampoline restores exec_elf's frame
- * exactly as if the original program had exited.
- * ----------------------------------------------------------------------- */
-
-/* Kernel-side read buffer — lives in supervisor memory, never overlaps user space. */
 #define EXEC_BUF_SIZE (64 * 1024)
 static uint8_t exec_buf[EXEC_BUF_SIZE];
 
-/* Machine code for the ring3 exit stub planted just below the new stack top.
- * If _start returns without calling SYS_EXIT this stub runs instead. */
-static const uint8_t exec_exit_stub[] = {
-    0xB8, 0x02, 0x00, 0x00, 0x00,  /* mov $2, %eax   (SYS_EXIT) */
-    0x31, 0xC9,                      /* xor %ecx, %ecx            */
-    0xCD, 0x80,                      /* int $0x80                 */
-    0xF4                             /* hlt            (safety)   */
+/* Old-style exit stub using old syscall 2 ABI */
+static const uint8_t exec_exit_stub_old[] = {
+    0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov $1, %eax   (SYS_EXIT Linux) */
+    0x31, 0xDB,                      /* xor %ebx, %ebx */
+    0xCD, 0x80,                      /* int $0x80 */
+    0xF4                             /* hlt */
 };
-#define EXEC_STUB_ADDR (USER_STACK - 32U)
+
+/* Sigreturn trampoline: mov $119, %eax; int $0x80; hlt */
+static const uint8_t sigreturn_trampoline[] = {
+    0xB8, 0x77, 0x00, 0x00, 0x00,  /* mov $119, %eax (SYS_SIGRETURN) */
+    0xCD, 0x80,                      /* int $0x80 */
+    0xF4                             /* hlt */
+};
+
+/* Exit stub: mov $1, %eax; xor %ebx,%ebx; int $0x80; hlt */
+static const uint8_t exit_stub_bytes[] = {
+    0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov $1, %eax */
+    0x31, 0xDB,                      /* xor %ebx, %ebx */
+    0xCD, 0x80,                      /* int $0x80 */
+    0xF4                             /* hlt */
+};
+
+static void plant_user_stubs(void) {
+    /* Plant sigreturn trampoline at SIG_TRAMPOLINE_ADDR */
+    uint8_t *tramp = (uint8_t *)SIG_TRAMPOLINE_ADDR;
+    for (uint32_t i = 0; i < sizeof(sigreturn_trampoline); i++)
+        tramp[i] = sigreturn_trampoline[i];
+
+    /* Plant exit stub at EXIT_STUB_ADDR */
+    uint8_t *xstub = (uint8_t *)EXIT_STUB_ADDR;
+    for (uint32_t i = 0; i < sizeof(exit_stub_bytes); i++)
+        xstub[i] = exit_stub_bytes[i];
+}
 
 int32_t sys_exec(const char *path, registers_t *regs) {
-    klog("syscall", "SYS_EXEC");
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EINVAL;
 
-    /* --- 1. Validate the user-supplied path pointer ------------------- */
-    if (!user_ptr_ok(path, 1)) {
-        klog("syscall", "SYS_EXEC: invalid path pointer");
-        return -(int32_t)EINVAL;
-    }
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
 
-    const char *name = path;
-    if (name[0] == '/') name++;
-    if (!*name) {
-        klog("syscall", "SYS_EXEC: empty path");
-        return -(int32_t)EINVAL;
-    }
-
-    if (!g_fs) {
-        klog("syscall", "SYS_EXEC: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
-
-    klog("syscall", "SYS_EXEC: reading file");
-    serial_write(COM1, "[SIMPLE] SYS_EXEC: path=");
-    serial_write(COM1, name);
-    serial_write(COM1, "\n");
-
-    /* --- 2. Read the ELF file into the kernel exec buffer ------------- */
     uint32_t out_len = 0;
-    int rc = fat16_read_file(g_fs, 0, name, exec_buf, EXEC_BUF_SIZE, &out_len);
-    if (rc != FAT16_OK) {
-        klog("syscall", "SYS_EXEC: file not found or read error");
-        return -(int32_t)ENOENT;
-    }
-    klog_dec("syscall", "SYS_EXEC: file bytes", out_len);
+    int rc = fat16_read_file(g_fs, 0, name, (char *)exec_buf, EXEC_BUF_SIZE, &out_len);
+    if (rc != FAT16_OK) return -(int32_t)ENOENT;
 
-    /* --- 3. Validate ELF header --------------------------------------- */
-    if (elf_validate(exec_buf) != 0) {
-        klog("syscall", "SYS_EXEC: invalid ELF");
-        return -(int32_t)ENOEXEC;
-    }
+    if (elf_validate(exec_buf) != 0) return -(int32_t)ENOEXEC;
 
     Elf32_Ehdr *ehdr = (Elf32_Ehdr *)exec_buf;
     Elf32_Phdr *phdr = (Elf32_Phdr *)(exec_buf + ehdr->e_phoff);
 
-    /* Compute load bias: shift first PT_LOAD segment to USER_BASE. */
     uint32_t base = 0;
     int found_load = 0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -449,25 +256,16 @@ int32_t sys_exec(const char *path, registers_t *regs) {
             break;
         }
     }
-    if (!found_load) {
-        klog("syscall", "SYS_EXEC: no PT_LOAD segment");
-        return -(int32_t)ENOEXEC;
-    }
+    if (!found_load) return -(int32_t)ENOEXEC;
 
-    /* --- 4. Bounds-check all load segments before touching user space - */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
         uint32_t dest_start = phdr[i].p_vaddr + base;
         uint32_t dest_end   = dest_start + phdr[i].p_memsz;
-        if (dest_start < USER_BASE || dest_end > USER_STACK) {
-            klog_hex("syscall", "SYS_EXEC: segment out of bounds", dest_start);
+        if (dest_start < USER_BASE || dest_end > USER_STACK)
             return -(int32_t)ENOEXEC;
-        }
     }
 
-    klog("syscall", "SYS_EXEC: ELF valid, loading new image");
-
-    /* --- 5. Copy new ELF segments into user space --------------------- */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
         uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr + base);
@@ -477,55 +275,27 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     }
 
     uint32_t entry = ehdr->e_entry + base;
-    klog_hex("syscall", "SYS_EXEC: new entry", entry);
 
-    /* --- 6. Plant exit stub and set up new user stack ----------------- */
-    uint8_t *stub = (uint8_t *)EXEC_STUB_ADDR;
-    for (uint32_t i = 0; i < sizeof(exec_exit_stub); i++) stub[i] = exec_exit_stub[i];
+    /* Plant stubs */
+    plant_user_stubs();
 
-    uint32_t new_sp = USER_STACK - 4U - 32U; /* one slot below the stub */
-    *(uint32_t *)new_sp = EXEC_STUB_ADDR;     /* _start return address   */
+    /* Set up stack */
+    uint32_t new_sp = EXIT_STUB_ADDR - 4U;
+    *(uint32_t *)new_sp = EXIT_STUB_ADDR;  /* return addr */
 
-    klog_hex("syscall", "SYS_EXEC: new_sp", new_sp);
-
-    /* --- 7. Patch the ISR iret frame to jump to the new entry point --- *
-     *                                                                     *
-     * The frame on the kernel ISR stack (kstack, at TSS.esp0) currently  *
-     * holds the old program's [EIP, CS, EFLAGS, ESP, SS].  We overwrite  *
-     * it so the isr_syscall epilogue's iret jumps straight into the new   *
-     * ELF instead of returning to the old program.  The old code/data at  *
-     * USER_BASE has already been replaced above, so there is nothing left  *
-     * for the old program to execute even if somehow control returned.    */
     regs->eip     = entry;
-    regs->cs      = SEG_UCODE;   /* 0x1B — user code, DPL=3  */
-    regs->eflags  = 0x02;        /* reserved bit; IF=0        */
+    regs->cs      = SEG_UCODE;
+    regs->eflags  = 0x202;
     regs->useresp = new_sp;
-    regs->ss      = SEG_UDATA;   /* 0x23 — user data, DPL=3  */
+    regs->ss      = SEG_UDATA;
 
-    serial_write(COM1, "[SIMPLE] SYS_EXEC: iret frame patched → new program\n");
-
-    /* Return value ends up in regs->eax via popa, but the new _start
-     * never inspects eax, so the value is irrelevant. */
     return 0;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_SBRK (15): ecx = increment (bytes, must be > 0)
- *
- * Grows the calling process's heap by `increment` bytes.
- * Returns the old break value (start of newly usable memory).
- * Returns -1 if the heap would exceed 0x700000 or physical pages run out.
- *
- * Each process starts with brk = 0x400000.  Pages are lazily mapped into
- * the process's PDE[1] page table as user-accessible (ring-3 R/W).
- * ----------------------------------------------------------------------- */
 #define PROC_BRK_MAX 0x700000U
 
 int32_t sys_sbrk(int32_t increment) {
-    if (current_proc < 0) {
-        klog("syscall", "SYS_SBRK: no current process");
-        return -1;
-    }
+    if (current_proc < 0) return -1;
 
     process_t *proc = &proc_table[current_proc];
     uint32_t old_brk = proc->brk;
@@ -533,69 +303,28 @@ int32_t sys_sbrk(int32_t increment) {
     if (increment <= 0) return (int32_t)old_brk;
 
     uint32_t new_brk = old_brk + (uint32_t)increment;
+    if (new_brk > PROC_BRK_MAX || new_brk < old_brk) return -1;
 
-    if (new_brk > PROC_BRK_MAX || new_brk < old_brk) {
-        klog("syscall", "SYS_SBRK: heap limit exceeded");
-        return -1;
-    }
-
-    /* Map any 4 KB pages newly required to cover [old_brk, new_brk). */
     for (uint32_t addr = old_brk & ~0xFFFU; addr < new_brk; addr += 0x1000U) {
         if (paging_page_mapped(proc->page_dir, addr)) continue;
         uint32_t phys = paging_alloc_phys_page();
-        if (!phys) {
-            klog("syscall", "SYS_SBRK: out of physical pages");
-            return -1;
-        }
-        paging_map_page(proc->page_dir, addr, phys, 1 /*user*/);
+        if (!phys) return -1;
+        paging_map_page(proc->page_dir, addr, phys, 1);
     }
 
     proc->brk = new_brk;
-
-    serial_write(COM1, "[sbrk] old=");
-    serial_write_hex(COM1, old_brk);
-    serial_write(COM1, " new=");
-    serial_write_hex(COM1, new_brk);
-    serial_write(COM1, "\n");
-
     return (int32_t)old_brk;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_GETPID (13): no arguments
- *
- * Returns the PID of the calling process.  Returns -1 if no process is
- * active (should not happen from ring3, but handle gracefully).
- * ----------------------------------------------------------------------- */
 int32_t sys_getpid(void) {
-    if (current_proc < 0 || current_proc >= MAX_PROCS) return -1;
+    if (current_proc < 0) return -1;
     return (int32_t)proc_table[current_proc].pid;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_GETTICKS (19): no arguments
- *
- * Returns the global PIT tick counter (100 Hz, same counter used by
- * SYS_SLEEP).  Useful for busy-wait timers and benchmarking from user space.
- * ----------------------------------------------------------------------- */
 int32_t sys_getticks(void) {
     return (int32_t)pit_ticks();
 }
 
-/* -----------------------------------------------------------------------
- * Stat and readdir struct layouts — must match user/syscall.h exactly.
- *
- * sys_stat_t  (SYS_STAT result):
- *   uint32_t size    — file size in bytes (0 for dirs)
- *   uint8_t  is_dir  — 1 if directory, 0 if regular file
- *   uint8_t  exists  — 1 if the path was found, 0 if not
- *
- * sys_dirent_t  (SYS_READDIR per-entry):
- *   char     name[64] — null-terminated filename (8.3 format)
- *   uint8_t  is_dir   — 1 if directory
- *   uint8_t  _pad[3]  — alignment padding (compiler inserts this anyway)
- *   uint32_t size     — file size in bytes
- * ----------------------------------------------------------------------- */
 typedef struct {
     uint32_t size;
     uint8_t  is_dir;
@@ -609,29 +338,12 @@ typedef struct {
     uint32_t size;
 } sys_dirent_t;
 
-/* -----------------------------------------------------------------------
- * SYS_STAT (16): ecx = path (user ptr), edx = pointer to sys_stat_t
- *
- * Fills the caller's stat struct from the FAT16 directory entry.
- * Always looks up from the root directory (cluster 0).
- * Returns 0 on success, -1 if not found.
- * ----------------------------------------------------------------------- */
 int32_t sys_stat(const char *path, sys_stat_t *out) {
-    if (!user_ptr_ok(path, 1)) {
-        klog("syscall", "SYS_STAT: invalid path pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!user_ptr_ok(out, (uint32_t)sizeof(sys_stat_t))) {
-        klog("syscall", "SYS_STAT: invalid out pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_STAT: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EINVAL;
+    if (!user_ptr_ok(out, (uint32_t)sizeof(sys_stat_t))) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
 
-    const char *name = path;
-    if (name[0] == '/') name++;
+    const char *name = strip_slash(path);
 
     fat16_dirent_t entry;
     int rc = fat16_stat(g_fs, 0, name, &entry);
@@ -642,10 +354,7 @@ int32_t sys_stat(const char *path, sys_stat_t *out) {
         out->exists = 0;
         return 0;
     }
-    if (rc != FAT16_OK) {
-        klog("syscall", "SYS_STAT: fat16_stat failed");
-        return -(int32_t)EIO;
-    }
+    if (rc != FAT16_OK) return -(int32_t)EIO;
 
     out->size   = entry.size;
     out->is_dir = (entry.attr & FAT16_ATTR_DIRECTORY) ? 1 : 0;
@@ -653,64 +362,33 @@ int32_t sys_stat(const char *path, sys_stat_t *out) {
     return 0;
 }
 
-/* Kernel-side scratch buffer for SYS_READDIR — avoids holding a large
- * array on the stack and prevents user pointer from reaching fat16 directly. */
 #define READDIR_KERNEL_MAX 64
 static fat16_dirent_t readdir_kbuf[READDIR_KERNEL_MAX];
 
-/* -----------------------------------------------------------------------
- * SYS_READDIR (17): ecx = path (user ptr), edx = sys_dirent_t[] (user ptr),
- *                   ebx = max entries
- *
- * Enumerates the directory at `path` (root-relative; "/" means root).
- * Writes up to max_entries entries into the caller's buffer.
- * Returns the number of entries written, or -1 on error.
- * ----------------------------------------------------------------------- */
 int32_t sys_readdir(const char *path, sys_dirent_t *out, uint32_t max_entries) {
-    if (!user_ptr_ok(path, 1)) {
-        klog("syscall", "SYS_READDIR: invalid path pointer");
-        return -(int32_t)EINVAL;
-    }
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EINVAL;
     if (max_entries == 0) return 0;
     if (max_entries > READDIR_KERNEL_MAX) max_entries = READDIR_KERNEL_MAX;
-    if (!user_ptr_ok(out, max_entries * (uint32_t)sizeof(sys_dirent_t))) {
-        klog("syscall", "SYS_READDIR: invalid out pointer");
+    if (!user_ptr_ok(out, max_entries * (uint32_t)sizeof(sys_dirent_t)))
         return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_READDIR: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    if (!g_fs) return -(int32_t)EIO;
 
-    /* Resolve directory cluster from path */
     uint16_t dir_cluster = 0;
-    const char *dname = path;
-    if (dname[0] == '/') dname++;
+    const char *dname = strip_slash(path);
 
     if (*dname != '\0') {
         fat16_dirent_t de;
-        int rc = fat16_stat(g_fs, 0, dname, &de);
-        if (rc != FAT16_OK) {
-            klog("syscall", "SYS_READDIR: directory not found");
-            return -1;
-        }
-        if (!(de.attr & FAT16_ATTR_DIRECTORY)) {
-            klog("syscall", "SYS_READDIR: path is not a directory");
-            return -(int32_t)EINVAL;
-        }
+        if (fat16_stat(g_fs, 0, dname, &de) != FAT16_OK) return -1;
+        if (!(de.attr & FAT16_ATTR_DIRECTORY)) return -(int32_t)EINVAL;
         dir_cluster = de.first_cluster;
     }
 
     int count = 0;
     int rc = fat16_list_entries(g_fs, dir_cluster, readdir_kbuf,
                                 (int)max_entries, &count);
-    if (rc != FAT16_OK) {
-        klog("syscall", "SYS_READDIR: fat16_list_entries failed");
-        return -1;
-    }
+    if (rc != FAT16_OK) return -1;
 
     for (int i = 0; i < count; i++) {
-        /* Copy 8.3 name — fat16_dirent_t.name is already null-terminated */
         uint32_t j = 0;
         while (readdir_kbuf[i].name[j] && j < 63) {
             out[i].name[j] = readdir_kbuf[i].name[j];
@@ -727,44 +405,946 @@ int32_t sys_readdir(const char *path, sys_dirent_t *out, uint32_t max_entries) {
     return (int32_t)count;
 }
 
-/* -----------------------------------------------------------------------
- * SYS_RENAME (18): ecx = old_path (user ptr), edx = new_path (user ptr)
- *
- * Renames a file or directory within the root directory.
- * Uses fat16_move_file with the same source and destination directory
- * (cluster 0) to perform an in-place rename.
- * Returns 0 on success, -1 on error.
- * ----------------------------------------------------------------------- */
 int32_t sys_rename(const char *old_path, const char *new_path) {
-    if (!user_ptr_ok(old_path, 1)) {
-        klog("syscall", "SYS_RENAME: invalid old_path pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!user_ptr_ok(new_path, 1)) {
-        klog("syscall", "SYS_RENAME: invalid new_path pointer");
-        return -(int32_t)EINVAL;
-    }
-    if (!g_fs) {
-        klog("syscall", "SYS_RENAME: filesystem not mounted");
-        return -(int32_t)EIO;
-    }
+    if (!user_ptr_ok(old_path, 1) || !user_ptr_ok(new_path, 1)) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
 
-    const char *old_name = old_path;
-    if (old_name[0] == '/') old_name++;
-    const char *new_name = new_path;
-    if (new_name[0] == '/') new_name++;
-
-    if (!*old_name || !*new_name) {
-        klog("syscall", "SYS_RENAME: empty path component");
-        return -(int32_t)EINVAL;
-    }
+    const char *old_name = strip_slash(old_path);
+    const char *new_name = strip_slash(new_path);
+    if (!*old_name || !*new_name) return -(int32_t)EINVAL;
 
     fat16_dirent_t old_entry;
-    if (fat16_stat(g_fs, 0, old_name, &old_entry) != FAT16_OK) {
-        klog("syscall", "SYS_RENAME: old path not found");
-        return -(int32_t)ENOENT;
-    }
+    if (fat16_stat(g_fs, 0, old_name, &old_entry) != FAT16_OK) return -(int32_t)ENOENT;
 
     int rc = fat16_move_file(g_fs, 0, old_name, 0, new_name);
     return (rc == FAT16_OK) ? 0 : -1;
+}
+
+/* ---- NEW POSIX syscall implementations ---- */
+
+int32_t sys_linux_write(int32_t fd, const char *buf, uint32_t len) {
+    if (len == 0) return 0;
+    if (len > 0x8000) len = 0x8000;
+
+    if (fd == 1 || fd == 2) {
+        /* stdout / stderr: write to VGA */
+        if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+        for (uint32_t i = 0; i < len; i++)
+            vga_putc(buf[i]);
+        return (int32_t)len;
+    }
+
+    /* Look up fd in process table */
+    file_desc_t *f = fd_get(syscall_get_fd_table(), fd);
+    if (!f) return -(int32_t)EBADF;
+
+    if (f->type == FD_TTY) {
+        if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+        for (uint32_t i = 0; i < len; i++)
+            vga_putc(buf[i]);
+        return (int32_t)len;
+    }
+
+    if (f->type == FD_PIPE_W) {
+        if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+        return (int32_t)pipe_write(f->pipe.pipe_idx, buf, len);
+    }
+
+    if (f->type == FD_FILE) {
+        if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+        if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int32_t)EACCES;
+        if (!g_fs) return -(int32_t)EIO;
+
+        /* Handle O_APPEND */
+        if (f->flags & O_APPEND) {
+            fat16_dirent_t dirent;
+            if (fat16_stat(g_fs, f->file.dir_cluster, f->file.name, &dirent) == FAT16_OK)
+                f->file.offset = dirent.size;
+        }
+
+        int rc = fat16_write_at(g_fs, f->file.dir_cluster, f->file.name,
+                                f->file.offset, buf, len);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
+        f->file.offset += len;
+        if (f->file.offset > f->file.size) f->file.size = f->file.offset;
+        return (int32_t)len;
+    }
+
+    return -(int32_t)EBADF;
+}
+
+int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
+    (void)regs;
+    if (len == 0) return 0;
+    if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+
+    if (fd == 0) {
+        /* stdin: keyboard */
+        if (tty_is_canon()) {
+            /* Canonical mode: read a full line */
+            console_read_line(buf, len);
+            /* Check if line contains Ctrl-C */
+            uint32_t line_len = (uint32_t)strlen(buf);
+            for (uint32_t i = 0; i < line_len; i++) {
+                if (tty_is_intr(buf[i])) {
+                    if (current_proc >= 0)
+                        proc_send_signal(proc_table[current_proc].pid, SIGINT);
+                    return -(int32_t)EINTR;
+                }
+                if (tty_is_eof(buf[i])) {
+                    return 0;  /* EOF */
+                }
+            }
+            /* Append newline if not already there */
+            if (line_len < len - 1) {
+                buf[line_len] = '\n';
+                buf[line_len + 1] = '\0';
+                return (int32_t)(line_len + 1);
+            }
+            return (int32_t)line_len;
+        } else {
+            /* Raw mode */
+            uint8_t vmin = g_tty.termios.c_cc[VMIN];
+            if (vmin == 0) vmin = 1;
+            uint32_t got = 0;
+            while (got < vmin && got < len) {
+                char c = keyboard_getchar();
+                if (tty_is_intr(c)) {
+                    if (current_proc >= 0)
+                        proc_send_signal(proc_table[current_proc].pid, SIGINT);
+                    if (got == 0) return -(int32_t)EINTR;
+                    break;
+                }
+                buf[got++] = c;
+            }
+            return (int32_t)got;
+        }
+    }
+
+    /* Other fds */
+    file_desc_t *f = fd_get(syscall_get_fd_table(), fd);
+    if (!f) return -(int32_t)EBADF;
+
+    if (f->type == FD_TTY) {
+        /* Same as fd 0 */
+        console_read_line(buf, len);
+        return (int32_t)strlen(buf);
+    }
+
+    if (f->type == FD_PIPE_R) {
+        return (int32_t)pipe_read(f->pipe.pipe_idx, buf, len);
+    }
+
+    if (f->type == FD_FILE) {
+        if ((f->flags & O_ACCMODE) == O_WRONLY) return -(int32_t)EACCES;
+        if (!g_fs) return -(int32_t)EIO;
+
+        fat16_dirent_t dirent;
+        if (fat16_stat(g_fs, f->file.dir_cluster, f->file.name, &dirent) == FAT16_OK)
+            f->file.size = dirent.size;
+
+        if (f->file.offset >= f->file.size) return 0;
+
+        uint32_t out_len = 0;
+        int rc = fat16_read_file(g_fs, f->file.dir_cluster, f->file.name,
+                                 fread_buf, FREAD_BUF_SIZE, &out_len);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
+
+        uint32_t avail = (out_len > f->file.offset) ? (out_len - f->file.offset) : 0U;
+        uint32_t n     = (avail < len) ? avail : len;
+
+        for (uint32_t i = 0; i < n; i++)
+            buf[i] = fread_buf[f->file.offset + i];
+
+        f->file.offset += n;
+        return (int32_t)n;
+    }
+
+    return -(int32_t)EBADF;
+}
+
+int32_t sys_linux_open(const char *path, uint32_t flags, uint32_t mode) {
+    (void)mode;
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+    if (!*path) return -(int32_t)EINVAL;
+    if (!g_fs) return -(int32_t)EIO;
+
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
+
+    fat16_dirent_t entry;
+    int rc = fat16_stat(g_fs, 0, name, &entry);
+
+    if (rc == FAT16_ERR_NOT_FOUND) {
+        if (!(flags & O_CREAT)) return -(int32_t)ENOENT;
+        rc = fat16_touch(g_fs, 0, name);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
+        rc = fat16_stat(g_fs, 0, name, &entry);
+        if (rc != FAT16_OK) return -(int32_t)EIO;
+    } else if (rc != FAT16_OK) {
+        return -(int32_t)EIO;
+    }
+
+    if (entry.attr & FAT16_ATTR_DIRECTORY) {
+        /* Allow opening directories for reading (getdents) */
+        int fd = fd_alloc_file(syscall_get_fd_table(), entry.first_cluster,
+                               entry.name, flags, 0);
+        return (int32_t)fd;
+    }
+
+    if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
+        fat16_write_file(g_fs, 0, name, "", 0);
+        entry.size = 0;
+    }
+
+    int fd = fd_alloc_file(syscall_get_fd_table(), 0, entry.name, flags, entry.size);
+    return (int32_t)fd;
+}
+
+int32_t sys_linux_close(int32_t fd) {
+    return (int32_t)fd_close(syscall_get_fd_table(), fd);
+}
+
+int32_t sys_linux_lseek(int32_t fd, int32_t offset, int32_t whence) {
+    file_desc_t *f = fd_get(syscall_get_fd_table(), fd);
+    if (!f) return -(int32_t)EBADF;
+    if (f->type == FD_PIPE_R || f->type == FD_PIPE_W) return -(int32_t)ESPIPE;
+    if (f->type == FD_TTY) return -(int32_t)ESPIPE;
+    return sys_seek(fd, offset, whence);
+}
+
+int32_t sys_linux_unlink(const char *path) {
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+    if (!g_fs) return -(int32_t)EIO;
+
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
+
+    fat16_dirent_t entry;
+    if (fat16_stat(g_fs, 0, name, &entry) != FAT16_OK) return -(int32_t)ENOENT;
+    if (entry.attr & FAT16_ATTR_DIRECTORY) return -(int32_t)EISDIR;
+
+    int rc = fat16_remove(g_fs, 0, name);
+    return (rc == FAT16_OK) ? 0 : -(int32_t)EIO;
+}
+
+int32_t sys_linux_rename(const char *old, const char *newp) {
+    return sys_rename(old, newp);
+}
+
+int32_t sys_linux_mkdir(const char *path, uint32_t mode) {
+    (void)mode;
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+    if (!g_fs) return -(int32_t)EIO;
+
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
+
+    int rc = fat16_mkdir(g_fs, 0, name);
+    if (rc == FAT16_ERR_EXISTS) return -(int32_t)EEXIST;
+    if (rc == FAT16_ERR_NOSPACE) return -(int32_t)ENOSPC;
+    return (rc == FAT16_OK) ? 0 : -(int32_t)EIO;
+}
+
+int32_t sys_linux_rmdir(const char *path) {
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+    if (!g_fs) return -(int32_t)EIO;
+
+    const char *name = strip_slash(path);
+    if (!*name) return -(int32_t)EINVAL;
+
+    fat16_dirent_t entry;
+    if (fat16_stat(g_fs, 0, name, &entry) != FAT16_OK) return -(int32_t)ENOENT;
+    if (!(entry.attr & FAT16_ATTR_DIRECTORY)) return -(int32_t)ENOTDIR;
+
+    int rc = fat16_remove(g_fs, 0, name);
+    if (rc == FAT16_ERR_NOTEMPTY) return -(int32_t)ENOTEMPTY;
+    return (rc == FAT16_OK) ? 0 : -(int32_t)EIO;
+}
+
+int32_t sys_linux_dup(int32_t fd) {
+    return (int32_t)fd_dup(syscall_get_fd_table(), fd);
+}
+
+int32_t sys_linux_dup2(int32_t oldfd, int32_t newfd) {
+    return (int32_t)fd_dup2(syscall_get_fd_table(), oldfd, newfd);
+}
+
+int32_t sys_linux_pipe(int32_t *fds) {
+    if (!user_ptr_ok(fds, 2 * sizeof(int32_t))) return -(int32_t)EFAULT;
+
+    int pipe_idx = pipe_alloc();
+    if (pipe_idx < 0) return -(int32_t)ENFILE;
+
+    fd_table_t *fdt = syscall_get_fd_table();
+
+    /* Read end */
+    int rfd = fd_alloc_pipe(fdt, pipe_idx, 0);
+    if (rfd < 0) {
+        pipe_release(pipe_idx, 0);
+        pipe_release(pipe_idx, 1);
+        return -(int32_t)EMFILE;
+    }
+
+    /* Write end */
+    int wfd = fd_alloc_pipe(fdt, pipe_idx, 1);
+    if (wfd < 0) {
+        fd_close(fdt, rfd);
+        pipe_release(pipe_idx, 0);
+        pipe_release(pipe_idx, 1);
+        return -(int32_t)EMFILE;
+    }
+
+    /* We gave both ends refcount=1 each from pipe_alloc.
+     * fd_alloc_pipe doesn't increment the refcount — that's fine since
+     * pipe_alloc starts at reader_open=1, writer_open=1. */
+    fds[0] = rfd;
+    fds[1] = wfd;
+    return 0;
+}
+
+int32_t sys_linux_brk(uint32_t addr) {
+    if (current_proc < 0) return -ENOMEM;
+
+    process_t *proc = &proc_table[current_proc];
+
+    if (addr == 0) return (int32_t)proc->brk;
+
+    if (addr < 0x400000U) {
+        /* Don't allow shrinking below heap start */
+        return (int32_t)proc->brk;
+    }
+
+    if (addr > PROC_BRK_MAX) {
+        return (int32_t)proc->brk;
+    }
+
+    if (addr > proc->brk) {
+        /* Grow: map new pages */
+        for (uint32_t a = proc->brk & ~0xFFFU; a < addr; a += 0x1000U) {
+            if (paging_page_mapped(proc->page_dir, a)) continue;
+            uint32_t phys = paging_alloc_phys_page();
+            if (!phys) return (int32_t)proc->brk;
+            paging_map_page(proc->page_dir, a, phys, 1);
+        }
+    }
+
+    proc->brk = addr;
+    return (int32_t)proc->brk;
+}
+
+int32_t sys_linux_ioctl(int32_t fd, uint32_t req, uint32_t arg) {
+    /* Handle TTY ioctls */
+    if (fd <= 2 || (fd_get(syscall_get_fd_table(), fd) &&
+                    fd_get(syscall_get_fd_table(), fd)->type == FD_TTY)) {
+        switch (req) {
+        case TCGETS: {
+            if (!user_ptr_ok((void *)arg, sizeof(termios_t))) return -(int32_t)EFAULT;
+            termios_t *t = (termios_t *)arg;
+            *t = g_tty.termios;
+            return 0;
+        }
+        case TCSETS:
+        case TCSETSW:
+        case TCSETSF: {
+            if (!user_ptr_ok((void *)arg, sizeof(termios_t))) return -(int32_t)EFAULT;
+            g_tty.termios = *(termios_t *)arg;
+            return 0;
+        }
+        case TIOCGWINSZ: {
+            if (!user_ptr_ok((void *)arg, sizeof(struct winsize))) return -(int32_t)EFAULT;
+            struct winsize *ws = (struct winsize *)arg;
+            ws->ws_row    = (uint16_t)g_tty.rows;
+            ws->ws_col    = (uint16_t)g_tty.cols;
+            ws->ws_xpixel = 0;
+            ws->ws_ypixel = 0;
+            return 0;
+        }
+        case TIOCSWINSZ:
+            return 0;
+        case TIOCGPGRP: {
+            if (!user_ptr_ok((void *)arg, sizeof(pid_t))) return -(int32_t)EFAULT;
+            *(pid_t *)arg = (current_proc >= 0) ? proc_table[current_proc].pgid : 1;
+            return 0;
+        }
+        case TIOCSPGRP:
+            return 0;
+        case TIOCSCTTY:
+            return 0;
+        default:
+            return -(int32_t)ENOTTY;
+        }
+    }
+    return -(int32_t)ENOTTY;
+}
+
+int32_t sys_linux_fcntl(int32_t fd, int32_t cmd, uint32_t arg) {
+    fd_table_t *fdt = syscall_get_fd_table();
+    file_desc_t *f = fd_get(fdt, fd);
+    if (!f) return -(int32_t)EBADF;
+
+    switch (cmd) {
+    case F_DUPFD:
+        return (int32_t)fd_dup(fdt, fd);
+    case F_GETFD:
+        return f->cloexec ? FD_CLOEXEC : 0;
+    case F_SETFD:
+        f->cloexec = (arg & FD_CLOEXEC) ? 1 : 0;
+        return 0;
+    case F_GETFL:
+        return (int32_t)f->flags;
+    case F_SETFL:
+        f->flags = (f->flags & O_ACCMODE) | (arg & ~O_ACCMODE);
+        return 0;
+    default:
+        return -(int32_t)EINVAL;
+    }
+}
+
+int32_t sys_linux_setpgid(pid_t pid, pgid_t pgid) {
+    if (pid == 0) pid = (current_proc >= 0) ? proc_table[current_proc].pid : 1;
+    if (pgid == 0) pgid = pid;
+
+    int idx = proc_find_by_pid(pid);
+    if (idx < 0) return -(int32_t)ESRCH;
+
+    proc_table[idx].pgid = pgid;
+    return 0;
+}
+
+int32_t sys_linux_setsid(void) {
+    if (current_proc < 0) return -(int32_t)EPERM;
+    pid_t pid = proc_table[current_proc].pid;
+    proc_table[current_proc].sid  = pid;
+    proc_table[current_proc].pgid = pid;
+    return (int32_t)pid;
+}
+
+int32_t sys_linux_getppid(void) {
+    if (current_proc < 0) return 1;
+    return (int32_t)proc_table[current_proc].parent_pid;
+}
+
+int32_t sys_linux_getpgrp(void) {
+    if (current_proc < 0) return 1;
+    return (int32_t)proc_table[current_proc].pgid;
+}
+
+int32_t sys_linux_kill(pid_t pid, int sig) {
+    if (pid > 0) {
+        return (int32_t)proc_send_signal(pid, sig);
+    } else if (pid == 0) {
+        /* Send to process group */
+        if (current_proc >= 0)
+            proc_send_signal_group(proc_table[current_proc].pgid, sig);
+        return 0;
+    } else if (pid == -1) {
+        /* Send to all processes */
+        for (int i = 0; i < MAX_PROCS; i++) {
+            if (proc_table[i].state != PROC_DEAD &&
+                proc_table[i].pid != (current_proc >= 0 ? proc_table[current_proc].pid : -1))
+                proc_send_signal(proc_table[i].pid, sig);
+        }
+        return 0;
+    } else {
+        proc_send_signal_group(-pid, sig);
+        return 0;
+    }
+}
+
+int32_t sys_linux_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    if (sig <= 0 || sig >= NSIG) return -(int32_t)EINVAL;
+    if (sig == SIGKILL || sig == SIGSTOP) return -(int32_t)EINVAL;
+    if (current_proc < 0) return -(int32_t)ESRCH;
+
+    if (oact) {
+        if (!user_ptr_ok(oact, sizeof(struct sigaction))) return -(int32_t)EFAULT;
+        *oact = proc_table[current_proc].sig_actions[sig];
+    }
+
+    if (act) {
+        if (!user_ptr_ok(act, sizeof(struct sigaction))) return -(int32_t)EFAULT;
+        proc_table[current_proc].sig_actions[sig] = *act;
+    }
+
+    return 0;
+}
+
+int32_t sys_linux_sigprocmask(int how, const uint32_t *set, uint32_t *oset) {
+    if (current_proc < 0) return -(int32_t)ESRCH;
+
+    uint32_t old_mask = proc_table[current_proc].sig_mask;
+
+    if (oset) {
+        if (!user_ptr_ok(oset, sizeof(uint32_t))) return -(int32_t)EFAULT;
+        *oset = old_mask;
+    }
+
+    if (set) {
+        if (!user_ptr_ok(set, sizeof(uint32_t))) return -(int32_t)EFAULT;
+        uint32_t new_set = *set;
+        /* SIGKILL and SIGSTOP cannot be blocked */
+        new_set &= ~((1U << SIGKILL) | (1U << SIGSTOP));
+
+        switch (how) {
+        case SIG_BLOCK:
+            proc_table[current_proc].sig_mask |= new_set;
+            break;
+        case SIG_UNBLOCK:
+            proc_table[current_proc].sig_mask &= ~new_set;
+            break;
+        case SIG_SETMASK:
+            proc_table[current_proc].sig_mask = new_set;
+            break;
+        default:
+            return -(int32_t)EINVAL;
+        }
+    }
+
+    return 0;
+}
+
+int32_t sys_linux_sigreturn(registers_t *regs) {
+    if (current_proc < 0) return -(int32_t)ESRCH;
+
+    /* Restore from sig_frame_t on user stack */
+    uint32_t user_sp = regs->useresp;
+    sig_frame_t *frame = (sig_frame_t *)user_sp;
+
+    if (!user_ptr_ok(frame, sizeof(sig_frame_t))) return -(int32_t)EFAULT;
+
+    regs->eax     = frame->saved_eax;
+    regs->ecx     = frame->saved_ecx;
+    regs->edx     = frame->saved_edx;
+    regs->ebx     = frame->saved_ebx;
+    regs->esi     = frame->saved_esi;
+    regs->edi     = frame->saved_edi;
+    regs->ebp     = frame->saved_ebp;
+    regs->eip     = frame->saved_eip;
+    regs->eflags  = frame->saved_eflags | 0x200;  /* keep IF set */
+    regs->useresp = frame->saved_useresp;
+
+    proc_table[current_proc].sig_mask = frame->saved_mask;
+
+    return 0;
+}
+
+int32_t sys_linux_sigsuspend(const uint32_t *mask) {
+    if (current_proc < 0) return -(int32_t)ESRCH;
+    if (mask && user_ptr_ok(mask, sizeof(uint32_t))) {
+        /* Temporarily set mask and wait for a signal */
+        proc_table[current_proc].sig_mask = *mask &
+            ~((1U << SIGKILL) | (1U << SIGSTOP));
+    }
+    /* Always returns -EINTR after signal delivery */
+    return -(int32_t)EINTR;
+}
+
+int32_t sys_linux_sigpending(uint32_t *set) {
+    if (!user_ptr_ok(set, sizeof(uint32_t))) return -(int32_t)EFAULT;
+    if (current_proc < 0) {
+        *set = 0;
+        return 0;
+    }
+    *set = proc_table[current_proc].sig_pending;
+    return 0;
+}
+
+int32_t sys_linux_rt_sigaction(int sig, const struct sigaction *act,
+                                struct sigaction *oact, uint32_t sz) {
+    (void)sz;
+    return sys_linux_sigaction(sig, act, oact);
+}
+
+int32_t sys_linux_rt_sigprocmask(int how, const uint32_t *set,
+                                  uint32_t *oset, uint32_t sz) {
+    (void)sz;
+    return sys_linux_sigprocmask(how, set, oset);
+}
+
+int32_t sys_linux_mmap2(uint32_t addr, uint32_t len, uint32_t prot,
+                         uint32_t flags, int32_t fd, uint32_t pgoff) {
+    (void)addr; (void)prot; (void)flags; (void)fd; (void)pgoff;
+    if (len == 0) return -(int32_t)EINVAL;
+    if (current_proc < 0) return -(int32_t)ENOMEM;
+
+    /* Anonymous mmap: use brk to get memory */
+    process_t *proc = &proc_table[current_proc];
+    uint32_t old_brk = proc->brk;
+    uint32_t new_brk = (old_brk + len + 0xFFFU) & ~0xFFFU;
+
+    if (new_brk > PROC_BRK_MAX) return -(int32_t)ENOMEM;
+
+    for (uint32_t a = old_brk & ~0xFFFU; a < new_brk; a += 0x1000U) {
+        if (paging_page_mapped(proc->page_dir, a)) continue;
+        uint32_t phys = paging_alloc_phys_page();
+        if (!phys) return -(int32_t)ENOMEM;
+        paging_map_page(proc->page_dir, a, phys, 1);
+    }
+
+    proc->brk = new_brk;
+    return (int32_t)old_brk;
+}
+
+int32_t sys_linux_munmap(uint32_t addr, uint32_t len) {
+    (void)addr; (void)len;
+    return 0;  /* no-op */
+}
+
+int32_t sys_linux_chdir(const char *path) {
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+    if (current_proc < 0) return -(int32_t)ESRCH;
+
+    const char *name = strip_slash(path);
+
+    if (*name != '\0' && g_fs) {
+        fat16_dirent_t entry;
+        if (fat16_stat(g_fs, 0, name, &entry) != FAT16_OK) return -(int32_t)ENOENT;
+        if (!(entry.attr & FAT16_ATTR_DIRECTORY)) return -(int32_t)ENOTDIR;
+    }
+
+    /* Update cwd */
+    char *cwd = proc_table[current_proc].cwd;
+    cwd[0] = '/';
+    int i = 1;
+    if (*name != '\0') {
+        const char *p = name;
+        while (*p && i < CWD_MAX - 1) cwd[i++] = *p++;
+    }
+    cwd[i] = '\0';
+    return 0;
+}
+
+int32_t sys_linux_getcwd(char *buf, uint32_t len) {
+    if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+    if (len == 0) return -(int32_t)EINVAL;
+
+    const char *cwd = (current_proc >= 0) ? proc_table[current_proc].cwd : "/";
+    uint32_t i = 0;
+    while (cwd[i] && i < len - 1) { buf[i] = cwd[i]; i++; }
+    buf[i] = '\0';
+    return (int32_t)i;
+}
+
+/* struct utsname */
+typedef struct {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+} utsname_t;
+
+int32_t sys_linux_uname(void *buf) {
+    if (!user_ptr_ok(buf, sizeof(utsname_t))) return -(int32_t)EFAULT;
+    utsname_t *u = (utsname_t *)buf;
+
+    /* Copy strings manually */
+    const char *sysname = "SiMPLE";
+    const char *nodename = "simpleos";
+    const char *release  = "1.0";
+    const char *version  = "1.0.0";
+    const char *machine  = "i686";
+    const char *domain   = "";
+
+    int i = 0;
+    for (i = 0; sysname[i] && i < 64; i++) u->sysname[i] = sysname[i];
+    u->sysname[i] = '\0';
+    for (i = 0; nodename[i] && i < 64; i++) u->nodename[i] = nodename[i];
+    u->nodename[i] = '\0';
+    for (i = 0; release[i] && i < 64; i++) u->release[i] = release[i];
+    u->release[i] = '\0';
+    for (i = 0; version[i] && i < 64; i++) u->version[i] = version[i];
+    u->version[i] = '\0';
+    for (i = 0; machine[i] && i < 64; i++) u->machine[i] = machine[i];
+    u->machine[i] = '\0';
+    for (i = 0; domain[i] && i < 64; i++) u->domainname[i] = domain[i];
+    u->domainname[i] = '\0';
+
+    return 0;
+}
+
+/* struct timespec */
+typedef struct {
+    int32_t tv_sec;
+    int32_t tv_nsec;
+} timespec_t;
+
+int32_t sys_linux_nanosleep(const void *req, void *rem) {
+    if (!user_ptr_ok(req, sizeof(timespec_t))) return -(int32_t)EFAULT;
+    const timespec_t *rq = (const timespec_t *)req;
+
+    /* Convert to PIT ticks (100 Hz) */
+    uint32_t ticks = (uint32_t)rq->tv_sec * 100U;
+    ticks += (uint32_t)(rq->tv_nsec / 10000000L); /* nanosecs to hundredths */
+
+    if (rem) {
+        if (user_ptr_ok(rem, sizeof(timespec_t))) {
+            timespec_t *rm = (timespec_t *)rem;
+            rm->tv_sec  = 0;
+            rm->tv_nsec = 0;
+        }
+    }
+
+    if (ticks == 0) return 0;
+
+    /* Use proc_sleep but we can't call it directly here since we need regs */
+    /* Simple busy-wait for small sleeps */
+    uint32_t wake_at = pit_ticks() + ticks;
+    while (pit_ticks() < wake_at)
+        __asm__ volatile("hlt");
+
+    return 0;
+}
+
+/* struct timeval */
+typedef struct {
+    int32_t tv_sec;
+    int32_t tv_usec;
+} timeval_t;
+
+int32_t sys_linux_gettimeofday(void *tv, void *tz) {
+    (void)tz;
+    if (tv) {
+        if (!user_ptr_ok(tv, sizeof(timeval_t))) return -(int32_t)EFAULT;
+        timeval_t *t = (timeval_t *)tv;
+        uint32_t ticks = pit_ticks();
+        t->tv_sec  = (int32_t)(ticks / 100U);
+        t->tv_usec = (int32_t)((ticks % 100U) * 10000);
+    }
+    return 0;
+}
+
+/* struct timespec for clock_gettime */
+int32_t sys_linux_clock_gettime(int clk, void *tp) {
+    (void)clk;
+    if (!user_ptr_ok(tp, sizeof(timespec_t))) return -(int32_t)EFAULT;
+    timespec_t *t = (timespec_t *)tp;
+    uint32_t ticks = pit_ticks();
+    t->tv_sec  = (int32_t)(ticks / 100U);
+    t->tv_nsec = (int32_t)((ticks % 100U) * 10000000L);
+    return 0;
+}
+
+/* Linux dirent for getdents */
+typedef struct {
+    uint32_t d_ino;
+    uint32_t d_off;
+    uint16_t d_reclen;
+    char     d_name[1]; /* variable */
+} __attribute__((packed)) linux_dirent_t;
+
+int32_t sys_linux_getdents(int32_t fd, void *buf, uint32_t count) {
+    if (!user_ptr_ok(buf, count)) return -(int32_t)EFAULT;
+    if (!g_fs) return -(int32_t)EIO;
+
+    file_desc_t *f = fd_get(syscall_get_fd_table(), fd);
+    if (!f) return -(int32_t)EBADF;
+    if (f->type != FD_FILE) return -(int32_t)ENOTDIR;
+
+    /* List entries */
+    fat16_dirent_t kbuf[32];
+    int kcount = 0;
+    int rc = fat16_list_entries(g_fs, f->file.dir_cluster, kbuf, 32, &kcount);
+    if (rc != FAT16_OK) return -(int32_t)EIO;
+
+    uint32_t pos = 0;
+    uint32_t ino = 1;
+    for (int i = (int)f->file.offset; i < kcount && pos + 12 + 14 < count; i++) {
+        uint32_t name_len = (uint32_t)strlen(kbuf[i].name);
+        uint32_t reclen = (8 + name_len + 2 + 3) & ~3U;
+        if (pos + reclen > count) break;
+
+        linux_dirent_t *de = (linux_dirent_t *)((uint8_t *)buf + pos);
+        de->d_ino    = ino++;
+        de->d_off    = pos + reclen;
+        de->d_reclen = (uint16_t)reclen;
+        uint32_t j = 0;
+        while (j < name_len) { de->d_name[j] = kbuf[i].name[j]; j++; }
+        de->d_name[j] = '\0';
+        /* file type byte at end of name */
+        de->d_name[j + 1] = (kbuf[i].attr & FAT16_ATTR_DIRECTORY) ? 4 : 8;
+
+        pos += reclen;
+        f->file.offset++;
+    }
+
+    return (int32_t)pos;
+}
+
+/* Linux dirent64 */
+typedef struct {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[1];
+} __attribute__((packed)) linux_dirent64_t;
+
+int32_t sys_linux_getdents64(int32_t fd, void *buf, uint32_t count) {
+    if (!user_ptr_ok(buf, count)) return -(int32_t)EFAULT;
+    if (!g_fs) return -(int32_t)EIO;
+
+    file_desc_t *f = fd_get(syscall_get_fd_table(), fd);
+    if (!f) return -(int32_t)EBADF;
+
+    uint16_t dir_cluster = 0;
+    if (f->type == FD_FILE) {
+        dir_cluster = f->file.dir_cluster;
+    }
+
+    fat16_dirent_t kbuf[32];
+    int kcount = 0;
+    int rc = fat16_list_entries(g_fs, dir_cluster, kbuf, 32, &kcount);
+    if (rc != FAT16_OK) return -(int32_t)EIO;
+
+    uint32_t pos = 0;
+    uint64_t ino = 1;
+    for (int i = (int)f->file.offset; i < kcount; i++) {
+        uint32_t name_len = (uint32_t)strlen(kbuf[i].name);
+        uint32_t reclen = (19 + name_len + 3) & ~3U;
+        if (pos + reclen > count) break;
+
+        linux_dirent64_t *de = (linux_dirent64_t *)((uint8_t *)buf + pos);
+        de->d_ino    = ino++;
+        de->d_off    = (int64_t)(pos + reclen);
+        de->d_reclen = (uint16_t)reclen;
+        de->d_type   = (kbuf[i].attr & FAT16_ATTR_DIRECTORY) ? 4 : 8;
+        uint32_t j = 0;
+        while (j < name_len) { de->d_name[j] = kbuf[i].name[j]; j++; }
+        de->d_name[j] = '\0';
+
+        pos += reclen;
+        f->file.offset++;
+    }
+
+    return (int32_t)pos;
+}
+
+int32_t sys_linux_llseek(int32_t fd, uint32_t off_hi, uint32_t off_lo,
+                          uint64_t *result, uint32_t whence) {
+    (void)off_hi;
+    int32_t r = sys_linux_lseek(fd, (int32_t)off_lo, (int32_t)whence);
+    if (r < 0) return r;
+    if (result && user_ptr_ok(result, sizeof(uint64_t)))
+        *result = (uint64_t)(uint32_t)r;
+    return 0;
+}
+
+/* struct pollfd */
+typedef struct {
+    int32_t  fd;
+    int16_t  events;
+    int16_t  revents;
+} pollfd_t;
+
+int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout) {
+    (void)timeout;
+    if (!user_ptr_ok(fds, nfds * sizeof(pollfd_t))) return -(int32_t)EFAULT;
+
+    pollfd_t *pfds = (pollfd_t *)fds;
+    int ready = 0;
+
+    for (uint32_t i = 0; i < nfds; i++) {
+        pfds[i].revents = 0;
+        if (pfds[i].fd < 0) continue;
+
+        file_desc_t *f = fd_get(syscall_get_fd_table(), pfds[i].fd);
+        if (!f) {
+            pfds[i].revents = POLLNVAL;
+            ready++;
+            continue;
+        }
+
+        /* For pipes: check if data available */
+        if (f->type == FD_PIPE_R) {
+            if ((pfds[i].events & POLLIN) && pipe_read_avail(f->pipe.pipe_idx) > 0) {
+                pfds[i].revents |= POLLIN;
+                ready++;
+            }
+            if (g_pipes[f->pipe.pipe_idx].writer_open == 0) {
+                pfds[i].revents |= POLLHUP;
+                ready++;
+            }
+        } else if (f->type == FD_PIPE_W) {
+            if (pfds[i].events & POLLOUT) {
+                pfds[i].revents |= POLLOUT;
+                ready++;
+            }
+        } else if (f->type == FD_TTY || pfds[i].fd <= 2) {
+            if (pfds[i].events & POLLIN) {
+                pfds[i].revents |= POLLIN;
+                ready++;
+            }
+            if (pfds[i].events & POLLOUT) {
+                pfds[i].revents |= POLLOUT;
+                ready++;
+            }
+        } else if (f->type == FD_FILE) {
+            if (pfds[i].events & POLLIN) {
+                pfds[i].revents |= POLLIN;
+                ready++;
+            }
+            if (pfds[i].events & POLLOUT) {
+                pfds[i].revents |= POLLOUT;
+                ready++;
+            }
+        }
+    }
+
+    return ready;
+}
+
+int32_t sys_linux_wait4(pid_t pid, int *status, int options, void *rusage,
+                         registers_t *regs) {
+    (void)rusage;
+    return (int32_t)proc_waitpid(pid, status, options, regs);
+}
+
+int32_t sys_linux_execve(const char *path, char **argv, char **envp,
+                          registers_t *regs) {
+    (void)argv; (void)envp;
+    /* For now, just do the basic exec without argv/envp */
+    return sys_exec(path, regs);
+}
+
+int32_t sys_linux_getuid32(void) {
+    if (current_proc >= 0) return (int32_t)proc_table[current_proc].uid;
+    return 0;
+}
+
+int32_t sys_linux_getgid32(void) {
+    if (current_proc >= 0) return (int32_t)proc_table[current_proc].gid;
+    return 0;
+}
+
+int32_t sys_linux_geteuid32(void) {
+    if (current_proc >= 0) return (int32_t)proc_table[current_proc].euid;
+    return 0;
+}
+
+int32_t sys_linux_getegid32(void) {
+    if (current_proc >= 0) return (int32_t)proc_table[current_proc].egid;
+    return 0;
+}
+
+int32_t sys_linux_prctl(uint32_t opt, uint32_t a1, uint32_t a2,
+                         uint32_t a3, uint32_t a4) {
+    (void)opt; (void)a1; (void)a2; (void)a3; (void)a4;
+    return 0;
+}
+
+int32_t sys_linux_umask(uint32_t mask) {
+    if (current_proc < 0) return 022;
+    uint32_t old = proc_table[current_proc].umask;
+    proc_table[current_proc].umask = mask & 0777U;
+    return (int32_t)old;
+}
+
+int32_t sys_powerctl(int mode) {
+    (void)mode;
+    /* power off / reboot stub */
+    __asm__ volatile("cli; hlt");
+    return 0;
 }

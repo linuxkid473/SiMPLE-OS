@@ -1,3 +1,16 @@
+/*
+ * idt.c — IDT setup and central ISR dispatcher.
+ *
+ * Syscall ABI (Linux i386 compatible):
+ *   eax = syscall number
+ *   ebx = arg0
+ *   ecx = arg1
+ *   edx = arg2
+ *   esi = arg3
+ *   edi = arg4
+ *   ebp = arg5
+ */
+
 #include "idt.h"
 #include "elf.h"
 #include "fd.h"
@@ -6,10 +19,12 @@
 #include "panic.h"
 #include "pic.h"
 #include "pit.h"
+#include "posix_errno.h"
 #include "process.h"
 #include "registers.h"
 #include "serial.h"
 #include "string.h"
+#include "syscall.h"
 #include "vga.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
@@ -132,13 +147,7 @@ void idt_init(void) {
     idt_set_gate(30, (uint32_t)isr30, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(31, (uint32_t)isr31, IDT_TYPE_INTERRUPT_GATE);
 
-    /*
-     * IRQ0 (PIT timer) at vector 0x20.
-     * Interrupt gate (IF=0 on entry): prevents nested timer IRQs while the
-     * scheduler is running.  DPL=0 so ring3 cannot invoke it with `int 0x20`.
-     */
     idt_set_gate(0x20, (uint32_t)isr32, IDT_TYPE_INTERRUPT_GATE);
-
     idt_set_gate(0x22, (uint32_t)isr34, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(0x30, (uint32_t)isr48, IDT_TYPE_INTERRUPT_GATE);
 
@@ -150,15 +159,11 @@ void idt_init(void) {
     idt_ptr.base  = (uint32_t)idt;
     __asm__ volatile("lidt %0" : : "m"(idt_ptr));
 
-    klog("idt", "initialized: 32 exception gates + ring3 syscall gate");
+    klog("idt", "initialized");
 }
-
-/* process_exited and exit_trampoline used in process.c (via proc_exit). */
 
 /* -------------------------------------------------------------------------
    User-process fault handler
-   Patches the iret frame so the ISR epilogue returns to exit_trampoline
-   at ring0 instead of back into broken user code.
    ---------------------------------------------------------------------- */
 static void kill_user_process(registers_t *regs, const char *reason) {
     serial_write(COM1, "[SIMPLE] user process killed: ");
@@ -169,14 +174,6 @@ static void kill_user_process(registers_t *regs, const char *reason) {
     serial_write(COM1, " EIP=");           serial_write_hex(COM1, regs->eip);
     serial_write(COM1, " CS=");            serial_write_hex(COM1, regs->cs);
     serial_write(COM1, "\n");
-    serial_write(COM1, "[SIMPLE] EAX=");   serial_write_hex(COM1, regs->eax);
-    serial_write(COM1, " EBX=");           serial_write_hex(COM1, regs->ebx);
-    serial_write(COM1, " ECX=");           serial_write_hex(COM1, regs->ecx);
-    serial_write(COM1, " EDX=");           serial_write_hex(COM1, regs->edx);
-    serial_write(COM1, "\n");
-    serial_write(COM1, "[SIMPLE] ESP=");   serial_write_hex(COM1, regs->useresp);
-    serial_write(COM1, " EBP=");           serial_write_hex(COM1, regs->ebp);
-    serial_write(COM1, "\n");
 
     if (regs->int_no == 14) {
         uint32_t cr2;
@@ -186,168 +183,397 @@ static void kill_user_process(registers_t *regs, const char *reason) {
         serial_write(COM1, "\n");
         vga_write("User fault: ");
         vga_write(reason);
-        vga_write("  CR2=");
-        vga_write_hex(cr2);
         vga_putc('\n');
     } else {
         vga_write("User fault: ");
         vga_write_line(reason);
     }
 
-    /*
-     * Delegate to proc_exit which either schedules the next runnable process
-     * or patches the iret frame to exit_trampoline (last process exiting).
-     */
-    proc_exit(regs, -1);
+    /* Send SIGSEGV to current process, or kill it directly */
+    if (current_proc >= 0) {
+        proc_exit(regs, W_SIGNALED(SIGSEGV));
+    } else {
+        proc_exit(regs, -1);
+    }
 }
 
 /* -------------------------------------------------------------------------
-   Syscall dispatcher
+   Forward declarations for syscall implementations
+   ---------------------------------------------------------------------- */
+
+/* From syscall.c — legacy implementations */
+int32_t sys_write(const char *buf, uint32_t len);
+int32_t sys_read(char *buf, uint32_t max_len);
+int32_t sys_open(const char *path, uint32_t flags);
+int32_t sys_close(int32_t fd);
+int32_t sys_fread(int32_t fd, char *buf, uint32_t max_len);
+int32_t sys_fwrite(int32_t fd, const char *buf, uint32_t len);
+int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence);
+int32_t sys_exec(const char *path, registers_t *regs);
+int32_t sys_sbrk(int32_t increment);
+int32_t sys_getpid(void);
+int32_t sys_getticks(void);
+int32_t sys_stat(const char *path, void *out);
+int32_t sys_readdir(const char *path, void *buf, uint32_t max_entries);
+int32_t sys_rename(const char *old_path, const char *new_path);
+
+/* New POSIX syscalls */
+int32_t sys_linux_write(int32_t fd, const char *buf, uint32_t len);
+int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs);
+int32_t sys_linux_open(const char *path, uint32_t flags, uint32_t mode);
+int32_t sys_linux_close(int32_t fd);
+int32_t sys_linux_lseek(int32_t fd, int32_t offset, int32_t whence);
+int32_t sys_linux_unlink(const char *path);
+int32_t sys_linux_rename(const char *old, const char *newp);
+int32_t sys_linux_mkdir(const char *path, uint32_t mode);
+int32_t sys_linux_rmdir(const char *path);
+int32_t sys_linux_dup(int32_t fd);
+int32_t sys_linux_dup2(int32_t oldfd, int32_t newfd);
+int32_t sys_linux_pipe(int32_t *fds);
+int32_t sys_linux_brk(uint32_t addr);
+int32_t sys_linux_ioctl(int32_t fd, uint32_t req, uint32_t arg);
+int32_t sys_linux_fcntl(int32_t fd, int32_t cmd, uint32_t arg);
+int32_t sys_linux_setpgid(pid_t pid, pgid_t pgid);
+int32_t sys_linux_setsid(void);
+int32_t sys_linux_getppid(void);
+int32_t sys_linux_getpgrp(void);
+int32_t sys_linux_kill(pid_t pid, int sig);
+int32_t sys_linux_sigaction(int sig, const struct sigaction *act, struct sigaction *oact);
+int32_t sys_linux_sigprocmask(int how, const uint32_t *set, uint32_t *oset);
+int32_t sys_linux_sigreturn(registers_t *regs);
+int32_t sys_linux_sigsuspend(const uint32_t *mask);
+int32_t sys_linux_sigpending(uint32_t *set);
+int32_t sys_linux_rt_sigaction(int sig, const struct sigaction *act, struct sigaction *oact, uint32_t sz);
+int32_t sys_linux_rt_sigprocmask(int how, const uint32_t *set, uint32_t *oset, uint32_t sz);
+int32_t sys_linux_mmap2(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags, int32_t fd, uint32_t pgoff);
+int32_t sys_linux_munmap(uint32_t addr, uint32_t len);
+int32_t sys_linux_chdir(const char *path);
+int32_t sys_linux_getcwd(char *buf, uint32_t len);
+int32_t sys_linux_uname(void *buf);
+int32_t sys_linux_nanosleep(const void *req, void *rem);
+int32_t sys_linux_gettimeofday(void *tv, void *tz);
+int32_t sys_linux_clock_gettime(int clk, void *tp);
+int32_t sys_linux_getdents(int32_t fd, void *buf, uint32_t count);
+int32_t sys_linux_getdents64(int32_t fd, void *buf, uint32_t count);
+int32_t sys_linux_llseek(int32_t fd, uint32_t off_hi, uint32_t off_lo, uint64_t *result, uint32_t whence);
+int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout);
+int32_t sys_linux_wait4(pid_t pid, int *status, int options, void *rusage, registers_t *regs);
+int32_t sys_linux_execve(const char *path, char **argv, char **envp, registers_t *regs);
+int32_t sys_linux_getuid32(void);
+int32_t sys_linux_getgid32(void);
+int32_t sys_linux_geteuid32(void);
+int32_t sys_linux_getegid32(void);
+int32_t sys_linux_prctl(uint32_t opt, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4);
+int32_t sys_linux_umask(uint32_t mask);
+int32_t sys_powerctl(int mode);
+int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
+
+/* -------------------------------------------------------------------------
+   Syscall dispatcher — Linux i386 ABI
    ---------------------------------------------------------------------- */
 static void syscall_handler(registers_t *regs) {
-    switch (regs->eax) {
-    case 1: {
-        int32_t sys_write(const char *buf, uint32_t len);
-        regs->eax = (uint32_t)sys_write((const char *)regs->ecx, regs->edx);
+    uint32_t nr  = regs->eax;
+    uint32_t a0  = regs->ebx;   /* arg0 */
+    uint32_t a1  = regs->ecx;   /* arg1 */
+    uint32_t a2  = regs->edx;   /* arg2 */
+    uint32_t a3  = regs->esi;   /* arg3 */
+    /* uint32_t a4  = regs->edi; */ /* arg4 (unused for now) */
+
+    switch (nr) {
+    /* ---- Linux syscalls ---- */
+    case 1:  /* exit(code) */
+        proc_exit(regs, W_EXITED((int)a0));
+        return;
+
+    case 2:  /* fork */
+        regs->eax = (uint32_t)proc_fork(regs);
+        break;
+
+    case 3:  /* read(fd, buf, len) */
+        regs->eax = (uint32_t)sys_linux_read((int32_t)a0, (char *)a1, a2, regs);
+        break;
+
+    case 4:  /* write(fd, buf, len) */
+        regs->eax = (uint32_t)sys_linux_write((int32_t)a0, (const char *)a1, a2);
+        break;
+
+    case 5:  /* open(path, flags, mode) */
+        regs->eax = (uint32_t)sys_linux_open((const char *)a0, a1, a2);
+        break;
+
+    case 6:  /* close(fd) */
+        regs->eax = (uint32_t)sys_linux_close((int32_t)a0);
+        break;
+
+    case 7:  /* waitpid(pid, stat_addr, options) */
+        regs->eax = (uint32_t)proc_waitpid((pid_t)a0, (int *)a1, (int)a2, regs);
+        break;
+
+    case 10: /* unlink(path) */
+        regs->eax = (uint32_t)sys_linux_unlink((const char *)a0);
+        break;
+
+    case 11: /* execve(path, argv, envp) */
+        regs->eax = (uint32_t)sys_linux_execve((const char *)a0, (char **)a1, (char **)a2, regs);
+        break;
+
+    case 12: /* chdir(path) */
+        regs->eax = (uint32_t)sys_linux_chdir((const char *)a0);
+        break;
+
+    case 19: /* lseek(fd, offset, whence) */
+        regs->eax = (uint32_t)sys_linux_lseek((int32_t)a0, (int32_t)a1, (int32_t)a2);
+        break;
+
+    case 20: /* getpid */
+        regs->eax = (uint32_t)sys_getpid();
+        break;
+
+    case 37: /* kill(pid, sig) */
+        regs->eax = (uint32_t)sys_linux_kill((pid_t)a0, (int)a1);
+        break;
+
+    case 38: /* rename(old, new) */
+        regs->eax = (uint32_t)sys_linux_rename((const char *)a0, (const char *)a1);
+        break;
+
+    case 39: /* mkdir(path, mode) */
+        regs->eax = (uint32_t)sys_linux_mkdir((const char *)a0, a1);
+        break;
+
+    case 40: /* rmdir(path) */
+        regs->eax = (uint32_t)sys_linux_rmdir((const char *)a0);
+        break;
+
+    case 41: /* dup(fd) */
+        regs->eax = (uint32_t)sys_linux_dup((int32_t)a0);
+        break;
+
+    case 42: /* pipe(fds[2]) */
+        regs->eax = (uint32_t)sys_linux_pipe((int32_t *)a0);
+        break;
+
+    case 45: /* brk(addr) */
+        regs->eax = (uint32_t)sys_linux_brk(a0);
+        break;
+
+    case 54: /* ioctl(fd, req, arg) */
+        regs->eax = (uint32_t)sys_linux_ioctl((int32_t)a0, a1, a2);
+        break;
+
+    case 55: /* fcntl(fd, cmd, arg) */
+        regs->eax = (uint32_t)sys_linux_fcntl((int32_t)a0, (int32_t)a1, a2);
+        break;
+
+    case 57: /* setpgid(pid, pgid) */
+        regs->eax = (uint32_t)sys_linux_setpgid((pid_t)a0, (pgid_t)a1);
+        break;
+
+    case 63: /* dup2(oldfd, newfd) */
+        regs->eax = (uint32_t)sys_linux_dup2((int32_t)a0, (int32_t)a1);
+        break;
+
+    case 64: /* getppid */
+        regs->eax = (uint32_t)sys_linux_getppid();
+        break;
+
+    case 65: /* getpgrp */
+        regs->eax = (uint32_t)sys_linux_getpgrp();
+        break;
+
+    case 66: /* setsid */
+        regs->eax = (uint32_t)sys_linux_setsid();
+        break;
+
+    case 67: /* sigaction(sig, act, oact) */
+        regs->eax = (uint32_t)sys_linux_sigaction((int)a0,
+            (const struct sigaction *)a1, (struct sigaction *)a2);
+        break;
+
+    case 72: /* sigsuspend(mask) */
+        regs->eax = (uint32_t)sys_linux_sigsuspend((const uint32_t *)a0);
+        break;
+
+    case 73: /* sigpending(set) */
+        regs->eax = (uint32_t)sys_linux_sigpending((uint32_t *)a0);
+        break;
+
+    case 78: /* gettimeofday(tv, tz) */
+        regs->eax = (uint32_t)sys_linux_gettimeofday((void *)a0, (void *)a1);
+        break;
+
+    case 90: /* mmap(addr,len,prot,flags,fd,off) — old mmap via ebx pointer */
+        regs->eax = (uint32_t)sys_linux_mmap2(0, a1, a2, a3, -1, 0);
+        break;
+
+    case 91: /* munmap(addr, len) */
+        regs->eax = (uint32_t)sys_linux_munmap(a0, a1);
+        break;
+
+    case 114: /* wait4(pid, stat, opts, rusage) */
+        regs->eax = (uint32_t)sys_linux_wait4((pid_t)a0, (int *)a1, (int)a2, (void *)a3, regs);
+        break;
+
+    case 119: /* sigreturn */
+        sys_linux_sigreturn(regs);
+        return;  /* regs already modified */
+
+    case 122: /* uname(buf) */
+        regs->eax = (uint32_t)sys_linux_uname((void *)a0);
+        break;
+
+    case 126: /* sigprocmask(how, set, oset) */
+        regs->eax = (uint32_t)sys_linux_sigprocmask((int)a0,
+            (const uint32_t *)a1, (uint32_t *)a2);
+        break;
+
+    case 140: /* llseek(fd, hi, lo, result, whence) */
+        regs->eax = (uint32_t)sys_linux_llseek((int32_t)a0, a1, a2,
+            (uint64_t *)a3, regs->edi);
+        break;
+
+    case 141: /* getdents(fd, buf, count) */
+        regs->eax = (uint32_t)sys_linux_getdents((int32_t)a0, (void *)a1, a2);
+        break;
+
+    case 162: /* nanosleep(req, rem) */
+        regs->eax = (uint32_t)sys_linux_nanosleep((const void *)a0, (void *)a1);
+        break;
+
+    case 168: /* poll(fds, nfds, timeout) */
+        regs->eax = (uint32_t)sys_linux_poll((void *)a0, a1, (int32_t)a2);
+        break;
+
+    case 172: /* prctl(opt, ...) */
+        regs->eax = (uint32_t)sys_linux_prctl(a0, a1, a2, a3, regs->edi);
+        break;
+
+    case 173: /* rt_sigaction(sig, act, oact, sz) */
+        regs->eax = (uint32_t)sys_linux_rt_sigaction((int)a0,
+            (const struct sigaction *)a1, (struct sigaction *)a2, a3);
+        break;
+
+    case 174: /* rt_sigprocmask(how, set, oset, sz) */
+        regs->eax = (uint32_t)sys_linux_rt_sigprocmask((int)a0,
+            (const uint32_t *)a1, (uint32_t *)a2, a3);
+        break;
+
+    case 175: /* rt_sigpending(set, sz) */
+        regs->eax = (uint32_t)sys_linux_sigpending((uint32_t *)a0);
+        break;
+
+    case 177: /* rt_sigsuspend(mask, sz) */
+        regs->eax = (uint32_t)sys_linux_sigsuspend((const uint32_t *)a0);
+        break;
+
+    case 183: /* getcwd(buf, len) */
+        regs->eax = (uint32_t)sys_linux_getcwd((char *)a0, a1);
+        break;
+
+    case 186: /* gettid — same as getpid */
+        regs->eax = (uint32_t)sys_getpid();
+        break;
+
+    case 192: /* mmap2(addr,len,prot,flags,fd,pgoff) */
+        regs->eax = (uint32_t)sys_linux_mmap2(a0, a1, a2, a3,
+            (int32_t)regs->edi, regs->ebp);
+        break;
+
+    case 199: /* getuid32 */
+        regs->eax = (uint32_t)sys_linux_getuid32();
+        break;
+
+    case 200: /* getgid32 */
+        regs->eax = (uint32_t)sys_linux_getgid32();
+        break;
+
+    case 201: /* geteuid32 */
+        regs->eax = (uint32_t)sys_linux_geteuid32();
+        break;
+
+    case 202: /* getegid32 */
+        regs->eax = (uint32_t)sys_linux_getegid32();
+        break;
+
+    case 220: /* getdents64(fd, buf, count) */
+        regs->eax = (uint32_t)sys_linux_getdents64((int32_t)a0, (void *)a1, a2);
+        break;
+
+    case 252: /* exit_group(code) */
+        proc_exit(regs, W_EXITED((int)a0));
+        return;
+
+    case 265: /* clock_gettime(clk, tp) */
+        regs->eax = (uint32_t)sys_linux_clock_gettime((int)a0, (void *)a1);
+        break;
+
+    /* ---- SiMPLE-specific high-range syscalls ---- */
+    case 400: /* getticks */
+        regs->eax = (uint32_t)sys_getticks();
+        break;
+
+    case 401: case 402: case 403: case 404: case 405: case 406: case 407: {
+        /* WM syscalls: mapped from 20-26 to 401-407 */
+        uint32_t wm_nr = nr - 401 + 20;
+        regs->eax = (uint32_t)wm_syscall(wm_nr, a0, a1, a2);
         break;
     }
-    case 2:
-        /* SYS_EXIT: ecx = exit code */
-        proc_exit(regs, (int)regs->ecx);
+
+    case 408: /* powerctl */
+        regs->eax = (uint32_t)sys_powerctl((int)a0);
         break;
-    case 3: {
-        int32_t sys_read(char *buf, uint32_t max_len);
-        regs->eax = (uint32_t)sys_read((char *)regs->ecx, regs->edx);
+
+    case 409: /* stat_simple(path, out) */
+        regs->eax = (uint32_t)sys_stat((const char *)a0, (void *)a1);
         break;
-    }
-    case 4:
-        /* SYS_YIELD: cooperative yield to next runnable process */
+
+    case 410: /* readdir_simple(path, buf, max) */
+        regs->eax = (uint32_t)sys_readdir((const char *)a0, (void *)a1, a2);
+        break;
+
+    /* ---- Legacy SiMPLE syscalls (kept for backward compat) ---- */
+    /* Old syscall 1: write to stdout */
+    /* Old syscall 2: exit — handled above as Linux exit */
+    /* Old syscall 3: read from stdin */
+    /* Old syscall 4: yield */
+    case 500 + 4: /* yield via high alias */
         proc_yield(regs);
         regs->eax = 0;
         break;
-    case 5: {
-        int32_t sys_open(const char *path, uint32_t flags);
-        regs->eax = (uint32_t)sys_open((const char *)regs->ecx, regs->edx);
+
+    /* SYS_SBRK old-style (increment, not address) */
+    case 500 + 15:
+        regs->eax = (uint32_t)sys_sbrk((int32_t)a0);
         break;
-    }
-    case 6: {
-        int32_t sys_close(int32_t fd);
-        regs->eax = (uint32_t)sys_close((int32_t)regs->ecx);
+
+    /* Old exec (path only) */
+    case 500 + 10:
+        regs->eax = (uint32_t)sys_exec((const char *)a0, regs);
         break;
-    }
-    case 7: {
-        int32_t sys_fread(int32_t fd, char *buf, uint32_t max_len);
-        regs->eax = (uint32_t)sys_fread((int32_t)regs->ecx,
-                                         (char *)regs->edx,
-                                         regs->ebx);
+
+    /* Old fread/fwrite via aliases */
+    case 500 + 7:
+        regs->eax = (uint32_t)sys_fread((int32_t)a0, (char *)a1, a2);
         break;
-    }
-    case 8: {
-        int32_t sys_fwrite(int32_t fd, const char *buf, uint32_t len);
-        regs->eax = (uint32_t)sys_fwrite((int32_t)regs->ecx,
-                                          (const char *)regs->edx,
-                                          regs->ebx);
+    case 500 + 8:
+        regs->eax = (uint32_t)sys_fwrite((int32_t)a0, (const char *)a1, a2);
         break;
-    }
-    case 9: {
-        int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence);
-        regs->eax = (uint32_t)sys_seek((int32_t)regs->ecx,
-                                        (int32_t)regs->edx,
-                                        (int32_t)regs->ebx);
+    case 500 + 9:
+        regs->eax = (uint32_t)sys_seek((int32_t)a0, (int32_t)a1, (int32_t)a2);
         break;
-    }
-    case 10: {
-        /*
-         * SYS_EXEC — ecx = path (user pointer).
-         * On success: iret frame is patched; does not return to caller.
-         * On failure: regs->eax gets -errno; iret returns normally.
-         */
-        int32_t sys_exec(const char *path, registers_t *regs);
-        regs->eax = (uint32_t)sys_exec((const char *)regs->ecx, regs);
+
+    case 82: /* select — stub */
+        regs->eax = (uint32_t)(-ENOSYS);
         break;
-    }
-    case 11:
-        /*
-         * SYS_FORK — duplicate current process.
-         * Parent: regs->eax = child pid (>0).
-         * Child:  saved_regs.eax = 0 (set inside proc_fork).
-         */
-        regs->eax = (uint32_t)proc_fork(regs);
-        break;
-    case 12:
-        /*
-         * SYS_WAIT — block until any child exits, then reap it.
-         * Returns child's exit code, or -1 if no children exist.
-         * When blocking: do_switch runs child; proc_exit() patches
-         * saved_regs.eax with the exit code before switching back,
-         * so the ISR epilogue delivers the correct value to ring3.
-         */
-        regs->eax = (uint32_t)proc_wait(regs);
-        break;
-    case 15: {
-        /* SYS_SBRK — ecx = increment in bytes (>0 to grow heap).
-         * Returns old break (start of newly usable memory), or -1 on error. */
-        int32_t sys_sbrk(int32_t increment);
-        regs->eax = (uint32_t)sys_sbrk((int32_t)regs->ecx);
-        break;
-    }
-    case 13: {
-        /* SYS_GETPID — no arguments. Returns current process PID. */
-        int32_t sys_getpid(void);
-        regs->eax = (uint32_t)sys_getpid();
-        break;
-    }
-    case 14:
-        /* SYS_SLEEP — ecx = ticks (PIT ticks at 100 Hz).
-         * proc_sleep owns eax=0: alone/ticks=0 paths set it before returning;
-         * context-switch path sets saved_regs.eax=0 before do_switch overwrites
-         * *regs with the next process's state — we must NOT touch eax after. */
-        proc_sleep(regs, regs->ecx);
-        break;
-    case 16: {
-        /* SYS_STAT — ecx = path (user ptr), edx = sys_stat_t* (user ptr).
-         * Fills stat struct; returns 0 on success, -1 if not found. */
-        int32_t sys_stat(const char *path, void *out);
-        regs->eax = (uint32_t)sys_stat((const char *)regs->ecx,
-                                        (void *)regs->edx);
-        break;
-    }
-    case 17: {
-        /* SYS_READDIR — ecx = path, edx = sys_dirent_t[] buf, ebx = max.
-         * Returns number of entries written, or -1 on error. */
-        int32_t sys_readdir(const char *path, void *buf, uint32_t max);
-        regs->eax = (uint32_t)sys_readdir((const char *)regs->ecx,
-                                           (void *)regs->edx,
-                                           regs->ebx);
-        break;
-    }
-    case 18: {
-        /* SYS_RENAME — ecx = old_path, edx = new_path.
-         * Returns 0 on success, -1 on error. */
-        int32_t sys_rename(const char *old_path, const char *new_path);
-        regs->eax = (uint32_t)sys_rename((const char *)regs->ecx,
-                                          (const char *)regs->edx);
-        break;
-    }
-    case 19: {
-        /* SYS_GETTICKS — no arguments. Returns global PIT tick counter. */
-        int32_t sys_getticks(void);
-        regs->eax = (uint32_t)sys_getticks();
-        break;
-    }
-    case 20: case 21: case 22: case 23: case 24: case 25: case 26: {
-        /* SYS_WM_CREATE..SYS_WM_SETFOCUS
-         * ABI: eax=nr  ecx=a  edx=b  ebx=c */
-        int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
-        regs->eax = (uint32_t)wm_syscall(regs->eax, regs->ecx,
-                                          regs->edx, regs->ebx);
-        break;
-    }
+
     default:
-        klog_dec("syscall", "unknown syscall", regs->eax);
-        regs->eax = (uint32_t)(-(int32_t)EINVAL);
+        klog_dec("syscall", "unknown", nr);
+        regs->eax = (uint32_t)(-(int32_t)ENOSYS);
         break;
     }
+
+    /* Deliver any pending signals when returning to user space */
+    proc_deliver_signals(regs);
 }
 
 /* -------------------------------------------------------------------------
@@ -360,8 +586,9 @@ void isr_handler(registers_t *regs) {
     }
 
     if (regs->int_no == 0x20) {
-        /* IRQ0: PIT timer tick — may preempt current ring3 process */
         pit_timer_tick(regs);
+        /* Deliver signals after timer tick if returning to user */
+        proc_deliver_signals(regs);
         return;
     }
 
@@ -377,10 +604,7 @@ void isr_handler(registers_t *regs) {
         return;
     }
 
-    vga_write("[INT] vector 0x");
-    vga_write_hex(regs->int_no);
-    vga_write_line(" handled, returning");
-    serial_write(COM1, "[SIMPLE] isr: SW INT #");
+    serial_write(COM1, "[SIMPLE] isr: vector 0x");
     serial_write_dec(COM1, regs->int_no);
     serial_write(COM1, "\n");
 }

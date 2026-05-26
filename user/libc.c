@@ -1,331 +1,586 @@
-// user/libc.c
-#include "wm.h"
+/*
+ * user/libc.c — user-space C library for SiMPLE OS.
+ *
+ * Uses Linux i386 syscall ABI: int $0x80
+ *   eax = syscall number
+ *   ebx = arg0
+ *   ecx = arg1
+ *   edx = arg2
+ *   esi = arg3
+ *   edi = arg4
+ *   ebp = arg5
+ */
 
-int write(const char* buf, int len) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(1), "c"(buf), "d"(len)
-    );
+/* ---- errno ---- */
+static int _errno_storage = 0;
+
+int *__errno_location(void) { return &_errno_storage; }
+#define errno (*__errno_location())
+
+/* ---- syscall wrappers ---- */
+static inline long syscall0(long nr) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr) : "memory");
     return ret;
+}
+
+static inline long syscall1(long nr, long a) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(a) : "memory");
+    return ret;
+}
+
+static inline long syscall2(long nr, long a, long b) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(a), "c"(b) : "memory");
+    return ret;
+}
+
+static inline long syscall3(long nr, long a, long b, long c) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(a), "c"(b), "d"(c) : "memory");
+    return ret;
+}
+
+static inline long syscall4(long nr, long a, long b, long c, long d) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d) : "memory");
+    return ret;
+}
+
+static inline long syscall5(long nr, long a, long b, long c, long d, long e) {
+    long ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e) : "memory");
+    return ret;
+}
+
+/* ---- string functions ---- */
+typedef unsigned int size_t;
+
+size_t strlen(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+char *strcpy(char *dst, const char *src) {
+    char *d = dst;
+    while ((*d++ = *src++));
+    return dst;
+}
+
+char *strncpy(char *dst, const char *src, size_t n) {
+    size_t i;
+    for (i = 0; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = '\0';
+    return dst;
+}
+
+int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+int strncmp(const char *a, const char *b, size_t n) {
+    while (n-- && *a && *a == *b) { a++; b++; }
+    if (n == (size_t)-1) return 0;
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+char *strchr(const char *s, int c) {
+    while (*s) {
+        if (*s == (char)c) return (char *)s;
+        s++;
+    }
+    return (char *)0;
+}
+
+char *strcat(char *dst, const char *src) {
+    char *d = dst + strlen(dst);
+    while (*src) *d++ = *src++;
+    *d = '\0';
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, size_t n) {
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+void *memset(void *dst, int c, size_t n) {
+    char *d = (char *)dst;
+    while (n--) *d++ = (char)c;
+    return dst;
+}
+
+int memcmp(const void *a, const void *b, size_t n) {
+    const unsigned char *p = (const unsigned char *)a;
+    const unsigned char *q = (const unsigned char *)b;
+    while (n--) {
+        if (*p != *q) return (int)*p - (int)*q;
+        p++; q++;
+    }
+    return 0;
+}
+
+/* ---- Process ---- */
+
+void _exit(int code) {
+    syscall1(1, code);
+    for (;;) __asm__ volatile("hlt");
 }
 
 void exit(int code) {
-    __asm__ volatile(
-        "int $0x80"
-        :
-        : "a"(2), "c"(code)
-    );
-
-    for (;;);
+    _exit(code);
 }
 
-int open(const char* path, int flags) {
-    int ret;
+int fork(void) {
+    long ret = syscall0(2);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
 
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(5), "c"(path), "d"(flags)
-        : "memory"
-    );
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    long ret = syscall3(11, (long)path, (long)argv, (long)envp);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
 
-    return ret;
+/* exec — old-style (path only) via execve */
+int exec(const char *path) {
+    return execve(path, (char *const *)0, (char *const *)0);
+}
+
+int waitpid(int pid, int *status, int options) {
+    long ret = syscall3(7, pid, (long)status, options);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int wait(int *status) {
+    return waitpid(-1, status, 0);
+}
+
+int getpid(void) {
+    return (int)syscall0(20);
+}
+
+int getppid(void) {
+    return (int)syscall0(64);
+}
+
+int setsid(void) {
+    long ret = syscall0(66);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int setpgid(int pid, int pgid) {
+    long ret = syscall2(57, pid, pgid);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int getpgrp(void) {
+    return (int)syscall0(65);
+}
+
+int kill(int pid, int sig) {
+    long ret = syscall2(37, pid, sig);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* ---- File I/O ---- */
+
+int open(const char *path, int flags, ...) {
+    long ret = syscall3(5, (long)path, flags, 0644);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
 int close(int fd) {
-    int ret;
-
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(6), "c"(fd)
-        : "memory"
-    );
-
-    return ret;
+    long ret = syscall1(6, fd);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-int fd_read(int fd, void* buf, int len) {
-    int ret;
-
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(7), "c"(fd), "d"(buf), "b"(len)
-        : "memory"
-    );
-
-    return ret;
+int read(int fd, void *buf, int len) {
+    long ret = syscall3(3, fd, (long)buf, len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-int fd_write(int fd, const void* buf, int len) {
-    int ret;
-
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(8), "c"(fd), "d"(buf), "b"(len)
-        : "memory"
-    );
-
-    return ret;
+int write(int fd, const void *buf, int len) {
+    long ret = syscall3(4, fd, (long)buf, len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
+int lseek(int fd, int offset, int whence) {
+    long ret = syscall3(19, fd, offset, whence);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* Legacy seek alias */
 int seek(int fd, int offset, int whence) {
-    int ret;
-
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(9), "c"(fd), "d"(offset), "b"(whence)
-        : "memory"
-    );
-
-    return ret;
+    return lseek(fd, offset, whence);
 }
 
-/* exec — replace the current process image with the ELF at path.
- * Does not return on success.  Returns -errno on failure. */
-int exec(const char *path) {
-    int ret;
-
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(10), "c"(path)
-        : "memory"
-    );
-
-    return ret;
+int dup(int fd) {
+    long ret = syscall1(41, fd);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-/*
- * fork — duplicate the current process.
- *   Parent receives the child's pid (>0).
- *   Child  receives 0.
- *   Returns -1 on failure.
- *
- * The child starts executing at the instruction immediately after the
- * int $0x80 (i.e. here, returning from the inline asm), with an
- * independent copy of all user memory and the register state.
- */
-int fork(void) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(11)
-        : "memory"
-    );
-    return ret;
+int dup2(int oldfd, int newfd) {
+    long ret = syscall2(63, oldfd, newfd);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-/* wait — block until any child exits; returns child's exit code, or -1. */
-int wait(void) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(12)
-        : "memory"
-    );
-    return ret;
+int pipe(int fds[2]) {
+    long ret = syscall1(42, (long)fds);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int fcntl(int fd, int cmd, ...) {
+    /* Get the third arg via inline asm trick — use 0 if not provided */
+    long ret = syscall3(55, fd, cmd, 0);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int ioctl(int fd, unsigned long req, ...) {
+    /* Get arg from inline asm — use 0 if not provided */
+    unsigned long arg = 0;
+    /* We can't easily get varargs here, caller should pass arg directly */
+    long ret = syscall3(54, fd, (long)req, (long)arg);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* Legacy fd_read / fd_write using fread/fwrite syscalls via Linux read/write */
+int fd_read(int fd, void *buf, int len) {
+    return read(fd, buf, len);
+}
+
+int fd_write(int fd, const void *buf, int len) {
+    return write(fd, buf, len);
+}
+
+/* ---- Directories ---- */
+
+int mkdir(const char *path, int mode) {
+    long ret = syscall2(39, (long)path, mode);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int rmdir(const char *path) {
+    long ret = syscall1(40, (long)path);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int unlink(const char *path) {
+    long ret = syscall1(10, (long)path);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int rename(const char *old, const char *newp) {
+    long ret = syscall2(38, (long)old, (long)newp);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int chdir(const char *path) {
+    long ret = syscall1(12, (long)path);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+char *getcwd(char *buf, int len) {
+    long ret = syscall2(183, (long)buf, len);
+    if (ret < 0) { errno = (int)-ret; return (char *)0; }
+    return buf;
+}
+
+/* ---- Memory ---- */
+
+static int _current_brk = 0;
+
+void *sbrk(int inc) {
+    if (_current_brk == 0) {
+        _current_brk = (int)syscall1(45, 0);
+    }
+    if (inc == 0) return (void *)_current_brk;
+
+    int new_brk = (int)syscall1(45, _current_brk + inc);
+    if (new_brk < 0) { errno = 12; return (void *)-1; }
+    int old_brk = _current_brk;
+    _current_brk = new_brk;
+    return (void *)old_brk;
+}
+
+void *mmap(void *addr, int len, int prot, int flags, int fd, int off) {
+    long ret = syscall5(192, (long)addr, len, prot, flags, fd);
+    (void)off;
+    if (ret < 0) { errno = (int)-ret; return (void *)-1; }
+    return (void *)ret;
+}
+
+int munmap(void *addr, int len) {
+    long ret = syscall2(91, (long)addr, len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* ---- Signals ---- */
+
+typedef unsigned int sigset_t;
+
+struct sigaction_user {
+    void     (*sa_handler)(int);
+    unsigned   sa_flags;
+    void     (*sa_restorer)(void);
+    sigset_t   sa_mask;
+};
+
+int sigaction(int sig, const struct sigaction_user *act, struct sigaction_user *oact) {
+    long ret = syscall4(173, sig, (long)act, (long)oact, sizeof(sigset_t));
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oset) {
+    long ret = syscall4(174, how, (long)set, (long)oset, sizeof(sigset_t));
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+void (*signal(int sig, void (*handler)(int)))(int) {
+    struct sigaction_user act, oact;
+    act.sa_handler = handler;
+    act.sa_flags   = 0;
+    act.sa_restorer = (void *)0;
+    act.sa_mask    = 0;
+    if (sigaction(sig, &act, &oact) < 0) return (void (*)(int))-1;
+    return oact.sa_handler;
+}
+
+/* ---- TTY ---- */
+
+typedef struct {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_cc[19];
+    unsigned int  _ispeed;
+    unsigned int  _ospeed;
+} termios_t;
+
+int isatty(int fd) {
+    termios_t t;
+    return (ioctl(fd, 0x5401, (unsigned long)&t) == 0) ? 1 : 0;
+}
+
+int tcgetattr(int fd, termios_t *t) {
+    long ret = syscall3(54, fd, 0x5401, (long)t);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int tcsetattr(int fd, int action, const termios_t *t) {
+    unsigned long req;
+    if (action == 0) req = 0x5402;
+    else if (action == 1) req = 0x5403;
+    else req = 0x5404;
+    long ret = syscall3(54, fd, (long)req, (long)t);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int tcgetpgrp(int fd) {
+    int pgid = 0;
+    long ret = syscall3(54, fd, 0x540F, (long)&pgid);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return pgid;
+}
+
+int tcsetpgrp(int fd, int pgid) {
+    long ret = syscall3(54, fd, 0x5410, (long)&pgid);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* ---- Time ---- */
+
+struct timespec {
+    int tv_sec;
+    int tv_nsec;
+};
+
+int nanosleep(const struct timespec *req, struct timespec *rem) {
+    long ret = syscall2(162, (long)req, (long)rem);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+unsigned sleep(unsigned sec) {
+    struct timespec req;
+    req.tv_sec  = (int)sec;
+    req.tv_nsec = 0;
+    nanosleep(&req, (struct timespec *)0);
+    return 0;
+}
+
+/* Legacy sleep in ticks */
+int sleep_ticks(unsigned int ticks) {
+    /* Use nanosleep with ticks*10ms */
+    struct timespec req;
+    req.tv_sec  = (int)(ticks / 100);
+    req.tv_nsec = (int)((ticks % 100) * 10000000);
+    return nanosleep(&req, (struct timespec *)0);
 }
 
 /* yield — cooperatively hand CPU to the next runnable process. */
 int yield(void) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(4)
-        : "memory"
-    );
-    return ret;
+    /* Use the high-alias yield */
+    long ret = syscall0(500 + 4);
+    return (int)ret;
 }
 
-/* sbrk — grow heap by increment bytes.
- * Returns old break (pointer to start of new region), or -1 on failure. */
-int sbrk(int increment) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(15), "c"(increment)
-        : "memory"
-    );
-    return ret;
-}
+/* ---- SiMPLE-specific syscalls ---- */
 
-/* -----------------------------------------------------------------------
- * Window Manager syscall wrappers (syscalls 20-26)
- *
- * SYS_WM_CREATE packs w and h into ebx as (w<<16 | h) so all four
- * geometry parameters fit in the standard 3-register ABI.
- * ----------------------------------------------------------------------- */
-
-/* Create a window at (x,y) with dimensions w×h.
- * Returns wid (>= 0) or negative errno on failure. */
-int wm_create(int x, int y, int w, int h) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(20), "c"(x), "d"(y), "b"((w << 16) | (h & 0xffff))
-        : "memory"
-    );
-    return ret;
-}
-
-/* Destroy a window.  Returns 0 or -EBADF. */
-int wm_destroy(int wid) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(21), "c"(wid)
-        : "memory"
-    );
-    return ret;
-}
-
-/* Blit a 32bpp pixel buffer (w*h*4 bytes) into the window.
- * len must be >= w*h*4.  Returns 0 or negative errno. */
-int wm_blit(int wid, unsigned int *buf, int len) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(22), "c"(wid), "d"(buf), "b"(len)
-        : "memory"
-    );
-    return ret;
-}
-
-/* Move a window to (x,y); re-blits the last pixel buffer.
- * Returns 0 or -EBADF. */
-int wm_move(int wid, int x, int y) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(23), "c"(wid), "d"(x), "b"(y)
-        : "memory"
-    );
-    return ret;
-}
-
-/* Dequeue one event into *ev.  Non-blocking.
- * Returns event type (> 0) or 0 if queue empty. */
-int wm_event(wm_event_t *ev, int max) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(24), "c"(ev), "d"(max)
-        : "memory"
-    );
-    return ret;
-}
-
-/* Flush wid to framebuffer (-1 = all windows).  Returns 0. */
-int wm_flush(int wid) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(25), "c"(wid)
-        : "memory"
-    );
-    return ret;
-}
-
-/* Set the focused user window (keyboard events route to it).
- * Returns 0 or -EBADF. */
-int wm_setfocus(int wid) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(26), "c"(wid)
-        : "memory"
-    );
-    return ret;
-}
-
-/* getpid — return the calling process's PID. */
-int getpid(void) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(13)
-    );
-    return ret;
-}
-
-/* sleep — sleep for `ticks` PIT ticks (100 Hz → 100 ticks ≈ 1 second).
- * Returns 0 when the sleep completes. */
-int sleep(unsigned int ticks) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(14), "c"(ticks)
-        : "memory"
-    );
-    return ret;
-}
-
-/* getticks — return the global PIT tick counter. */
 unsigned int getticks(void) {
-    unsigned int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(19)
-    );
-    return ret;
+    return (unsigned int)syscall0(400);
 }
 
-/* stat — fill *out with metadata for path; returns 0 or -1 if not found.
- * Caller must provide a pointer to a stat_t struct (see user/syscall.h). */
 int stat(const char *path, void *out) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(16), "c"(path), "d"(out)
-        : "memory"
-    );
-    return ret;
+    long ret = syscall2(409, (long)path, (long)out);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-/* readdir — enumerate directory path into buf[]; max_entries is array size.
- * Each entry is a dirent_t (see user/syscall.h).
- * Returns entry count (>= 0) or -1 on error. */
 int readdir(const char *path, void *buf, int max_entries) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(17), "c"(path), "d"(buf), "b"(max_entries)
-        : "memory"
-    );
-    return ret;
+    long ret = syscall3(410, (long)path, (long)buf, max_entries);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
 }
 
-/* rename — rename old_path to new_path (root-relative paths).
- * Returns 0 on success, -1 on error. */
-int rename(const char *old_path, const char *new_path) {
-    int ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(18), "c"(old_path), "d"(new_path)
-        : "memory"
-    );
-    return ret;
+/* fstat — stub returning 0 */
+int fstat(int fd, void *buf) {
+    (void)fd; (void)buf;
+    return 0;
+}
+
+/* access — check file existence via stat */
+int access(const char *path, int mode) {
+    (void)mode;
+    /* Use a stack-based stat struct */
+    struct { unsigned size; unsigned char is_dir; unsigned char exists; } st;
+    stat(path, &st);
+    if (!st.exists) { errno = 2; return -1; }
+    return 0;
+}
+
+/* getdents / getdents64 */
+int getdents(int fd, void *buf, int count) {
+    long ret = syscall3(141, fd, (long)buf, count);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int getdents64(int fd, void *buf, int count) {
+    long ret = syscall3(220, fd, (long)buf, count);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+int poll(struct pollfd *fds, int nfds, int timeout) {
+    long ret = syscall3(168, (long)fds, nfds, timeout);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* uname */
+int uname(void *buf) {
+    long ret = syscall1(122, (long)buf);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+/* select — stub */
+int select(int n, void *rfds, void *wfds, void *efds, void *timeout) {
+    (void)n; (void)rfds; (void)wfds; (void)efds; (void)timeout;
+    errno = 38; /* ENOSYS */
+    return -1;
+}
+
+/* ---- Window Manager syscalls (401-407 range) ---- */
+
+int wm_create(int x, int y, int w, int h) {
+    long ret = syscall3(401, x, y, (w << 16) | (h & 0xffff));
+    return (int)ret;
+}
+
+int wm_destroy(int wid) {
+    long ret = syscall1(402, wid);
+    return (int)ret;
+}
+
+int wm_blit(int wid, unsigned int *buf, int len) {
+    long ret = syscall3(403, wid, (long)buf, len);
+    return (int)ret;
+}
+
+int wm_move(int wid, int x, int y) {
+    long ret = syscall3(404, wid, x, y);
+    return (int)ret;
+}
+
+int wm_event(void *ev, int max) {
+    long ret = syscall2(405, (long)ev, max);
+    return (int)ret;
+}
+
+int wm_flush(int wid) {
+    long ret = syscall1(406, wid);
+    return (int)ret;
+}
+
+int wm_setfocus(int wid) {
+    long ret = syscall1(407, wid);
+    return (int)ret;
+}
+
+void sys_powerctl(int mode) {
+    syscall1(408, mode);
+}
+
+/* Legacy sbrk that returns int (old ABI) */
+int sbrk_inc(int increment) {
+    return (int)(long)sbrk(increment);
+}
+
+/* stat_simple / readdir_simple — direct aliases */
+int stat_simple(const char *path, void *out) {
+    return stat(path, out);
+}
+
+int readdir_simple(const char *path, void *buf, int max) {
+    return readdir(path, buf, max);
 }

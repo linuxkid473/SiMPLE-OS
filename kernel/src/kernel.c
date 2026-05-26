@@ -8,10 +8,12 @@
 #include "paging.h"
 #include "panic.h"
 #include "pic.h"
+#include "pipe.h"
 #include "pit.h"
 #include "process.h"
 #include "serial.h"
 #include "shell.h"
+#include "tty.h"
 #include "vga.h"
 #include "wm.h"
 #define _STIVALE2_SPLIT_64
@@ -142,6 +144,12 @@ void kernel_main(struct stivale2_struct *s2) {
 
     proc_init();
     klog_boot("process table initialized");
+
+    pipe_init();
+    klog_boot("pipe subsystem initialized");
+
+    tty_init();
+    klog_boot("tty initialized");
 
     keyboard_init();
     klog("keyboard", "initialized");

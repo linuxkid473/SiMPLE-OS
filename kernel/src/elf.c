@@ -4,6 +4,7 @@
 #include "paging.h"
 #include "process.h"
 #include "serial.h"
+#include "signal.h"
 #include "vga.h"
 #include "types.h"
 
@@ -183,30 +184,40 @@ int exec_elf(void *data) {
     uint32_t entry = ehdr->e_entry + base;
 
     /*
-     * Plant a tiny exit stub in the user stack area so that if _start
-     * returns without calling SYS_EXIT, the CPU executes:
-     *   mov $2, %eax  ; SYS_EXIT
-     *   xor %ecx, %ecx
-     *   int $0x80
-     * The stub is placed 32 bytes below the stack top.
+     * Plant stubs in the user stack area:
+     *   SIG_TRAMPOLINE_ADDR (0x3FFF80): sigreturn trampoline
+     *   EXIT_STUB_ADDR      (0x3FFFA0): exit stub (Linux SYS_EXIT=1)
+     *
+     * If _start returns without calling exit(), the exit stub runs.
      */
-    static const uint8_t exit_stub[] = {
-        0xB8, 0x02, 0x00, 0x00, 0x00,  /* mov $2, %eax  */
-        0x31, 0xC9,                      /* xor %ecx,%ecx */
-        0xCD, 0x80,                      /* int $0x80     */
-        0xF4                             /* hlt (safety)  */
+    /* Sigreturn trampoline: mov $119, %eax; int $0x80; hlt */
+    static const uint8_t sigret_stub[] = {
+        0xB8, 0x77, 0x00, 0x00, 0x00,  /* mov $119, %eax */
+        0xCD, 0x80,                      /* int $0x80      */
+        0xF4                             /* hlt            */
     };
-    uint32_t stub_addr = USER_STACK - 32;
-    uint8_t *stub_ptr  = (uint8_t *)stub_addr;
-    for (uint32_t i = 0; i < sizeof(exit_stub); i++) stub_ptr[i] = exit_stub[i];
+    /* Exit stub: mov $1, %eax; xor %ebx,%ebx; int $0x80; hlt */
+    static const uint8_t exit_stub[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov $1, %eax   */
+        0x31, 0xDB,                      /* xor %ebx,%ebx  */
+        0xCD, 0x80,                      /* int $0x80      */
+        0xF4                             /* hlt (safety)   */
+    };
 
-    /* Plant stub address as _start's return address. */
-    uint32_t user_sp = USER_STACK - 4 - 32;   /* below the stub */
-    *(uint32_t *)(user_sp) = stub_addr;
+    uint8_t *sigret_ptr = (uint8_t *)SIG_TRAMPOLINE_ADDR;
+    for (uint32_t i = 0; i < sizeof(sigret_stub); i++) sigret_ptr[i] = sigret_stub[i];
 
-    klog_hex("elf", "entry",    entry);
-    klog_hex("elf", "user_sp",  user_sp);
-    klog_hex("elf", "stub",     stub_addr);
+    uint8_t *exit_ptr = (uint8_t *)EXIT_STUB_ADDR;
+    for (uint32_t i = 0; i < sizeof(exit_stub); i++) exit_ptr[i] = exit_stub[i];
+
+    /* Plant exit stub address as _start's return address. */
+    uint32_t user_sp = EXIT_STUB_ADDR - 4U;
+    *(uint32_t *)(user_sp) = EXIT_STUB_ADDR;
+
+    klog_hex("elf", "entry",       entry);
+    klog_hex("elf", "user_sp",     user_sp);
+    klog_hex("elf", "exit_stub",   EXIT_STUB_ADDR);
+    klog_hex("elf", "sigret_stub", SIG_TRAMPOLINE_ADDR);
     klog("elf", "launching ring3 program");
 
     /*

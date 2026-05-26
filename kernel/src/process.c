@@ -1,21 +1,5 @@
 /*
- * process.c — process table, PID allocation, preemptive + cooperative scheduler,
- *             context switching, and fork().
- *
- * Memory layout for user process images:
- *   slot 0 (initial): virtual 0x300000 → physical 0x300000 (kernel page_dir)
- *   slot 1 (child 1): virtual 0x300000 → physical 0x500000
- *   slot 2 (child 2): virtual 0x300000 → physical 0x600000
- *   slot 3 (child 3): virtual 0x300000 → physical 0x700000
- *
- * Context switch mechanism (same for cooperative yield AND timer preemption):
- *   The caller holds a `registers_t *regs` pointing to the full saved CPU
- *   state on the current process's kernel ISR stack.  We copy that struct
- *   into current_proc.saved_regs, then overwrite *regs with next_proc.saved_regs.
- *   The ISR epilogue (pop segs, popa, add $8, iret) then restores the new
- *   process's state and irets into it.  CR3 and TSS.esp0 are updated before
- *   returning so the next ring3→ring0 event uses the correct address space
- *   and kernel stack.
+ * process.c — process table, scheduler, context switching, fork, signals.
  */
 
 #include "elf.h"      /* USER_BASE, USER_STACK, exit_trampoline */
@@ -24,20 +8,17 @@
 #include "klog.h"
 #include "kmalloc.h"
 #include "paging.h"
-#include "pit.h"      /* pit_ticks() — used by proc_sleep and proc_timer_tick */
+#include "pit.h"
+#include "posix_errno.h"
 #include "process.h"
 #include "serial.h"
+#include "signal.h"
 #include "types.h"
 
 process_t proc_table[MAX_PROCS];
 int       current_proc = -1;
 
-/*
- * Per-process page directories, page tables, and ISR kernel stacks.
- * All must be page-aligned; static in BSS guarantees zero-init.
- * proc_ptabs1: per-process page table for PDE[1] (0x400000–0x7FFFFF),
- * used to map heap pages via SYS_SBRK.
- */
+/* Per-process page directories, page tables, and ISR kernel stacks. */
 static uint32_t proc_pdirs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
 static uint32_t proc_ptabs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
 static uint32_t proc_ptabs1 [MAX_PROCS][1024] __attribute__((aligned(4096)));
@@ -45,59 +26,99 @@ static uint8_t  proc_kstacks[MAX_PROCS][4096] __attribute__((aligned(16)));
 
 void proc_init(void) {
     for (int i = 0; i < MAX_PROCS; i++) {
-        proc_table[i].pid      = -1;
-        proc_table[i].state    = PROC_DEAD;
-        proc_table[i].page_dir = (uint32_t *)0;
+        proc_table[i].pid        = -1;
+        proc_table[i].state      = PROC_DEAD;
+        proc_table[i].page_dir   = (uint32_t *)0;
+        proc_table[i].sig_pending = 0;
+        proc_table[i].sig_mask   = 0;
+        for (int s = 0; s < NSIG; s++) {
+            proc_table[i].sig_actions[s].sa_handler = SIG_DFL;
+            proc_table[i].sig_actions[s].sa_flags   = 0;
+            proc_table[i].sig_actions[s].sa_mask     = 0;
+        }
     }
     current_proc = -1;
 }
 
-/*
- * Register the initial exec'd process in slot 0.
- * Called by exec_elf() before launch_ring3().
- */
 void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     /* Reset any leftover zombie child slots from a previous run. */
     for (int i = 1; i < MAX_PROCS; i++)
         proc_table[i].state = PROC_DEAD;
 
-    /* Reclaim heap from the previous program run. */
     kmalloc_reset();
 
     proc_table[0].pid             = 1;
     proc_table[0].parent_pid      = -1;
+    proc_table[0].pgid            = 1;
+    proc_table[0].sid             = 1;
+    proc_table[0].uid             = 0;
+    proc_table[0].euid            = 0;
+    proc_table[0].gid             = 0;
+    proc_table[0].egid            = 0;
+    proc_table[0].umask           = 022;
     proc_table[0].state           = PROC_RUNNING;
     proc_table[0].page_dir        = page_dir;
-    proc_table[0].exit_code       = 0;
+    proc_table[0].exit_status     = 0;
     proc_table[0].ticks_remaining = PROC_TIMESLICE;
     proc_table[0].brk             = 0x400000U;
+    proc_table[0].sig_pending     = 0;
+    proc_table[0].sig_mask        = 0;
+    proc_table[0].cwd[0]          = '/';
+    proc_table[0].cwd[1]          = '\0';
+    for (int s = 0; s < NSIG; s++) {
+        proc_table[0].sig_actions[s].sa_handler = SIG_DFL;
+        proc_table[0].sig_actions[s].sa_flags   = 0;
+        proc_table[0].sig_actions[s].sa_mask     = 0;
+    }
     if (fdt)
         proc_table[0].fd_table = *fdt;
     else
         fd_table_init(&proc_table[0].fd_table);
     current_proc = 0;
-    /* Restore CR3 to this process's page directory.  After a multi-process
-     * run, CR3 may still point to a dead child's page directory. */
     paging_switch_dir(page_dir);
-    /* Switch ISR stack to proc_kstacks[0] for this process */
     tss_set_esp0((uint32_t)(proc_kstacks[0] + 4096));
 
-    serial_write(COM1, "[proc] initial pid=1 kstack=");
-    serial_write_hex(COM1, (uint32_t)(proc_kstacks[0] + 4096));
-    serial_write(COM1, "\n");
+    serial_write(COM1, "[proc] initial pid=1\n");
 }
 
-/* Allocate a free child slot (slots 1–MAX_PROCS-1 only).
- * Returns slot index or -1 if full. */
 static int alloc_child_slot(void) {
     for (int i = 1; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_DEAD) {
             proc_table[i].pid             = i + 1;
             proc_table[i].parent_pid      = (current_proc >= 0) ? proc_table[current_proc].pid : -1;
+            proc_table[i].pgid            = (current_proc >= 0) ? proc_table[current_proc].pgid : i + 1;
+            proc_table[i].sid             = (current_proc >= 0) ? proc_table[current_proc].sid : i + 1;
+            proc_table[i].uid             = (current_proc >= 0) ? proc_table[current_proc].uid : 0;
+            proc_table[i].euid            = (current_proc >= 0) ? proc_table[current_proc].euid : 0;
+            proc_table[i].gid             = (current_proc >= 0) ? proc_table[current_proc].gid : 0;
+            proc_table[i].egid            = (current_proc >= 0) ? proc_table[current_proc].egid : 0;
+            proc_table[i].umask           = (current_proc >= 0) ? proc_table[current_proc].umask : 022;
             proc_table[i].state           = PROC_RUNNABLE;
-            proc_table[i].exit_code       = 0;
+            proc_table[i].exit_status     = 0;
             proc_table[i].ticks_remaining = PROC_TIMESLICE;
             proc_table[i].brk             = 0x400000U;
+            proc_table[i].sig_pending     = 0;
+            proc_table[i].sig_mask        = (current_proc >= 0) ? proc_table[current_proc].sig_mask : 0;
+            for (int s = 0; s < NSIG; s++) {
+                if (current_proc >= 0)
+                    proc_table[i].sig_actions[s] = proc_table[current_proc].sig_actions[s];
+                else {
+                    proc_table[i].sig_actions[s].sa_handler = SIG_DFL;
+                    proc_table[i].sig_actions[s].sa_flags   = 0;
+                    proc_table[i].sig_actions[s].sa_mask     = 0;
+                }
+            }
+            if (current_proc >= 0) {
+                int j = 0;
+                while (proc_table[current_proc].cwd[j] && j < CWD_MAX - 1) {
+                    proc_table[i].cwd[j] = proc_table[current_proc].cwd[j];
+                    j++;
+                }
+                proc_table[i].cwd[j] = '\0';
+            } else {
+                proc_table[i].cwd[0] = '/';
+                proc_table[i].cwd[1] = '\0';
+            }
             fd_table_init(&proc_table[i].fd_table);
             return i;
         }
@@ -105,7 +126,6 @@ static int alloc_child_slot(void) {
     return -1;
 }
 
-/* Round-robin: find next RUNNABLE process starting after `from`. */
 static int sched_next_after(int from) {
     for (int i = 1; i <= MAX_PROCS; i++) {
         int slot = (from + i) % MAX_PROCS;
@@ -115,7 +135,6 @@ static int sched_next_after(int from) {
     return -1;
 }
 
-/* Count processes that are alive (RUNNING or RUNNABLE). */
 static int proc_alive_count(void) {
     int n = 0;
     for (int i = 0; i < MAX_PROCS; i++) {
@@ -126,74 +145,68 @@ static int proc_alive_count(void) {
     return n;
 }
 
-/* Perform the actual context switch: update CR3, TSS.esp0, overwrite *regs. */
 static void do_switch(int next_slot, registers_t *regs) {
-    /* Give the incoming process a fresh time slice */
     proc_table[next_slot].ticks_remaining = PROC_TIMESLICE;
     proc_table[next_slot].state           = PROC_RUNNING;
     current_proc = next_slot;
 
-    /* Switch address space */
     paging_switch_dir(proc_table[next_slot].page_dir);
-
-    /* Update TSS.esp0 so the next ring3→ring0 transition (syscall or IRQ)
-     * saves state on this process's dedicated kernel stack */
     tss_set_esp0((uint32_t)(proc_kstacks[next_slot] + 4096));
 
-    /* Overwrite the iret frame in-place so the ISR epilogue jumps into
-     * the new process instead of the old one */
     *regs = proc_table[next_slot].saved_regs;
 
-    serial_write(COM1, "[sched] switch→pid=");
+    serial_write(COM1, "[sched] switch pid=");
     serial_write_dec(COM1, (uint32_t)proc_table[next_slot].pid);
-    serial_write(COM1, " eip=");
-    serial_write_hex(COM1, proc_table[next_slot].saved_regs.eip);
-    serial_write(COM1, " cr3=");
-    serial_write_hex(COM1, (uint32_t)proc_table[next_slot].page_dir);
-    serial_write(COM1, " kstk=");
-    serial_write_hex(COM1, (uint32_t)(proc_kstacks[next_slot] + 4096));
     serial_write(COM1, "\n");
 }
 
-/* Globals from elf.c for the exit_trampoline return path. */
 extern int  process_exited;
+
+int proc_find_by_pid(pid_t pid) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (proc_table[i].state != PROC_DEAD && proc_table[i].pid == pid)
+            return i;
+    return -1;
+}
 
 void proc_yield(registers_t *regs) {
     if (current_proc < 0) return;
 
     int next = sched_next_after(current_proc);
-    if (next < 0) return;  /* only one process — keep running */
+    if (next < 0) return;
 
     proc_table[current_proc].saved_regs = *regs;
     proc_table[current_proc].state      = PROC_RUNNABLE;
 
-    serial_write(COM1, "[proc] yield: ");
-    serial_write_dec(COM1, (uint32_t)current_proc);
-    serial_write(COM1, " -> ");
-    serial_write_dec(COM1, (uint32_t)next);
-    serial_write(COM1, "\n");
-
     do_switch(next, regs);
 }
 
-void proc_exit(registers_t *regs, int code) {
+void proc_exit(registers_t *regs, int status) {
     int dying = current_proc;
 
     if (dying >= 0) {
-        proc_table[dying].state     = PROC_ZOMBIE;
-        proc_table[dying].exit_code = code;
+        /* Close all fds */
+        for (int fd = 0; fd < FD_MAX; fd++)
+            if (proc_table[dying].fd_table.fds[fd].type != FD_NONE)
+                fd_close(&proc_table[dying].fd_table, fd);
 
-        /* If parent is blocked in wait(), reap immediately and wake it. */
-        int ppid = proc_table[dying].parent_pid;
+        proc_table[dying].state       = PROC_ZOMBIE;
+        proc_table[dying].exit_status = status;
+
+        /* Send SIGCHLD to parent; if parent is blocked in wait, reap and wake */
+        pid_t ppid = proc_table[dying].parent_pid;
         if (ppid >= 0) {
             for (int i = 0; i < MAX_PROCS; i++) {
-                if (proc_table[i].pid == ppid &&
-                    proc_table[i].state == PROC_BLOCKED) {
-                    proc_table[dying].state          = PROC_DEAD;
-                    proc_table[i].saved_regs.eax     = (uint32_t)code;
-                    proc_table[i].state              = PROC_RUNNABLE;
-                    klog_dec("proc", "exit: woke blocked parent pid",
-                             (uint32_t)ppid);
+                if (proc_table[i].pid == ppid) {
+                    /* Send SIGCHLD */
+                    proc_table[i].sig_pending |= (1U << SIGCHLD);
+
+                    if (proc_table[i].state == PROC_BLOCKED) {
+                        proc_table[dying].state          = PROC_DEAD;
+                        proc_table[i].saved_regs.eax     = (uint32_t)proc_table[dying].pid;
+                        proc_table[i].state              = PROC_RUNNABLE;
+                        klog_dec("proc", "exit: woke blocked parent", (uint32_t)ppid);
+                    }
                     break;
                 }
             }
@@ -206,22 +219,12 @@ void proc_exit(registers_t *regs, int code) {
 
     int next = sched_next_after(dying >= 0 ? dying : 0);
     if (next >= 0) {
-        current_proc = -1;  /* clear before do_switch sets it */
+        current_proc = -1;
         do_switch(next, regs);
         return;
     }
 
-    /*
-     * No RUNNABLE process found.  Check whether any SLEEPING processes
-     * are still waiting — if so we must not go to exit_trampoline or they
-     * would be orphaned (nobody left to reschedule them).
-     *
-     * Spin with hlt until the nearest sleeper's deadline arrives, wake it,
-     * and switch into it.  This is safe only when called from a trap-gate
-     * context (SYS_EXIT, IF=1).  When called from a fault handler (IF=0)
-     * sleeping processes are simply dropped — a fault in a concurrent
-     * program is already a fatal error for that process.
-     */
+    /* Check for sleeping processes */
     int sleeper = -1;
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_SLEEPING) {
@@ -232,11 +235,7 @@ void proc_exit(registers_t *regs, int code) {
     }
 
     if (sleeper >= 0) {
-        serial_write(COM1, "[proc] exit: spinning for sleeper pid=");
-        serial_write_dec(COM1, (uint32_t)proc_table[sleeper].pid);
-        serial_write(COM1, "\n");
         current_proc = -1;
-        /* Spin-wait with hlt; requires IF=1 (trap gate). */
         while (pit_ticks() < proc_table[sleeper].sleep_until)
             __asm__ volatile("hlt");
         proc_table[sleeper].state = PROC_RUNNABLE;
@@ -244,8 +243,7 @@ void proc_exit(registers_t *regs, int code) {
         return;
     }
 
-    /* No more runnable or sleeping processes — return to exec_elf */
-    current_proc  = -1;
+    current_proc   = -1;
     process_exited = 1;
     regs->eip    = (uint32_t)exit_trampoline;
     regs->cs     = SEG_KCODE;
@@ -253,41 +251,53 @@ void proc_exit(registers_t *regs, int code) {
 }
 
 int proc_fork(registers_t *regs) {
-    if (current_proc < 0) return -1;
+    if (current_proc < 0) return -EAGAIN;
 
     int child_slot = alloc_child_slot();
     if (child_slot < 0) {
         klog("proc", "fork: no free slots");
-        return -1;
+        return -EAGAIN;
     }
 
     process_t *parent = &proc_table[current_proc];
     process_t *child  = &proc_table[child_slot];
 
     /*
-     * Physical base for child's user image.
-     * child_slot is always >=1; slot 1→0x500000, slot 2→0x600000, slot 3→0x700000.
+     * Allocate 256 physical pages for child's user space (0x300000-0x3FFFFF).
+     * We need 256 pages of 4KB = 1MB.
      */
-    uint32_t child_phys = PROC_POOL_BASE + (uint32_t)(child_slot - 1) * PROC_USER_SIZE;
+    uint32_t child_phys_base = paging_alloc_phys_page();
+    if (!child_phys_base) {
+        klog("proc", "fork: out of physical pages");
+        child->state = PROC_DEAD;
+        return -ENOMEM;
+    }
+    /* Allocate the remaining 255 pages to fill the 1MB region */
+    for (int p = 1; p < 256; p++) {
+        uint32_t page = paging_alloc_phys_page();
+        if (!page) {
+            klog("proc", "fork: out of physical pages during alloc");
+            child->state = PROC_DEAD;
+            return -ENOMEM;
+        }
+    }
 
-    /* 1. Physically copy the entire user region (code + data + stack). */
-    uint8_t *src    = (uint8_t *)USER_BASE;
-    uint8_t *dst    = (uint8_t *)child_phys;
+    /* Copy parent user space (0x300000..0x3FFFFF) to child's physical pages */
+    uint8_t *src = (uint8_t *)USER_BASE;
+    uint8_t *dst = (uint8_t *)child_phys_base;
     uint32_t region = USER_STACK - USER_BASE;  /* 1 MB */
     for (uint32_t i = 0; i < region; i++)
         dst[i] = src[i];
 
-    /* 2. Build child's page directory: kernel mappings shared, user remapped. */
+    /* Build child's page directory */
     paging_clone(proc_pdirs[child_slot], proc_ptabs[child_slot],
-                 proc_ptabs1[child_slot], child_phys);
+                 proc_ptabs1[child_slot], child_phys_base);
     child->page_dir = proc_pdirs[child_slot];
 
-    /* 3. Clone fd table from parent. */
-    child->fd_table = parent->fd_table;
+    /* Clone fd table from parent (bumping pipe refcounts) */
+    fd_table_clone(&child->fd_table, &parent->fd_table, 0 /* don't close cloexec on fork */);
 
-    /* 4. Clone CPU state; child returns 0 from fork.
-     *    The child's saved EFLAGS has IF=1 (trap gate doesn't clear IF),
-     *    so the child runs with interrupts enabled from the first tick. */
+    /* Clone CPU state; child returns 0 from fork */
     child->saved_regs     = *regs;
     child->saved_regs.eax = 0;
 
@@ -296,80 +306,73 @@ int proc_fork(registers_t *regs) {
     serial_write(COM1, "[proc] fork: child pid=");
     serial_write_dec(COM1, (uint32_t)child->pid);
     serial_write(COM1, " phys=");
-    serial_write_hex(COM1, child_phys);
-    serial_write(COM1, " eip=");
-    serial_write_hex(COM1, child->saved_regs.eip);
+    serial_write_hex(COM1, child_phys_base);
     serial_write(COM1, "\n");
 
-    /* Parent gets child pid as fork() return value. */
     return child->pid;
 }
 
-int proc_wait(registers_t *regs) {
-    if (current_proc < 0) return -1;
+pid_t proc_waitpid(pid_t pid, int *status, int options, registers_t *regs) {
+    if (current_proc < 0) return -ECHILD;
 
-    int my_pid = proc_table[current_proc].pid;
+    pid_t my_pid = proc_table[current_proc].pid;
 
-    /* Reap any zombie child immediately. */
+retry:
+    /* First scan for zombie children matching pid */
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (proc_table[i].state == PROC_ZOMBIE &&
-            proc_table[i].parent_pid == my_pid) {
-            int code = proc_table[i].exit_code;
-            proc_table[i].state = PROC_DEAD;
-            klog_dec("proc", "wait: reaped zombie pid",
-                     (uint32_t)proc_table[i].pid);
-            return code;
-        }
+        if (proc_table[i].state != PROC_ZOMBIE) continue;
+        if (proc_table[i].parent_pid != my_pid) continue;
+        if (pid > 0 && proc_table[i].pid != pid) continue;
+        if (pid < -1 && proc_table[i].pgid != -pid) continue;
+
+        /* Found a zombie to reap */
+        pid_t child_pid = proc_table[i].pid;
+        if (status) *status = proc_table[i].exit_status;
+        proc_table[i].state = PROC_DEAD;
+        klog_dec("proc", "waitpid: reaped", (uint32_t)child_pid);
+        return child_pid;
     }
 
-    /* No zombie yet — check if any children are still alive. */
+    /* Check if any matching children exist */
     int has_child = 0;
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (proc_table[i].parent_pid == my_pid &&
-            proc_table[i].state != PROC_DEAD) {
-            has_child = 1;
-            break;
-        }
+        if (proc_table[i].parent_pid != my_pid) continue;
+        if (proc_table[i].state == PROC_DEAD) continue;
+        if (pid > 0 && proc_table[i].pid != pid) continue;
+        if (pid < -1 && proc_table[i].pgid != -pid) continue;
+        has_child = 1;
+        break;
     }
-    if (!has_child) return -1;
 
-    /* Block until a child exits; proc_exit() will wake us and set
-     * saved_regs.eax to the child's exit code before do_switch back. */
+    if (!has_child) return -ECHILD;
+
+    if (options & WNOHANG) return 0;
+
+    /* Block until a child exits */
     proc_table[current_proc].saved_regs = *regs;
     proc_table[current_proc].state      = PROC_BLOCKED;
 
     int next = sched_next_after(current_proc);
     if (next < 0) {
-        /* Deadlock: no other runnable process. Return -1 to avoid hanging. */
+        /* Deadlock avoidance */
         proc_table[current_proc].state = PROC_RUNNING;
-        return -1;
+        return -ECHILD;
     }
 
-    klog_dec("proc", "wait: blocking, switching to",
-             (uint32_t)proc_table[next].pid);
     do_switch(next, regs);
-    /* Actual return value is already in saved_regs.eax (set by proc_exit);
-     * do_switch restored it into *regs, so the ISR epilogue returns it. */
-    return 0;
+    /* When we wake, proc_exit set our saved_regs.eax to child pid.
+     * The caller in idt.c will use regs->eax, so go retry to do a real reap. */
+    goto retry;
 }
 
-/*
- * proc_sleep — called from SYS_SLEEP.
- *
- * Two paths depending on whether other processes are runnable:
- *
- * A) Another process is runnable: save registers with saved_regs.eax = 0
- *    (so the sleeper sees return value 0 when rescheduled), mark SLEEPING,
- *    context-switch.  proc_timer_tick's wake sweep will flip state back to
- *    RUNNABLE; the preemptive scheduler will reschedule us from ring3.
- *
- * B) No other runnable process (alone or only sleeping siblings): do NOT
- *    mark PROC_SLEEPING and do NOT context-switch.  Spin with hlt so the
- *    PIT keeps firing and g_ticks keeps incrementing; exit the loop when
- *    the deadline is reached.  This is safe because the syscall gate is a
- *    trap gate (IF=1 on entry), so hlt actually waits for the next tick.
- *    Never changing process state means no orphan scenario is possible.
- */
+/* Legacy proc_wait wrapper */
+int proc_wait(registers_t *regs) {
+    int status = 0;
+    pid_t ret = proc_waitpid(-1, &status, 0, regs);
+    if (ret < 0) return -1;
+    return status;
+}
+
 void proc_sleep(registers_t *regs, uint32_t ticks) {
     if (current_proc < 0) return;
 
@@ -381,69 +384,171 @@ void proc_sleep(registers_t *regs, uint32_t ticks) {
     uint32_t wake_at = pit_ticks() + ticks;
     proc_table[current_proc].sleep_until = wake_at;
 
-    /*
-     * Check BEFORE touching state.  If no other process is runnable we
-     * must NOT mark ourselves SLEEPING — there would be nobody to ever
-     * reschedule us and proc_exit on the last peer would go straight to
-     * exit_trampoline, orphaning a PROC_SLEEPING process permanently.
-     */
     int next = sched_next_after(current_proc);
     if (next < 0) {
-        /* Alone (or only SLEEPING siblings): busy-wait.
-         * Stay PROC_RUNNING so proc_exit and the scheduler see us. */
-        serial_write(COM1, "[proc] sleep alone pid=");
-        serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
-        serial_write(COM1, " until=");
-        serial_write_dec(COM1, wake_at);
-        serial_write(COM1, "\n");
         while (pit_ticks() < wake_at)
             __asm__ volatile("hlt");
         regs->eax = 0;
         return;
     }
 
-    /* Save state; set eax=0 now so the sleeper sees 0 when rescheduled
-     * (we never return through idt.c's `regs->eax = 0` line for this path). */
-    proc_table[current_proc].saved_regs      = *regs;
-    proc_table[current_proc].saved_regs.eax  = 0;
-    proc_table[current_proc].state           = PROC_SLEEPING;
-
-    serial_write(COM1, "[proc] sleep pid=");
-    serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
-    serial_write(COM1, " until=");
-    serial_write_dec(COM1, wake_at);
-    serial_write(COM1, "\n");
+    proc_table[current_proc].saved_regs     = *regs;
+    proc_table[current_proc].saved_regs.eax = 0;
+    proc_table[current_proc].state          = PROC_SLEEPING;
 
     do_switch(next, regs);
 }
 
-/*
- * proc_timer_tick — called from the PIT IRQ0 handler once per tick.
- *
- * First wakes any SLEEPING processes whose sleep_until has passed.
- * Then, only preempts ring3 code (CS.RPL = 3).  Kernel-mode execution is
- * never preempted here.
- *
- * If the current process's time slice has expired and another RUNNABLE
- * process exists, saves current state and switches to the next process.
- * The switch modifies *regs in-place; the IRQ0 iret frame then carries
- * the new process into execution.
- */
+int proc_send_signal(pid_t pid, int sig) {
+    if (sig <= 0 || sig >= NSIG) return -EINVAL;
+
+    int idx = proc_find_by_pid(pid);
+    if (idx < 0) return -ESRCH;
+
+    if (sig == SIGKILL) {
+        /* Immediately terminate */
+        if (idx == current_proc) {
+            /* Will be handled by caller */
+            proc_table[idx].sig_pending |= (1U << sig);
+        } else {
+            proc_table[idx].state       = PROC_ZOMBIE;
+            proc_table[idx].exit_status = W_SIGNALED(SIGKILL);
+            /* Wake parent if blocked */
+            pid_t ppid = proc_table[idx].parent_pid;
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (proc_table[i].pid == ppid && proc_table[i].state == PROC_BLOCKED) {
+                    proc_table[i].saved_regs.eax = (uint32_t)proc_table[idx].pid;
+                    proc_table[idx].state        = PROC_DEAD;
+                    proc_table[i].state          = PROC_RUNNABLE;
+                    break;
+                }
+            }
+        }
+        return 0;
+    }
+
+    proc_table[idx].sig_pending |= (1U << sig);
+
+    /* Wake sleeping/blocked process */
+    if (proc_table[idx].state == PROC_SLEEPING ||
+        proc_table[idx].state == PROC_BLOCKED) {
+        proc_table[idx].state = PROC_RUNNABLE;
+    }
+
+    return 0;
+}
+
+void proc_send_signal_group(pgid_t pgid, int sig) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state != PROC_DEAD &&
+            proc_table[i].state != PROC_ZOMBIE &&
+            proc_table[i].pgid == pgid) {
+            proc_send_signal(proc_table[i].pid, sig);
+        }
+    }
+}
+
+static void proc_default_action(int sig, registers_t *regs) {
+    switch (sig) {
+    case SIGCHLD:
+    case SIGURG:
+    case SIGWINCH:
+        /* Ignore by default */
+        return;
+    case SIGCONT:
+        if (current_proc >= 0 && proc_table[current_proc].state == PROC_STOPPED) {
+            proc_table[current_proc].state = PROC_RUNNING;
+        }
+        return;
+    case SIGSTOP:
+    case SIGTSTP:
+    case SIGTTIN:
+    case SIGTTOU:
+        if (current_proc >= 0) {
+            proc_table[current_proc].saved_regs = *regs;
+            proc_table[current_proc].state      = PROC_STOPPED;
+            int next = sched_next_after(current_proc);
+            if (next >= 0) do_switch(next, regs);
+        }
+        return;
+    default:
+        /* Terminate */
+        proc_exit(regs, W_SIGNALED(sig));
+        return;
+    }
+}
+
+void proc_deliver_signals(registers_t *regs) {
+    if (current_proc < 0) return;
+    /* Only deliver when returning to user space */
+    if ((regs->cs & 3) != 3) return;
+
+    process_t *proc = &proc_table[current_proc];
+    uint32_t deliverable = proc->sig_pending & ~proc->sig_mask;
+    if (!deliverable) return;
+
+    /* Find lowest set bit */
+    int sig = -1;
+    for (int s = 1; s < NSIG; s++) {
+        if (deliverable & (1U << s)) {
+            sig = s;
+            break;
+        }
+    }
+    if (sig < 0) return;
+
+    /* Clear from pending */
+    proc->sig_pending &= ~(1U << sig);
+
+    struct sigaction *sa = &proc->sig_actions[sig];
+
+    if (sa->sa_handler == SIG_DFL) {
+        proc_default_action(sig, regs);
+        return;
+    }
+    if (sa->sa_handler == SIG_IGN) {
+        return;
+    }
+
+    /* Custom handler: build sig_frame_t on user stack */
+    uint32_t user_sp = regs->useresp;
+    user_sp -= sizeof(sig_frame_t);
+    user_sp &= ~3U;  /* align to 4 bytes */
+
+    sig_frame_t *frame = (sig_frame_t *)user_sp;
+    frame->retaddr       = SIG_TRAMPOLINE_ADDR;
+    frame->signum        = sig;
+    frame->saved_eax     = regs->eax;
+    frame->saved_ecx     = regs->ecx;
+    frame->saved_edx     = regs->edx;
+    frame->saved_ebx     = regs->ebx;
+    frame->saved_esi     = regs->esi;
+    frame->saved_edi     = regs->edi;
+    frame->saved_ebp     = regs->ebp;
+    frame->saved_eip     = regs->eip;
+    frame->saved_eflags  = regs->eflags;
+    frame->saved_useresp = regs->useresp;
+    frame->saved_mask    = proc->sig_mask;
+
+    /* Mask signals during handler */
+    proc->sig_mask |= sa->sa_mask | (1U << sig);
+
+    /* Redirect to handler */
+    regs->eip    = (uint32_t)sa->sa_handler;
+    regs->useresp = user_sp;
+
+    if (sa->sa_flags & SA_RESETHAND) {
+        sa->sa_handler = SIG_DFL;
+    }
+}
+
 void proc_timer_tick(registers_t *regs) {
-    /* Wake any sleeping processes whose deadline has passed */
     uint32_t now = pit_ticks();
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_SLEEPING && now >= proc_table[i].sleep_until)
             proc_table[i].state = PROC_RUNNABLE;
     }
 
-    /*
-     * Safety net: if no process is currently scheduled but a freshly-woken
-     * (or otherwise RUNNABLE) process exists, schedule it now.  This covers
-     * the rare path where kill_user_process (IF=0) called proc_exit with a
-     * sleeping sibling — proc_exit can't spin there, so the sleeper ends up
-     * RUNNABLE with current_proc == -1 until the next tick picks it up.
-     */
     if (current_proc < 0) {
         for (int i = 0; i < MAX_PROCS; i++) {
             if (proc_table[i].state == PROC_RUNNABLE) {
@@ -454,36 +559,23 @@ void proc_timer_tick(registers_t *regs) {
         return;
     }
 
-    /* Nothing running or interrupted from kernel mode: nothing to preempt */
-    if ((regs->cs & 3) != 3)        return;
-    if (proc_alive_count() < 2)     return;  /* alone — no point switching */
+    if ((regs->cs & 3) != 3) return;
+    if (proc_alive_count() < 2) return;
 
-    /* Decrement time slice */
     if (proc_table[current_proc].ticks_remaining > 0)
         proc_table[current_proc].ticks_remaining--;
 
     if (proc_table[current_proc].ticks_remaining > 0)
-        return;  /* still has time left */
+        return;
 
-    /* Slice expired — find next runnable process */
     int next = sched_next_after(current_proc);
     if (next < 0) {
-        /* No other runnable process; reset slice and keep current running */
         proc_table[current_proc].ticks_remaining = PROC_TIMESLICE;
         return;
     }
 
-    /* Save current process CPU state from the IRQ frame */
     proc_table[current_proc].saved_regs = *regs;
     proc_table[current_proc].state      = PROC_RUNNABLE;
-
-    serial_write(COM1, "[sched] preempt pid=");
-    serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
-    serial_write(COM1, " eip=");
-    serial_write_hex(COM1, regs->eip);
-    serial_write(COM1, " esp=");
-    serial_write_hex(COM1, regs->useresp);
-    serial_write(COM1, "\n");
 
     do_switch(next, regs);
 }

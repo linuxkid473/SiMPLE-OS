@@ -1736,12 +1736,12 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             if (s_whence == 0) {
                 new_off = s_off;
             } else if (s_whence == 1) {
-                new_off = (int)f->offset + s_off;
+                new_off = (int)f->file.offset + s_off;
             } else {
                 fat16_dirent_t dirent;
-                if (fs && fat16_stat(fs, f->dir_cluster, f->name, &dirent) == FAT16_OK)
-                    f->size = dirent.size;
-                new_off = (int)f->size + s_off;
+                if (fs && fat16_stat(fs, f->file.dir_cluster, f->file.name, &dirent) == FAT16_OK)
+                    f->file.size = dirent.size;
+                new_off = (int)f->file.size + s_off;
             }
 
             if (new_off < 0) {
@@ -1749,7 +1749,7 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 continue;
             }
 
-            f->offset = (uint32_t)new_off;
+            f->file.offset = (uint32_t)new_off;
 
             vga_write("fd ");
             char num_buf[12];
