@@ -21,6 +21,8 @@
 #define SHELL_COMPLETION_ENTRIES 256
 #define ABOUT_LABEL_WIDTH 16
 
+/* ELF_LOAD_BUF is defined in kernel/include/elf.h (1 MB). */
+
 #define COLOR_BLACK      0x0
 #define COLOR_LIGHT_GREY 0x7
 #define COLOR_LIGHT_CYAN 0xB
@@ -1783,15 +1785,21 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             }
 
             kmalloc_reset();
-            char* buf = (char*)kmalloc(65536);
+            char* buf = (char*)kmalloc(ELF_LOAD_BUF);
+            if (!buf) {
+                vga_write_line("ELF: out of kernel heap memory");
+                continue;
+            }
             uint32_t out_len = 0;
-            rc = fat16_read_file(fs, dir_cluster, file_name, buf, 65536, &out_len);
+            rc = fat16_read_file(fs, dir_cluster, file_name, buf, ELF_LOAD_BUF, &out_len);
             if (rc != FAT16_OK) {
                 vga_write_line("Failed to read file");
                 continue;
             }
 
-            exec_elf(buf);
+            int elf_rc = exec_elf(buf);
+            if (elf_rc != 0)
+                vga_write_line("ELF: execution failed");
             vga_putc('\n');
             continue;
         }

@@ -48,6 +48,18 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
 
     kmalloc_reset();
 
+    /*
+     * Reset the physical page pool and clear stale heap PTEs.
+     *
+     * Without this, two things go wrong on the second ELF run:
+     *   - paging_alloc_phys_page() returns 0 immediately because the bump
+     *     pointer was exhausted by fork() calls in the previous run.
+     *   - page_tab1 still has PTE_PRESENT entries from the previous run's
+     *     heap growth, so paging_page_mapped() reports pages as already
+     *     mapped and sbrk reuses stale physical memory.
+     */
+    paging_reset_phys_heap();
+
     proc_table[0].pid             = 1;
     proc_table[0].parent_pid      = -1;
     proc_table[0].pgid            = 1;
@@ -516,6 +528,14 @@ void proc_deliver_signals(registers_t *regs) {
     uint32_t user_sp = regs->useresp;
     user_sp -= sizeof(sig_frame_t);
     user_sp &= ~3U;  /* align to 4 bytes */
+
+    /* Refuse to deliver if the signal frame would land outside user space —
+     * that would write into supervisor memory or an unmapped page. */
+    if (user_sp < USER_BASE || user_sp + sizeof(sig_frame_t) > USER_STACK) {
+        /* Stack overflow during signal delivery: kill the process cleanly */
+        proc_exit(regs, W_SIGNALED(SIGSEGV));
+        return;
+    }
 
     sig_frame_t *frame = (sig_frame_t *)user_sp;
     frame->retaddr       = SIG_TRAMPOLINE_ADDR;

@@ -39,4 +39,16 @@ void      paging_map_page(uint32_t *page_dir, uint32_t vaddr,
 /* Return 1 if the 4 KB page covering vaddr is already present in page_dir. */
 int       paging_page_mapped(uint32_t *page_dir, uint32_t vaddr);
 
+/*
+ * Reset the physical page pool and clear all heap-range PTEs.
+ *
+ * Must be called by proc_register_initial() before loading a new ELF so that:
+ *   (a) paging_alloc_phys_page() starts fresh — no exhaustion from a previous
+ *       run's fork() calls.
+ *   (b) page_tab1[0..0xFF] (virtual 0x400000–0x4FFFFF) is fully cleared —
+ *       no stale present-bit entries that would fool paging_page_mapped()
+ *       into thinking the new process's heap is already mapped.
+ */
+void      paging_reset_phys_heap(void);
+
 #endif

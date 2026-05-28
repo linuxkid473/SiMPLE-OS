@@ -81,9 +81,29 @@ typedef struct {
     sigset_t saved_mask;
 } __attribute__((packed)) sig_frame_t;
 
-/* Addresses in user space for kernel-planted stubs */
+/* Addresses in user space for kernel-planted stubs.
+ *
+ * Memory map (top of user region, high → low):
+ *
+ *   0x3FFFFF  ← top of user region
+ *   0x3FFFF0  ← USER_INITIAL_SP  (16-byte aligned; stack grows down from here)
+ *
+ *   Initial stack built by build_posix_stack() (grows down from USER_INITIAL_SP):
+ *     [esp]   = EXIT_STUB_ADDR  ← fake return addr (ret from _start → clean exit)
+ *     [esp+4] = argc
+ *     [esp+8] = argv[0]  ...
+ *
+ *   0x3FFFAA  ← (gap)
+ *   0x3FFFA0  ← EXIT_STUB_ADDR   (10 bytes: mov $1,%eax; xor %ebx,%ebx; int $0x80)
+ *   0x3FFF88  ← (gap)
+ *   0x3FFF80  ← SIG_TRAMPOLINE_ADDR (8 bytes: mov $119,%eax; int $0x80)
+ *
+ * USER_INITIAL_SP must stay well above the top of EXIT_STUB (0x3FFFA9) so
+ * that build_posix_stack() — which writes downward from USER_INITIAL_SP —
+ * never overwrites the exit stub.  0x3FFFF0 leaves a 70-byte clearance.
+ */
 #define SIG_TRAMPOLINE_ADDR  0x3FFF80U   /* sigreturn trampoline */
 #define EXIT_STUB_ADDR       0x3FFFA0U   /* exit stub */
-#define USER_INITIAL_SP      0x3FFFB0U   /* initial user stack pointer */
+#define USER_INITIAL_SP      0x3FFFF0U   /* initial user stack pointer */
 
 #endif

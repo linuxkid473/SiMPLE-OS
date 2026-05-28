@@ -116,6 +116,10 @@ extern int         wm_active;    /* index of the focused window */
  * Must be called after fb_init(). */
 void wm_init(int screen_w, int screen_h);
 
+/* Spawn the built-in terminal window and redraw.
+ * Call after a desktop process exits to restore the shell terminal. */
+void wm_spawn_terminal(void);
+
 /* Redraw desktop + launcher + all visible windows + cursor.
  * Safe to call at any time; leaves vga text API anchored to the terminal. */
 void wm_draw_all(void);

@@ -345,15 +345,20 @@ int munmap(void *addr, int len) {
 
 typedef unsigned int sigset_t;
 
-struct sigaction_user {
+/* struct sigaction layout must match kernel/include/signal.h:
+ * { sa_handler, sa_flags, sa_restorer, sa_mask }
+ * Define only when not already defined by user/include/signal.h. */
+#ifndef _SIGNAL_H
+struct sigaction {
     void     (*sa_handler)(int);
     unsigned   sa_flags;
     void     (*sa_restorer)(void);
-    sigset_t   sa_mask;
+    unsigned   sa_mask;   /* sigset_t = uint32_t */
 };
+#endif
 
-int sigaction(int sig, const struct sigaction_user *act, struct sigaction_user *oact) {
-    long ret = syscall4(173, sig, (long)act, (long)oact, sizeof(sigset_t));
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    long ret = syscall4(173, sig, (long)act, (long)oact, 4 /* sizeof sigset_t */);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
 }
@@ -365,7 +370,7 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *oset) {
 }
 
 void (*signal(int sig, void (*handler)(int)))(int) {
-    struct sigaction_user act, oact;
+    struct sigaction act, oact;
     act.sa_handler = handler;
     act.sa_flags   = 0;
     act.sa_restorer = (void *)0;

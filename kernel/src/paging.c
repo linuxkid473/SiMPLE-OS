@@ -65,6 +65,46 @@ uint32_t paging_alloc_phys_page(void) {
     return page;
 }
 
+/*
+ * paging_reset_phys_heap — called by proc_register_initial() before each
+ * new ELF run.
+ *
+ * Two problems this fixes:
+ *
+ * 1. Physical page pool exhaustion.
+ *    proc_fork() consumes 256 pages (the full 1 MB pool) in one call.
+ *    After just one fork-using program (e.g. hello.elf's test_pipe /
+ *    test_fork_wait), phys_heap_next reaches PHYS_HEAP_LIMIT and stays
+ *    there forever.  Subsequent fork() calls return -ENOMEM, causing the
+ *    parent to block forever on a read() that has no writer.
+ *    Fix: reset the bump pointer so the pool is reusable across ELF runs.
+ *    (The physical frames are identity-mapped at 0x900000-0x9FFFFF and are
+ *    always writable by the kernel, so reuse is safe once all child
+ *    processes from the previous run are dead.)
+ *
+ * 2. Stale heap PTE entries in page_tab1.
+ *    sys_sbrk / sys_linux_brk write PTE_PRESENT entries into page_tab1
+ *    (virtual 0x400000-0x4FFFFF) as the user heap grows.  Those entries
+ *    survive into the next ELF run.  paging_page_mapped() sees them as
+ *    "already mapped" and skips the physical allocation, so the new
+ *    process inherits stale data from the previous run — and sbrk
+ *    eventually fails silently when it reaches the old high-water mark
+ *    and there are no new physical pages.
+ *    Fix: zero page_tab1[0..0xFF] so the heap region starts fully absent.
+ */
+void paging_reset_phys_heap(void) {
+    phys_heap_next = PHYS_HEAP_BASE;
+
+    /* Clear all heap-range PTEs and flush each TLB entry */
+    for (uint32_t i = 0; i < 0x100U; i++) {
+        if (page_tab1[i] & PTE_PRESENT) {
+            page_tab1[i] = 0;
+            __asm__ volatile("invlpg (%0)" : : "r"(0x400000U + i * PAGE_SIZE) : "memory");
+        }
+    }
+    klog("paging", "phys heap and heap PTEs reset");
+}
+
 void paging_init(void) {
     /* Build 4KB page table for the first 4MB (PD entry 0). */
     for (uint32_t i = 0; i < PT_ENTRIES; i++) {

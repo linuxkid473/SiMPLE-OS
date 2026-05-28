@@ -5,7 +5,10 @@
  * Linked together with libc.c for any program that needs stdio.
  */
 
-#include "stdio.h"
+/* stdio.c is compiled with -I user/include, so <stdio.h> resolves to
+ * user/include/stdio.h which forward-declares all our functions. */
+#include <stdio.h>
+#include <stddef.h>
 
 /* ---- internal syscall prototypes (provided by libc.c) ---- */
 int read(int fd, void *buf, int len);
@@ -226,16 +229,16 @@ char *fgets(char *buf, int size, FILE *f) {
 /* ================================================================
  * fread / fwrite
  * ================================================================ */
-int fwrite(const void *ptr, int size, int count, FILE *f) {
-    if (!f || !ptr || size <= 0 || count <= 0) return 0;
+size_t fwrite(const void *ptr, size_t size, size_t count, FILE *f) {
+    if (!f || !ptr || size == 0 || count == 0) return 0;
     const char *p = (const char *)ptr;
-    int total = size * count;
-    int done = 0;
+    size_t total = size * count;
+    size_t done = 0;
     while (done < total) {
         int space = FILE_BUF_SIZE - f->wpos;
-        int chunk = total - done;
-        if (chunk > space) chunk = space;
-        for (int i = 0; i < chunk; i++) f->wbuf[f->wpos++] = p[done + i];
+        size_t chunk = total - done;
+        if ((int)chunk > space) chunk = (size_t)space;
+        for (size_t i = 0; i < chunk; i++) f->wbuf[f->wpos++] = p[done + i];
         done += chunk;
         if (f->wpos >= FILE_BUF_SIZE) {
             if (_flush_write(f) < 0) break;
@@ -244,11 +247,11 @@ int fwrite(const void *ptr, int size, int count, FILE *f) {
     return done / size;
 }
 
-int fread(void *ptr, int size, int count, FILE *f) {
-    if (!f || !ptr || size <= 0 || count <= 0) return 0;
+size_t fread(void *ptr, size_t size, size_t count, FILE *f) {
+    if (!f || !ptr || size == 0 || count == 0) return 0;
     char *p = (char *)ptr;
-    int total = size * count;
-    int done = 0;
+    size_t total = size * count;
+    size_t done = 0;
     while (done < total) {
         int c = fgetc(f);
         if (c < 0) break;
@@ -361,14 +364,9 @@ static void _fmt_int(char **dst, int *rem, long v, int base,
     if (left) for (int i = num_width; i < width; i++) _out(dst, rem, ' ');
 }
 
-typedef __builtin_va_list va_list;
-#define va_start(v,l)  __builtin_va_start(v,l)
-#define va_arg(v,t)    __builtin_va_arg(v,t)
-#define va_end(v)      __builtin_va_end(v)
-
-int vsnprintf(char *buf, int size, const char *fmt, va_list ap) {
+int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
     char *dst = buf;
-    int rem = size;
+    int rem = (int)size;
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') { _out(&dst, &rem, *fmt); continue; }
@@ -468,7 +466,7 @@ int vsnprintf(char *buf, int size, const char *fmt, va_list ap) {
     return (int)((dst - buf) + (rem <= 0 ? 1 : 0));
 }
 
-int snprintf(char *buf, int size, const char *fmt, ...) {
+int snprintf(char *buf, size_t size, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int r = vsnprintf(buf, size, fmt, ap);
     va_end(ap);

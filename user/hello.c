@@ -1,356 +1,249 @@
-/* user/test_each.c - individual verbose test for each syscall 13-19 with 5s delays */
-#include "syscall.h"
+// posixstress.c
+// Comprehensive SiMPLE OS POSIX subsystem tester
 
-int write(const char *buf, int len);
-void exit(int code);
-int open(const char *path, int flags);
-int close(int fd);
-int fd_write(int fd, const void *buf, int len);
-int fork(void);
-int wait(void);
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 
-#define O_WRITE  2
-#define O_CREATE 4
+volatile int sigint_seen = 0;
 
-static void print(const char *s) { int l=0; while(s[l]) l++; write(s,l); }
-static void println(const char *s) { print(s); print("\n"); }
-static char *itoa(int n, char *buf) {
-    if(!n){buf[0]='0';buf[1]=0;return buf;}
-    int neg=0,i=0; char t[16];
-    if(n<0){neg=1;n=-n;}
-    while(n){t[i++]='0'+(n%10);n/=10;}
-    if(neg)t[i++]='-';
-    int j=0; while(i--)buf[j++]=t[i]; buf[j]=0; return buf;
-}
-static void print_int(int n) { char b[16]; print(itoa(n,b)); }
-static void print_uint(unsigned int n) { char b[16]; print(itoa((int)n,b)); }
-
-static void delay_5s(void) {
-    println("  [waiting 5 seconds...]");
-    sys_sleep(500);  /* 500 ticks at 100 Hz = 5 seconds */
+void sig_handler(int sig) {
+    printf("[signal] received signal %d\n", sig);
+    sigint_seen = 1;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 13: SYS_GETPID
-   ═════════════════════════════════════════════════════════════════ */
-void test_13_getpid(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 13: SYS_GETPID       ║");
-    println("╚═══════════════════════════╝");
-    
-    int pid = getpid();
-    print("  returned: ");
-    print_int(pid);
-    println("");
-    
-    if (pid > 0) {
-        print("  [PASS] getpid returned valid pid ");
-        print_int(pid);
-        println("");
-    } else {
-        println("  [FAIL] getpid returned invalid pid");
-    }
-    
-    delay_5s();
+void divider(const char* name) {
+    printf("\n==============================\n");
+    printf("%s\n", name);
+    printf("==============================\n");
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 14: SYS_SLEEP
-   ═════════════════════════════════════════════════════════════════ */
-void test_14_sleep(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 14: SYS_SLEEP        ║");
-    println("╚═══════════════════════════╝");
-    
-    unsigned int before = getticks();
-    print("  before: ");
-    print_uint(before);
-    println("");
-    
-    println("  sleeping 30 ticks...");
-    sys_sleep(30);
-    
-    unsigned int after = getticks();
-    print("  after:  ");
-    print_uint(after);
-    println("");
-    
-    unsigned int delta = after - before;
-    print("  delta:  ");
-    print_uint(delta);
-    println("");
-    
-    if (delta >= 30) {
-        print("  [PASS] slept at least 30 ticks (got ");
-        print_uint(delta);
-        println(")");
-    } else {
-        print("  [FAIL] woke too early (only ");
-        print_uint(delta);
-        println(" ticks)");
-    }
-    
-    delay_5s();
+void wait5() {
+    printf("\n[waiting 5 seconds]\n");
+    sleep(5);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 16: SYS_STAT
-   ═════════════════════════════════════════════════════════════════ */
-void test_16_stat(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 16: SYS_STAT         ║");
-    println("╚═══════════════════════════╝");
-    
-    println("  creating TEST13.TXT...");
-    int fd = open("TEST13.TXT", O_WRITE | O_CREATE);
-    if (fd < 0) {
-        println("  [FAIL] could not create file");
-        delay_5s();
-        return;
+void test_args(int argc, char** argv, char** envp) {
+    divider("ARGV / ENVP TEST");
+
+    printf("argc = %d\n", argc);
+
+    for(int i = 0; i < argc; i++) {
+        printf("argv[%d] = '%s'\n", i, argv[i]);
     }
-    fd_write(fd, "stat test data", 14);
-    close(fd);
-    println("  file created (14 bytes)");
-    
-    println("  calling stat(\"TEST13.TXT\", &st)...");
-    stat_t st;
-    int r = stat("TEST13.TXT", &st);
-    
-    print("  result: ");
-    print_int(r);
-    println("");
-    print("  exists: ");
-    print_int(st.exists);
-    println("");
-    print("  is_dir: ");
-    print_int(st.is_dir);
-    println("");
-    print("  size:   ");
-    print_uint(st.size);
-    println("");
-    
-    if (r == 0 && st.exists && st.size == 14) {
-        println("  [PASS] stat found file with correct size");
-    } else {
-        println("  [FAIL] stat returned wrong data");
+
+    int count = 0;
+
+    while(envp[count] && count < 5) {
+        printf("envp[%d] = '%s'\n", count, envp[count]);
+        count++;
     }
-    
-    println("  calling stat(\"NOFILE.TXT\", &st)...");
-    stat_t st2;
-    int r2 = stat("NOFILE.TXT", &st2);
-    print("  exists: ");
-    print_int(st2.exists);
-    println("");
-    
-    if (!st2.exists) {
-        println("  [PASS] stat correctly reports file not found");
-    } else {
-        println("  [FAIL] stat reports non-existent file as existing");
-    }
-    
-    delay_5s();
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 17: SYS_READDIR
-   ═════════════════════════════════════════════════════════════════ */
-void test_17_readdir(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 17: SYS_READDIR      ║");
-    println("╚═══════════════════════════╝");
-    
-    println("  calling readdir(\"/\", entries, 32)...");
-    dirent_t entries[32];
-    int count = readdir("/", entries, 32);
-    
-    print("  returned: ");
-    print_int(count);
-    println(" entries");
-    
-    if (count <= 0) {
-        println("  [FAIL] readdir returned no entries");
-        delay_5s();
-        return;
-    }
-    
-    println("  entries found:");
-    for (int i = 0; i < count && i < 5; i++) {
-        print("    ");
-        print(entries[i].is_dir ? "[DIR]  " : "[FILE] ");
-        print(entries[i].name);
-        print(" (");
-        print_uint(entries[i].size);
-        println(" bytes)");
-    }
-    
-    if (count > 5) {
-        print("    ... and ");
-        print_int(count - 5);
-        println(" more");
-    }
-    
-    println("  [PASS] readdir returned entries");
-    
-    delay_5s();
-}
+void test_stdio() {
+    divider("STDIO + FILE TEST");
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 18: SYS_RENAME
-   ═════════════════════════════════════════════════════════════════ */
-void test_18_rename(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 18: SYS_RENAME       ║");
-    println("╚═══════════════════════════╝");
-    
-    println("  creating OLDNAME.TXT...");
-    int fd = open("OLDNAME.TXT", O_WRITE | O_CREATE);
-    if (fd < 0) {
-        println("  [FAIL] could not create file");
-        delay_5s();
-        return;
-    }
-    fd_write(fd, "rename test", 11);
-    close(fd);
-    println("  file created");
+    FILE* f = fopen("/test.txt", "w");
 
-    println("  calling rename(\"OLDNAME.TXT\", \"NEWNAME.TXT\")...");
-    int r = rename("OLDNAME.TXT", "NEWNAME.TXT");
-    print("  result: ");
-    print_int(r);
-    println("");
-
-    if (r != 0) {
-        println("  [FAIL] rename returned non-zero");
-        delay_5s();
+    if(!f) {
+        printf("fopen failed\n");
         return;
     }
 
-    println("  checking old name...");
-    stat_t old_st;
-    stat("OLDNAME.TXT", &old_st);
-    print("  old file exists: ");
-    print_int(old_st.exists);
-    println("");
+    fprintf(f, "Hello from stdio layer!\n");
+    fprintf(f, "Number: %d\n", 12345);
 
-    println("  checking new name...");
-    stat_t new_st;
-    stat("NEWNAME.TXT", &new_st);
-    print("  new file exists: ");
-    print_int(new_st.exists);
-    println("");
+    fclose(f);
 
-    if (r == 0 && !old_st.exists && new_st.exists) {
-        println("  [PASS] rename worked correctly");
-    } else {
-        println("  [FAIL] rename did not work as expected");
+    f = fopen("/test.txt", "r");
+
+    if(!f) {
+        printf("reopen failed\n");
+        return;
     }
-    
-    delay_5s();
+
+    char buf[128];
+
+    while(fgets(buf, sizeof(buf), f)) {
+        printf("READ: %s", buf);
+    }
+
+    fclose(f);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 19: SYS_GETTICKS
-   ═════════════════════════════════════════════════════════════════ */
-void test_19_getticks(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 19: SYS_GETTICKS     ║");
-    println("╚═══════════════════════════╝");
-    
-    unsigned int t1 = getticks();
-    print("  t1 = ");
-    print_uint(t1);
-    println("");
-    
-    volatile int x = 0;
-    for (int i = 0; i < 300000; i++) x += i;
-    
-    unsigned int t2 = getticks();
-    print("  t2 = ");
-    print_uint(t2);
-    println("");
-    
-    print("  delta = ");
-    print_uint(t2 - t1);
-    println("");
-    
-    if (t2 >= t1) {
-        println("  [PASS] tick counter is monotonic");
-    } else {
-        println("  [FAIL] tick counter went backwards");
+void test_pipe() {
+    divider("PIPE + BLOCKING TEST");
+
+    int p[2];
+
+    if(pipe(p) < 0) {
+        printf("pipe failed\n");
+        return;
     }
-    
-    delay_5s();
+
+    int pid = fork();
+
+    if(pid == 0) {
+        printf("[child] sleeping before write...\n");
+        sleep(2);
+
+        write(p[1], "abc", 3);
+
+        printf("[child] wrote to pipe\n");
+
+        exit(0);
+    }
+
+    char buf[4];
+
+    memset(buf, 0, sizeof(buf));
+
+    printf("[parent] blocking on read...\n");
+
+    read(p[0], buf, 3);
+
+    printf("[parent] read returned: '%s'\n", buf);
+
+    waitpid(pid, NULL, 0);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TEST 11/12: SYS_FORK + SYS_WAIT
-   ═════════════════════════════════════════════════════════════════ */
-void test_11_12_fork_wait(void) {
-    println("\n╔═══════════════════════════╗");
-    println("║ TEST 11/12: FORK + WAIT   ║");
-    println("╚═══════════════════════════╝");
-    
-    int parent_pid = getpid();
-    print("  parent pid = ");
-    print_int(parent_pid);
-    println("");
-    
-    println("  calling fork()...");
-    int child_pid = fork();
-    
-    if (child_pid == 0) {
-        /* child */
-        int my_pid = getpid();
-        print("  [CHILD] my pid = ");
-        print_int(my_pid);
-        println("");
-        
-        println("  [CHILD] exiting with code 99...");
-        exit(99);
-    } else if (child_pid > 0) {
-        /* parent */
-        print("  [PARENT] child pid = ");
-        print_int(child_pid);
-        println("");
-        
-        println("  [PARENT] calling wait()...");
-        int exit_code = wait();
-        print("  [PARENT] child exited with code ");
-        print_int(exit_code);
-        println("");
-        
-        if (child_pid > 0 && exit_code == 99) {
-            println("  [PASS] fork and wait worked correctly");
-        } else {
-            println("  [FAIL] fork or wait returned wrong values");
+void test_fork_wait() {
+    divider("FORK + WAITPID TEST");
+
+    int pid = fork();
+
+    if(pid == 0) {
+        printf("[child] pid=%d\n", getpid());
+
+        sleep(1);
+
+        exit(42);
+    }
+
+    int status = 0;
+
+    int r = waitpid(pid, &status, 0);
+
+    printf("[parent] waitpid returned %d\n", r);
+    printf("[parent] raw status = %d\n", status);
+}
+
+void test_signals() {
+    divider("SIGNAL TEST");
+
+    signal(SIGINT, sig_handler);
+
+    printf("sending SIGINT to self...\n");
+
+    kill(getpid(), SIGINT);
+
+    sleep(1);
+
+    printf("sigint_seen = %d\n", sigint_seen);
+}
+
+void test_dirent() {
+    divider("DIRENT TEST");
+
+    DIR* d = opendir("/");
+
+    if(!d) {
+        printf("opendir failed\n");
+        return;
+    }
+
+    struct dirent* ent;
+
+    while((ent = readdir(d))) {
+        printf("dir: %s\n", ent->d_name);
+    }
+
+    closedir(d);
+}
+
+void test_ansi() {
+    divider("ANSI / VT100 TEST");
+
+    printf("\x1b[31mRED TEXT\x1b[0m\n");
+    printf("\x1b[32mGREEN TEXT\x1b[0m\n");
+    printf("\x1b[34mBLUE TEXT\x1b[0m\n");
+
+    sleep(1);
+
+    printf("\x1b[10;10HCursor moved to row 10 col 10\n");
+
+    sleep(1);
+
+    printf("\x1b[2J");
+
+    printf("Screen cleared.\n");
+}
+
+void test_malloc() {
+    divider("MALLOC TEST");
+
+    for(int i = 0; i < 10; i++) {
+        char* p = malloc(128);
+
+        if(!p) {
+            printf("malloc failed at %d\n", i);
+            return;
         }
-    } else {
-        println("  [FAIL] fork returned negative (failed)");
+
+        memset(p, 'A' + i, 127);
+
+        p[127] = 0;
+
+        printf("alloc[%d] = %.16s...\n", i, p);
+
+        free(p);
     }
-    
-    delay_5s();
+
+    printf("malloc/free cycle complete\n");
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   MAIN
-   ═════════════════════════════════════════════════════════════════ */
-void _start(void) {
-    println("\n╔════════════════════════════════════╗");
-    println("║  SiMPLE OS Syscalls 13-19 Tests   ║");
-    println("║   (5 second delays between tests)  ║");
-    println("╚════════════════════════════════════╝");
-    
-    test_13_getpid();
-    test_14_sleep();
-    test_16_stat();
-    test_17_readdir();
-    test_18_rename();
-    test_19_getticks();
-    test_11_12_fork_wait();
-    
-    println("\n╔════════════════════════════════════╗");
-    println("║         ALL TESTS DONE             ║");
-    println("╚════════════════════════════════════╝\n");
-    
-    exit(0);
+int main(int argc, char** argv, char** envp) {
+
+    printf("\n");
+    printf("====================================\n");
+    printf(" SiMPLE OS POSIX SUBSYSTEM TESTER\n");
+    printf("====================================\n");
+
+    test_args(argc, argv, envp);
+    wait5();
+
+    test_stdio();
+    wait5();
+
+    test_pipe();
+    wait5();
+
+    test_fork_wait();
+    wait5();
+
+    test_signals();
+    wait5();
+
+    test_dirent();
+    wait5();
+
+    test_ansi();
+    wait5();
+
+    test_malloc();
+    wait5();
+
+    divider("ALL TESTS COMPLETE");
+
+    while(1) {
+        sleep(1);
+    }
+
+    return 0;
 }

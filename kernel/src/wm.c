@@ -137,6 +137,21 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 #define COL_MENU_BD       0x888888   /* launcher dropdown border           */
 #define COL_MENU_FG       0xFFFFFF   /* launcher menu item text            */
 #define COL_STEXT_FG      0xCCCCCC   /* SText editor text colour           */
+#define COL_MENUBAR_BG    0x111133   /* top menu bar background            */
+#define COL_DOCK_BG       0x0D0D22   /* bottom dock background             */
+#define COL_DOCK_BTN_BG   0x223399   /* dock button background             */
+#define COL_DOCK_BTN_BD   0x4455CC   /* dock button border                 */
+#define COL_DOCK_BTN_FG   0xFFFFFF   /* dock button label text             */
+
+/* ---- Permanent UI chrome heights ---- */
+#define UI_MENUBAR_H  24   /* top menu bar height (px)  */
+#define UI_DOCK_H     52   /* bottom dock height  (px)  */
+
+/* ---- Dock button geometry ---- */
+#define DOCK_BTN_W    64
+#define DOCK_BTN_H    40
+#define DOCK_BTN_GAP  12
+#define DOCK_NITEMS    3
 
 /* ================================================================
  * Calculator state machine
@@ -733,18 +748,22 @@ static void wm_spawn(wm_win_type_t type) {
     w->instance = inst;
     w->hidden   = 0;
 
+    /* Available vertical range: below menu bar, above dock */
+    int avail_y  = UI_MENUBAR_H;
+    int avail_h  = scr_h - UI_DOCK_H - UI_MENUBAR_H;
+
     if (type == WM_TYPE_TERMINAL) {
-        w->x = 2 + offset;  w->y = 2 + offset;
+        w->x = 2 + offset;  w->y = avail_y + 2 + offset;
         w->width = WM_TERM_W;  w->height = WM_TERM_H;
         w->title = "STerm";
     } else if (type == WM_TYPE_CALC) {
         w->x = (scr_w - WM_CALC_W)  / 2 + offset;
-        w->y = (scr_h - WM_CALC_H)  / 2 + offset;
+        w->y = avail_y + (avail_h - WM_CALC_H)  / 2 + offset;
         w->width = WM_CALC_W;  w->height = WM_CALC_H;
         w->title = "Calculator";
     } else {
         w->x = (scr_w - WM_STEXT_W) / 2 + offset;
-        w->y = (scr_h - WM_STEXT_H) / 2 + offset;
+        w->y = avail_y + (avail_h - WM_STEXT_H) / 2 + offset;
         w->width = WM_STEXT_W;  w->height = WM_STEXT_H;
         w->title = "SText";
     }
@@ -906,9 +925,9 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
         w->x = x - drag_off_x;
         w->y = y - drag_off_y;
         if (w->x < 0)                w->x = 0;
-        if (w->y < 0)                w->y = 0;
+        if (w->y < UI_MENUBAR_H)     w->y = UI_MENUBAR_H;
         if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
-        if (w->y + w->height > scr_h) w->y = scr_h - w->height;
+        if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
     }
 
     /* ---- Button released → end drag ---- */
@@ -989,6 +1008,15 @@ void wm_draw_all(void) {
      * last active terminal's settings intact so vga_putc still works.
      */
 
+    /*
+     * The kernel's built-in menubar and dock chrome are intentionally NOT
+     * drawn here.  desktop.elf provides its own menu bar and dock as USER
+     * windows, giving richer interaction and a user-space-managed layout.
+     * Drawing both would produce overlapping chrome.
+     *
+     * The launcher ("Apps" dropdown, top-left) is kept as a fallback for
+     * sessions where desktop.elf is not running.
+     */
     draw_launcher();
     draw_cursor(mouse_get_x(), mouse_get_y());
 }
@@ -1018,9 +1046,14 @@ void wm_init(int sw, int sh) {
     /* wm_active must be a valid index before wm_set_active's save check runs */
     wm_active = 0;
 
-    /* Auto-spawn the initial terminal so the shell has somewhere to write */
+    /* Spawn the initial terminal — desktop.elf is no longer auto-run. */
     wm_spawn(WM_TYPE_TERMINAL);
 
+    wm_draw_all();
+}
+
+void wm_spawn_terminal(void) {
+    wm_spawn(WM_TYPE_TERMINAL);
     wm_draw_all();
 }
 
@@ -1042,9 +1075,9 @@ void wm_handle_key(int key_type) {
     w->y += dy;
 
     if (w->x < 0)               w->x = 0;
-    if (w->y < 0)               w->y = 0;
+    if (w->y < UI_MENUBAR_H)    w->y = UI_MENUBAR_H;
     if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
-    if (w->y + w->height > scr_h) w->y = scr_h - w->height;
+    if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
 
     wm_draw_all();
 }
@@ -1207,11 +1240,39 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
      * SYS_WM_DESTROY (21)
      *   a = wid
      * Hides the window and frees its slot.  Returns 0 or -EBADF.
+     *
+     * NOTE: we do NOT call wm_close_window() here, because that
+     * function pushes a WM_EV_CLOSE event to wm_eq for WM_TYPE_USER
+     * windows.  When the app itself calls wm_destroy() it already
+     * knows it is exiting — the event is unnecessary.  Worse, it
+     * poisons wm_eq: the next WM program dequeues the stale CLOSE
+     * event as its very first event and immediately quits.
+     *
+     * wm_close_window() is still used from the mouse-handler path
+     * (close-button click) where pushing CLOSE is the correct
+     * mechanism to notify the app that the user dismissed the window.
      * ---------------------------------------------------------- */
     case 21: {
         int wid = (int)a;
         if (!uw_valid(wid)) return -(int32_t)9;   /* -EBADF */
-        wm_close_window(wid);
+        {
+            wm_window_t *w = &wm_windows[wid];
+            /* Free pixel backing store reference (kernel owns the buffer) */
+            w->pixels = (uint32_t *)0;
+            w->hidden = 1;
+
+            /* Cancel any active drag on this window */
+            if (drag_win_idx == wid) { drag_active = 0; drag_win_idx = -1; }
+
+            /* Transfer focus to another visible window, if one exists */
+            if (wm_active == wid) {
+                int found = -1;
+                for (int i = 0; i < WM_MAX_WINDOWS; i++)
+                    if (!wm_windows[i].hidden) { found = i; break; }
+                if (found >= 0)
+                    wm_set_active(found);
+            }
+        }
         wm_draw_all();
         return 0;
     }

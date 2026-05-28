@@ -121,15 +121,22 @@ launch_ring3(uint32_t entry   __attribute__((unused)),
 /*
  * Build the Linux i386 initial stack layout just below USER_INITIAL_SP:
  *
- *   [esp]          argc        (always 1 — argv[0] = program path)
- *   [esp+4]        argv[0]     (pointer to path string below)
- *   [esp+8]        NULL        (argv terminator)
- *   [esp+12]       NULL        (envp terminator — no environment)
- *   [esp+16]       AT_NULL(0)  (auxv type)
- *   [esp+20]       0           (auxv value)
- *   [esp+24...]    path string
+ *   [esp]          EXIT_STUB_ADDR  (fake return addr — if _start returns, exits cleanly)
+ *   [esp+4]        argc            (always 1 — argv[0] = program path)
+ *   [esp+8]        argv[0]         (pointer to path string below)
+ *   [esp+12]       NULL            (argv terminator)
+ *   [esp+16]       NULL            (envp terminator — no environment)
+ *   [esp+20]       AT_NULL(0)      (auxv type)
+ *   [esp+24]       0               (auxv value)
+ *   [esp+28...]    path string
  *
- * Returns the new user ESP (points at argc).
+ * The fake return address at [esp] means that a _start() that falls off the
+ * end with a plain `ret` will jump to EXIT_STUB_ADDR (mov $1,%eax; int $0x80)
+ * and exit cleanly instead of crashing with an invalid EIP.
+ *
+ * crt0.c reads argc from [esp+4] (not [esp]) to skip the return address.
+ *
+ * Returns the new user ESP (points at EXIT_STUB_ADDR).
  */
 uint32_t build_posix_stack(const char *path) {
     uint8_t *top = (uint8_t *)USER_INITIAL_SP;
@@ -157,6 +164,13 @@ uint32_t build_posix_stack(const char *path) {
 
     /* argc = 1 */
     p -= 4; *(uint32_t *)p = 1;
+
+    /*
+     * Fake return address: if _start() executes a bare `ret` without calling
+     * exit(), it pops this address and lands at the exit stub rather than at
+     * whatever garbage was in argc (which previously caused EIP=1 crashes).
+     */
+    p -= 4; *(uint32_t *)p = EXIT_STUB_ADDR;
 
     return (uint32_t)p;
 }
@@ -196,7 +210,7 @@ int exec_elf(void *data) {
         }
     }
 
-    /* Bounds check: refuse anything outside user space. */
+    /* Bounds-check: refuse anything outside user space or with malformed fields. */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
         uint32_t dest_start = phdr[i].p_vaddr + base;
@@ -204,6 +218,15 @@ int exec_elf(void *data) {
         if (dest_start < USER_BASE || dest_end > USER_STACK) {
             klog_hex("elf", "unsafe load dest", dest_start);
             vga_write_line("ELF: load region outside user space — refused");
+            return -1;
+        }
+        if (phdr[i].p_filesz > phdr[i].p_memsz) {
+            vga_write_line("ELF: p_filesz > p_memsz — refused");
+            return -1;
+        }
+        /* p_offset + p_filesz must not overflow */
+        if (phdr[i].p_offset + phdr[i].p_filesz < phdr[i].p_offset) {
+            vga_write_line("ELF: p_offset overflow — refused");
             return -1;
         }
     }
@@ -219,16 +242,30 @@ int exec_elf(void *data) {
      */
     paging_switch_dir(paging_get_page_dir());
 
-    /* Copy segments and zero BSS. */
+    /* Copy segments and zero BSS.
+     * Clamp filesz to what was actually read so we never walk off the buffer. */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
         uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr + base);
         uint8_t *src  = (uint8_t *)data + phdr[i].p_offset;
-        for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
-        for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) dest[j] = 0;
+        uint32_t filesz = phdr[i].p_filesz;
+        uint32_t memsz  = phdr[i].p_memsz;
+        /* Don't read past the ELF_LOAD_BUF we were given */
+        if (phdr[i].p_offset < ELF_LOAD_BUF &&
+            filesz > ELF_LOAD_BUF - phdr[i].p_offset)
+            filesz = ELF_LOAD_BUF - phdr[i].p_offset;
+        for (uint32_t j = 0; j < filesz; j++) dest[j] = src[j];
+        for (uint32_t j = filesz; j < memsz; j++) dest[j] = 0;
     }
 
     uint32_t entry = ehdr->e_entry + base;
+
+    /* Validate entry point is within the user code region */
+    if (entry < USER_BASE || entry >= USER_STACK) {
+        klog_hex("elf", "entry out of range", entry);
+        vga_write_line("ELF: entry point outside user space — refused");
+        return -1;
+    }
 
     /*
      * Plant stubs in the user stack area:

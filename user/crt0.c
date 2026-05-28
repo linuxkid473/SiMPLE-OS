@@ -2,11 +2,12 @@
  * user/crt0.c — C runtime entry point for POSIX programs.
  *
  * The kernel plants a POSIX-style initial stack (build_posix_stack):
- *   [esp]   = argc
- *   [esp+4] = argv[0]  (program path)
- *   [esp+8] = NULL     (argv terminator)
- *   [esp+12]= NULL     (envp terminator)
- *   [esp+16]= AT_NULL  (auxv)
+ *   [esp]   = EXIT_STUB_ADDR  (fake return address — so bare `ret` exits cleanly)
+ *   [esp+4] = argc
+ *   [esp+8] = argv[0]  (program path)
+ *   [esp+12]= NULL     (argv terminator)
+ *   [esp+16]= NULL     (envp terminator)
+ *   [esp+20]= AT_NULL  (auxv)
  *
  * _start reads argc/argv/envp from the stack and calls main().
  * Programs that link crt0.c must define main() instead of _start().
@@ -20,9 +21,9 @@ extern char **environ;
 
 __attribute__((naked)) void _start(void) {
     __asm__ volatile (
-        /* esp points to argc */
-        "movl  (%%esp),  %%eax\n\t"   /* eax = argc */
-        "leal 4(%%esp),  %%ecx\n\t"   /* ecx = argv (= &argv[0]) */
+        /* esp+0 = fake return addr (EXIT_STUB_ADDR), esp+4 = argc */
+        "movl 4(%%esp),  %%eax\n\t"   /* eax = argc */
+        "leal 8(%%esp),  %%ecx\n\t"   /* ecx = argv (= &argv[0]) */
         "leal 4(%%ecx, %%eax, 4), %%edx\n\t" /* edx = envp (past argv+NULL) */
 
         /* align stack to 16 bytes before call (System V i386 ABI) */

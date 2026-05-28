@@ -24,9 +24,12 @@
 #include "types.h"
 #include "vga.h"
 
-/* Minimum valid userspace pointer */
-#define USER_ADDR_MIN 0x300000UL
-#define USER_ADDR_MAX 0xF00000UL
+/* Valid userspace pointer range.
+ * USER_ADDR_MIN : bottom of user ELF region  (= USER_BASE, 0x300000)
+ * USER_ADDR_MAX : top of user heap ceiling   (= PROC_BRK_MAX, 0x700000)
+ * Anything outside this window is either kernel memory or unmapped. */
+#define USER_ADDR_MIN  0x300000UL
+#define USER_ADDR_MAX  0x700000UL   /* must equal PROC_BRK_MAX */
 
 static fat16_fs_t *g_fs          = NULL;
 static fd_table_t  g_fd_table;
@@ -52,9 +55,14 @@ fd_table_t *syscall_get_fd_table(void) {
 
 static int user_ptr_ok(const void *ptr, uint32_t len) {
     uint32_t addr = (uint32_t)ptr;
-    if (!ptr)                       return 0;
-    if (addr < USER_ADDR_MIN)       return 0;
-    if (len > 0 && (addr + len) < addr) return 0;
+    if (!ptr)                           return 0;
+    if (addr < USER_ADDR_MIN)           return 0;
+    if (addr > USER_ADDR_MAX)           return 0;   /* in kernel or unmapped range */
+    if (len > 0) {
+        uint32_t end = addr + len;
+        if (end < addr)                 return 0;   /* wrap-around overflow */
+        if (end > USER_ADDR_MAX)        return 0;   /* past user ceiling */
+    }
     return 1;
 }
 
@@ -62,6 +70,7 @@ static int user_ptr_ok(const void *ptr, uint32_t len) {
 
 int32_t sys_write(const char *buf, uint32_t len) {
     if (len == 0) return 0;
+    if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
     if (len > 0x8000) len = 0x8000;
     for (uint32_t i = 0; i < len; i++)
         vga_putc(buf[i]);
@@ -114,7 +123,9 @@ int32_t sys_close(int32_t fd) {
     return (int32_t)fd_close(syscall_get_fd_table(), (int)fd);
 }
 
-#define FREAD_BUF_SIZE (8 * 1024)
+/* File-read staging buffer.  Kernel BSS; must stay < 0x200000 (kmalloc base).
+ * 64 KB handles all text/config files; ELF loading uses a separate path. */
+#define FREAD_BUF_SIZE (64 * 1024)
 static char fread_buf[FREAD_BUF_SIZE];
 
 int32_t sys_fread(int32_t fd, char *buf, uint32_t max_len) {
@@ -193,17 +204,6 @@ int32_t sys_seek(int32_t fd, int32_t offset, int32_t whence) {
     return new_pos;
 }
 
-#define EXEC_BUF_SIZE (64 * 1024)
-static uint8_t exec_buf[EXEC_BUF_SIZE];
-
-/* Old-style exit stub using old syscall 2 ABI */
-static const uint8_t exec_exit_stub_old[] = {
-    0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov $1, %eax   (SYS_EXIT Linux) */
-    0x31, 0xDB,                      /* xor %ebx, %ebx */
-    0xCD, 0x80,                      /* int $0x80 */
-    0xF4                             /* hlt */
-};
-
 /* Sigreturn trampoline: mov $119, %eax; int $0x80; hlt */
 static const uint8_t sigreturn_trampoline[] = {
     0xB8, 0x77, 0x00, 0x00, 0x00,  /* mov $119, %eax (SYS_SIGRETURN) */
@@ -220,33 +220,61 @@ static const uint8_t exit_stub_bytes[] = {
 };
 
 static void plant_user_stubs(void) {
-    /* Plant sigreturn trampoline at SIG_TRAMPOLINE_ADDR */
     uint8_t *tramp = (uint8_t *)SIG_TRAMPOLINE_ADDR;
     for (uint32_t i = 0; i < sizeof(sigreturn_trampoline); i++)
         tramp[i] = sigreturn_trampoline[i];
 
-    /* Plant exit stub at EXIT_STUB_ADDR */
     uint8_t *xstub = (uint8_t *)EXIT_STUB_ADDR;
     for (uint32_t i = 0; i < sizeof(exit_stub_bytes); i++)
         xstub[i] = exit_stub_bytes[i];
 }
 
+/*
+ * sys_exec — replace the current process image with a new ELF.
+ *
+ * Buffer strategy: we read the ELF file directly into user space (0x300000),
+ * which is 1 MB and can hold any program on disk.  Because exec() is about
+ * to overwrite user space anyway, reusing it as a load staging area is safe.
+ *
+ * The ELF segment copy is forward (dest ≤ src for our linker layout,
+ * p_vaddr=0x300000 / p_offset=0x60), so in-place copy never reads from
+ * an address it has already overwritten.  All segment metadata is saved into
+ * local variables before the first byte is copied, so clobbering the ELF
+ * header during the copy is harmless.
+ *
+ * This path is used by child processes after fork()+exec(); the kernel's
+ * shell uses exec_elf() directly.
+ */
 int32_t sys_exec(const char *path, registers_t *regs) {
-    if (!user_ptr_ok(path, 1)) return -(int32_t)EINVAL;
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
 
     const char *name = strip_slash(path);
     if (!*name) return -(int32_t)EINVAL;
-    if (!g_fs) return -(int32_t)EIO;
+    if (!g_fs)  return -(int32_t)EIO;
 
-    uint32_t out_len = 0;
-    int rc = fat16_read_file(g_fs, 0, name, (char *)exec_buf, EXEC_BUF_SIZE, &out_len);
+    /*
+     * Read ELF file directly into user space.  The current page directory
+     * (whether kernel's or a child's after fork) maps virtual 0x300000 as
+     * writable from ring-0, so fat16_read_file can write here safely.
+     */
+    uint8_t  *load_buf = (uint8_t *)USER_BASE;          /* 0x300000 */
+    uint32_t  max_read  = USER_STACK - USER_BASE;        /* 1 MB     */
+    uint32_t  out_len   = 0;
+    int rc = fat16_read_file(g_fs, 0, name, (char *)load_buf, max_read, &out_len);
     if (rc != FAT16_OK) return -(int32_t)ENOENT;
+    if (out_len < sizeof(Elf32_Ehdr)) return -(int32_t)ENOEXEC;
 
-    if (elf_validate(exec_buf) != 0) return -(int32_t)ENOEXEC;
+    if (elf_validate(load_buf) != 0) return -(int32_t)ENOEXEC;
 
-    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)exec_buf;
-    Elf32_Phdr *phdr = (Elf32_Phdr *)(exec_buf + ehdr->e_phoff);
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)load_buf;
+    Elf32_Phdr *phdr = (Elf32_Phdr *)(load_buf + ehdr->e_phoff);
 
+    /* Sanity-check phdr pointer stays within what we read */
+    uint32_t phdr_end = (uint32_t)ehdr->e_phoff +
+                        (uint32_t)ehdr->e_phnum * sizeof(Elf32_Phdr);
+    if (phdr_end > out_len) return -(int32_t)ENOEXEC;
+
+    /* Compute load bias from first PT_LOAD */
     uint32_t base = 0;
     int found_load = 0;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -258,33 +286,74 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     }
     if (!found_load) return -(int32_t)ENOEXEC;
 
+    /* Validate all PT_LOAD segments stay within user space */
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
-        uint32_t dest_start = phdr[i].p_vaddr + base;
-        uint32_t dest_end   = dest_start + phdr[i].p_memsz;
-        if (dest_start < USER_BASE || dest_end > USER_STACK)
+        uint32_t dst_start = phdr[i].p_vaddr + base;
+        uint32_t dst_end   = dst_start + phdr[i].p_memsz;
+        if (dst_start < USER_BASE || dst_end > USER_STACK)
             return -(int32_t)ENOEXEC;
+        if (phdr[i].p_filesz > phdr[i].p_memsz)
+            return -(int32_t)ENOEXEC;  /* malformed */
+        if (phdr[i].p_offset + phdr[i].p_filesz < phdr[i].p_offset)
+            return -(int32_t)ENOEXEC;  /* overflow */
     }
 
-    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type != PT_LOAD) continue;
-        uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr + base);
-        uint8_t *src  = exec_buf + phdr[i].p_offset;
-        for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
-        for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) dest[j] = 0;
-    }
-
+    /* Save entry + segment descriptors BEFORE in-place copy clobbers ELF headers */
     uint32_t entry = ehdr->e_entry + base;
+    if (entry < USER_BASE || entry >= USER_STACK) return -(int32_t)ENOEXEC;
 
-    /* Plant stubs */
+    typedef struct { uint32_t dest, filesz, memsz, src_off; } seg_t;
+    seg_t saved[8];
+    int nseg = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum && nseg < 8; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t avail = (phdr[i].p_offset <= out_len)
+                         ? (out_len - phdr[i].p_offset) : 0U;
+        saved[nseg].dest    = phdr[i].p_vaddr + base;
+        saved[nseg].filesz  = (phdr[i].p_filesz <= avail)
+                               ? phdr[i].p_filesz : avail;
+        saved[nseg].memsz   = phdr[i].p_memsz;
+        saved[nseg].src_off = phdr[i].p_offset;
+        nseg++;
+    }
+
+    /*
+     * In-place segment copy.  For our ELF layout (p_vaddr=0x300000,
+     * p_offset=0x60), dest == load_buf and src == load_buf+0x60, so the
+     * forward copy (dest[j] = src[j], j ascending) never reads past what
+     * has already been written.
+     */
+    for (int i = 0; i < nseg; i++) {
+        uint8_t *dest = (uint8_t *)saved[i].dest;
+        uint8_t *src  = load_buf + saved[i].src_off;
+        for (uint32_t j = 0; j < saved[i].filesz; j++) dest[j] = src[j];
+        for (uint32_t j = saved[i].filesz; j < saved[i].memsz; j++) dest[j] = 0;
+    }
+
+    /* Reset brk to start of heap for the newly exec'd program */
+    if (current_proc >= 0)
+        proc_table[current_proc].brk = 0x400000U;
+
+    /* Close any O_CLOEXEC file descriptors */
+    if (current_proc >= 0) {
+        fd_table_t *fdt = &proc_table[current_proc].fd_table;
+        for (int fd = 0; fd < FD_MAX; fd++) {
+            if (fdt->fds[fd].type != FD_NONE && fdt->fds[fd].cloexec)
+                fd_close(fdt, fd);
+        }
+    }
+
+    /* Plant kernel stubs in user stub area */
     plant_user_stubs();
 
-    /* Build POSIX initial stack (argc/argv/envp/auxv) */
+    /* Build POSIX initial stack */
     uint32_t new_sp = build_posix_stack(name);
 
+    /* Redirect iret to the new entry point */
     regs->eip     = entry;
     regs->cs      = SEG_UCODE;
-    regs->eflags  = 0x202;
+    regs->eflags  = 0x202;        /* IF=1, always */
     regs->useresp = new_sp;
     regs->ss      = SEG_UDATA;
 
