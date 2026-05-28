@@ -241,8 +241,8 @@ user/calc.elf: user/calc.c $(LEGACY_RUNTIME_DEPS)
 user/term.elf: user/term.c $(LEGACY_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/term.c $(LEGACY_RUNTIME_SRCS)
 
-user/desktop.elf: user/desktop.c $(LEGACY_RUNTIME_DEPS)
-	$(USER_CC) -o $@ user/desktop.c $(LEGACY_RUNTIME_SRCS)
+user/desktop.elf: user/desktop.c user/dirent.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/desktop.c user/dirent.c $(LEGACY_RUNTIME_SRCS)
 
 user/paint.elf: user/paint.c $(LEGACY_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/paint.c $(LEGACY_RUNTIME_SRCS)

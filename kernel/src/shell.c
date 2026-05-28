@@ -12,6 +12,7 @@
 #include "string.h"
 #include "syscall.h"
 #include "vga.h"
+#include "wm.h"
 
 #define SHELL_LINE_MAX 256
 #define CAT_BUFFER_MAX 8192
@@ -1168,8 +1169,10 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
     cwd_cluster = 0;
     cwd_depth   = 0;
 
-    if (fs_ready)
+    if (fs_ready) {
         syscall_set_fs(fs);
+        wm_set_fs(fs);
+    }
 
     while (1) {
         build_prompt();

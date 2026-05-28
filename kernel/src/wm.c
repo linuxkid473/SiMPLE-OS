@@ -5,6 +5,8 @@
 #include "string.h"
 #include "io.h"
 #include "kmalloc.h"
+#include "fat16.h"
+#include "elf.h"
 
 /* ================================================================
  * Global window state
@@ -47,6 +49,7 @@ static void wm_push_event_internal(wm_event_t e) {
  * the desktop, on top of all windows (rendered last, hit-tested
  * first).  Clicking it toggles a small dropdown menu.
  * ================================================================ */
+/* launcher_open: 0=closed  1=main menu  2=ELF browser */
 static int launcher_open = 0;
 
 /* Launcher button — fixed screen position */
@@ -60,7 +63,31 @@ static int launcher_open = 0;
 #define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
 #define LNCHR_MENU_W  100
 #define LNCHR_ITEM_H   16
-#define LNCHR_NITEMS    3   /* STerm, Calculator, SText; add entries here for more apps */
+#define LNCHR_NITEMS    4   /* STerm, Calculator, SText, Run App... */
+
+/* ELF browser panel dimensions */
+#define LNCHR_BROWSER_W    164
+#define LNCHR_BROWSER_MAX   20
+
+/* FAT16 filesystem reference — set by wm_set_fs() from shell_run */
+static fat16_fs_t    *wm_fs = (fat16_fs_t *)0;
+static fat16_dirent_t wm_elf_entries[LNCHR_BROWSER_MAX];
+static int            wm_elf_count = 0;
+
+/*
+ * Re-entrancy guard for exec_elf().
+ *
+ * When a ring-3 app is running it calls SYS_WM_EVENT which pumps PS/2
+ * input via wm_pump_input → wm_handle_mouse.  If the user opens the ELF
+ * browser and clicks a second ELF from there, exec_elf() would be called
+ * while already inside a syscall handler for the first app.  That nested
+ * call does kmalloc_reset() (destroying the live app's pixel buffers) and
+ * corrupts the saved kernel ESP in launch_ring3 → EIP=0 page fault.
+ *
+ * wm_app_running is set to 1 around any exec_elf() launch and checked
+ * before entering the browser launch path.
+ */
+static int wm_app_running = 0;
 
 /* ================================================================
  * Calculator button grid
@@ -618,23 +645,66 @@ static void draw_launcher(void) {
 
     if (!launcher_open) return;
 
-    /* Dropdown menu */
-    int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2;   /* 1-px border top + bottom */
-    fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_MENU_W, menu_h, COL_MENU_BG);
-    /* border */
-    fb_fill_rect(LNCHR_MENU_X,                   LNCHR_MENU_Y,              LNCHR_MENU_W, 1,       COL_MENU_BD);
-    fb_fill_rect(LNCHR_MENU_X,                   LNCHR_MENU_Y + menu_h - 1, LNCHR_MENU_W, 1,       COL_MENU_BD);
-    fb_fill_rect(LNCHR_MENU_X,                   LNCHR_MENU_Y,              1,             menu_h, COL_MENU_BD);
-    fb_fill_rect(LNCHR_MENU_X + LNCHR_MENU_W - 1, LNCHR_MENU_Y,            1,             menu_h, COL_MENU_BD);
-    /* item 0: STerm */
-    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 4,
-                      "STerm", COL_MENU_FG, COL_MENU_BG);
-    /* item 1: Calculator */
-    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
-                      "Calculator", COL_MENU_FG, COL_MENU_BG);
-    /* item 2: SText */
-    fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 2 * LNCHR_ITEM_H + 4,
-                      "SText", COL_MENU_FG, COL_MENU_BG);
+    if (launcher_open == 1) {
+        /* ---- Main dropdown menu ---- */
+        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2;   /* 1-px border top + bottom */
+        fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_MENU_W, menu_h, COL_MENU_BG);
+        /* border */
+        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              LNCHR_MENU_W, 1,       COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y + menu_h - 1, LNCHR_MENU_W, 1,       COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              1,             menu_h, COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X + LNCHR_MENU_W - 1, LNCHR_MENU_Y,             1,             menu_h, COL_MENU_BD);
+        /* item 0: STerm */
+        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 4,
+                          "STerm", COL_MENU_FG, COL_MENU_BG);
+        /* item 1: Calculator */
+        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
+                          "Calculator", COL_MENU_FG, COL_MENU_BG);
+        /* item 2: SText */
+        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 2 * LNCHR_ITEM_H + 4,
+                          "SText", COL_MENU_FG, COL_MENU_BG);
+        /* item 3: Run App... (dim if no FS or another app is already running) */
+        {
+            uint32_t col = (wm_fs && !wm_app_running) ? COL_MENU_FG : 0x666699u;
+            fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 3 * LNCHR_ITEM_H + 4,
+                              "Run App...", col, COL_MENU_BG);
+        }
+    } else {
+        /* ---- ELF browser panel (launcher_open == 2) ---- */
+        int rows = wm_elf_count + 1; /* +1 for "< Back" row */
+        if (rows < 2) rows = 2;      /* minimum: "< Back" + placeholder */
+        int browser_h = rows * LNCHR_ITEM_H + 2;
+
+        fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_BROWSER_W, browser_h, COL_MENU_BG);
+        /* border */
+        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y,               LNCHR_BROWSER_W, 1,          COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y+browser_h-1,   LNCHR_BROWSER_W, 1,          COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y,               1,               browser_h,  COL_MENU_BD);
+        fb_fill_rect(LNCHR_MENU_X + LNCHR_BROWSER_W - 1, LNCHR_MENU_Y,              1,               browser_h,  COL_MENU_BD);
+
+        /* Row 0: "< Back" in salmon */
+        fb_draw_string_px(LNCHR_MENU_X + 6,
+                          LNCHR_MENU_Y + 1 + 4,
+                          "< Back", 0xFFAAAAu, COL_MENU_BG);
+
+        /* Rows 1+: ELF file names (dimmed if an app is currently running) */
+        if (wm_app_running) {
+            fb_draw_string_px(LNCHR_MENU_X + 6,
+                              LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
+                              "Close app first", 0x999977u, COL_MENU_BG);
+        } else if (wm_elf_count == 0) {
+            fb_draw_string_px(LNCHR_MENU_X + 6,
+                              LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
+                              "No .elf files", 0x777799u, COL_MENU_BG);
+        } else {
+            int i;
+            for (i = 0; i < wm_elf_count; i++) {
+                fb_draw_string_px(LNCHR_MENU_X + 6,
+                                  LNCHR_MENU_Y + 1 + (i + 1) * LNCHR_ITEM_H + 4,
+                                  wm_elf_entries[i].name, COL_MENU_FG, COL_MENU_BG);
+            }
+        }
+    }
 }
 
 /* ================================================================
@@ -857,28 +927,128 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
         /* ---- 1. Launcher button ---- */
         if (point_in_rect(x, y, LNCHR_BTN_X, LNCHR_BTN_Y,
                           LNCHR_BTN_W, LNCHR_BTN_H)) {
-            launcher_open ^= 1;
+            launcher_open = launcher_open ? 0 : 1;
             launcher_handled = 1;
         }
 
-        /* ---- 2. Launcher menu (if open) ---- */
-        if (!launcher_handled && launcher_open) {
+        /* ---- 2a. Launcher main menu (launcher_open == 1) ---- */
+        if (!launcher_handled && launcher_open == 1) {
             int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2;
             if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
                               LNCHR_MENU_W, menu_h)) {
-                /* Which item did the user click? */
                 int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
                 if (item == 0) {        /* "STerm" */
                     wm_spawn(WM_TYPE_TERMINAL);
+                    launcher_open = 0;
                 } else if (item == 1) { /* "Calculator" */
                     wm_spawn(WM_TYPE_CALC);
+                    launcher_open = 0;
                 } else if (item == 2) { /* "SText" */
                     wm_spawn(WM_TYPE_STEXT);
+                    launcher_open = 0;
+                } else if (item == 3 && wm_fs && !wm_app_running) { /* "Run App..." → open ELF browser */
+                    /* Enumerate .elf files from FAT16 root */
+                    fat16_dirent_t tmp[32];
+                    int total = 0;
+                    fat16_list_entries(wm_fs, 0, tmp, 32, &total);
+                    wm_elf_count = 0;
+                    {
+                        int ei;
+                        for (ei = 0; ei < total && wm_elf_count < LNCHR_BROWSER_MAX; ei++) {
+                            if (tmp[ei].attr & 0x10u) continue; /* skip directories */
+                            char *n = tmp[ei].name;
+                            int l = (int)strlen(n);
+                            if (l >= 4 && n[l-4] == '.' &&
+                                (n[l-3] == 'E' || n[l-3] == 'e') &&
+                                (n[l-2] == 'L' || n[l-2] == 'l') &&
+                                (n[l-1] == 'F' || n[l-1] == 'f')) {
+                                wm_elf_entries[wm_elf_count++] = tmp[ei];
+                            }
+                        }
+                    }
+                    launcher_open = 2;
+                } else {
+                    launcher_open = 0;
                 }
-                launcher_open = 0;
                 launcher_handled = 1;
             } else {
                 /* Click outside open menu → close it, fall through to windows */
+                launcher_open = 0;
+            }
+        }
+
+        /* ---- 2b. ELF browser panel (launcher_open == 2) ---- */
+        if (!launcher_handled && launcher_open == 2) {
+            int rows = wm_elf_count + 1;
+            if (rows < 2) rows = 2;
+            int browser_h = rows * LNCHR_ITEM_H + 2;
+            if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
+                              LNCHR_BROWSER_W, browser_h)) {
+                int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
+                if (item == 0) {
+                    /* "< Back" → return to main menu */
+                    launcher_open = 1;
+                } else {
+                    int elf_idx = item - 1;
+                    if (elf_idx >= 0 && elf_idx < wm_elf_count && wm_fs && !wm_app_running) {
+                        /*
+                         * Launch the selected ELF.
+                         * exec_elf() blocks until the app calls exit().
+                         * wm_app_running prevents re-entrant calls if the user
+                         * opens the launcher again from within SYS_WM_EVENT.
+                         */
+                        launcher_open = 0;
+                        wm_draw_all();
+                        wm_app_running = 1;
+                        kmalloc_reset();
+                        char *buf = (char *)kmalloc(ELF_LOAD_BUF);
+                        if (buf) {
+                            uint32_t elen = 0;
+                            int rc = fat16_read_file(wm_fs, 0,
+                                         wm_elf_entries[elf_idx].name,
+                                         buf, ELF_LOAD_BUF, &elen);
+                            if (rc == FAT16_OK && elen > 0)
+                                exec_elf(buf);
+                        }
+                        wm_app_running = 0;
+                        /*
+                         * After exec_elf returns, forcibly hide any USER windows
+                         * the app left open (crash / unclean exit path).
+                         * Their pixel pointers now point into freed kmalloc
+                         * memory — rendering them would corrupt the display or
+                         * fault.
+                         */
+                        {
+                            int ci;
+                            for (ci = 0; ci < WM_MAX_WINDOWS; ci++) {
+                                if (!wm_windows[ci].hidden &&
+                                    wm_windows[ci].type == WM_TYPE_USER) {
+                                    wm_windows[ci].hidden = 1;
+                                    wm_windows[ci].pixels = (uint32_t *)0;
+                                    if (drag_win_idx == ci) {
+                                        drag_active  = 0;
+                                        drag_win_idx = -1;
+                                    }
+                                }
+                            }
+                            /* Re-focus the terminal if it was knocked off */
+                            if (wm_windows[wm_active].hidden) {
+                                int fi;
+                                for (fi = 0; fi < WM_MAX_WINDOWS; fi++) {
+                                    if (!wm_windows[fi].hidden) {
+                                        wm_set_active(fi);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        launcher_open = 0;
+                    }
+                }
+                launcher_handled = 1;
+            } else {
+                /* Click outside browser → close */
                 launcher_open = 0;
             }
         }
@@ -1363,4 +1533,13 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
     default:
         return -(int32_t)22;
     }
+}
+
+/* ================================================================
+ * wm_set_fs — give the WM a reference to the mounted FAT16 FS.
+ * Called by shell_run() after syscall_set_fs().  Enables "Run App..."
+ * in the Apps launcher dropdown.
+ * ================================================================ */
+void wm_set_fs(fat16_fs_t *fs) {
+    wm_fs = fs;
 }

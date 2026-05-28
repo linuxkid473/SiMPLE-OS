@@ -2,6 +2,7 @@
 #define SIMPLE_WM_H
 
 #include "types.h"
+#include "fat16.h"
 
 /* -----------------------------------------------------------------------
  * WM event — keyboard / mouse event delivered to ring-3 user programs
@@ -153,5 +154,9 @@ void wm_calc_handle_char(char c);
  * prev_buttons — button state from the previous packet.
  */
 void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons);
+
+/* Give the WM a reference to the mounted FAT16 filesystem.
+ * Enables "Run App..." in the Apps launcher.  Pass NULL to disable. */
+void wm_set_fs(fat16_fs_t *fs);
 
 #endif
