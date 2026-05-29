@@ -678,7 +678,7 @@ static const char *lnchr_labels[LNCHR_NITEMS] = {
     "Calculator",     /* 1 */
     "SText",          /* 2 */
     "Clock",          /* 3  → KAPP_CLOCK   */
-    "About",          /* 4  → KAPP_ABOUT   */
+    "SiMPLE Racer",   /* 4  → KAPP_ABOUT   */
     "System Info",    /* 5  → KAPP_SYSINFO */
     "Task Manager",   /* 6  → KAPP_TASKMGR */
     "Paint",          /* 7  → KAPP_PAINT   */

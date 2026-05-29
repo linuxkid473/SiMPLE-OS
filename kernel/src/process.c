@@ -26,6 +26,12 @@ int       current_proc = -1;
 static registers_t saved_ring0_regs;
 static int         ring0_has_saved_context = 0;
 
+/* Target ESP for the ring-0 resume trampoline (points at the 3-item IRET
+ * frame that was rebuilt on the original ring-0 stack).
+ * Must be non-static so the naked inline asm in ring0_resume_trampoline
+ * can reference it by name as a global symbol. */
+uint32_t ring0_resume_target_esp = 0;
+
 /* Per-process page directories, page tables, and ISR kernel stacks. */
 static uint32_t proc_pdirs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
 static uint32_t proc_ptabs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
@@ -229,6 +235,20 @@ void proc_yield(registers_t *regs) {
     do_switch(next, regs);
 }
 
+/*
+ * After restoring ring-0, IRET back to the original ring-0 stack position.
+ * We switch ESP to the rebuilt IRET frame on the ring-0 stack and iret there,
+ * avoiding the use of the syscall-handler stack (proc_kstacks[0]) entirely.
+ */
+__attribute__((naked, noinline)) static void ring0_resume_trampoline(void) {
+    __asm__ volatile(
+        "cli\n\t"
+        "movl ring0_resume_target_esp, %%esp\n\t"
+        "iret\n\t"
+        : : : "memory"
+    );
+}
+
 void proc_exit(registers_t *regs, int status) {
     int dying = current_proc;
 
@@ -311,13 +331,47 @@ void proc_exit(registers_t *regs, int status) {
         regs->eflags = 0x02;
     } else if (ring0_has_saved_context) {
         /* Non-blocking exec_elf_spawn() path — restore the ring-0 shell's ISR
-         * frame so IRET resumes the hlt loop inside console_read_line_opts. */
+         * frame so IRET resumes the hlt loop inside console_read_line_opts.
+         *
+         * When the PIT fired in ring-0 (sti;hlt), only EIP/CS/EFLAGS were
+         * pushed — useresp/ss are NOT part of the ring-0 interrupt frame.
+         * do_switch wrote all 76 bytes of ring-3 context onto the frame,
+         * landing ring-3 useresp/ss at E+0 and E+4, overwriting live ring-0
+         * stack data (e.g. keyboard_read_event's return address).
+         *
+         * saved_ring0_regs was captured BEFORE do_switch ran, so
+         * saved_ring0_regs.useresp/ss hold the original ring-0 values.
+         * Restore them, rebuild the IRET frame, and resume via trampoline. */
         serial_write(COM1, "[proc] restoring ring-0 context\n");
         wm_cleanup_all_user_windows();
         kmalloc_reset();
         paging_reset_phys_heap();
-        *regs = saved_ring0_regs;
         ring0_has_saved_context = 0;
+
+        /* saved_ring0_regs.esp = E-20 (pusha saves pre-pusha ESP).
+         * E = the ring-0 stack pointer at the moment the interrupt fired. */
+        uint32_t ring0_E = saved_ring0_regs.esp + 20u;
+
+        /* Rebuild the 3-item IRET frame at E-12 (do_switch overwrote it). */
+        uint32_t *iret_slot = (uint32_t *)(ring0_E - 12u);
+        iret_slot[0] = saved_ring0_regs.eip;
+        iret_slot[1] = 0x08u;                    /* CS = kernel code */
+        iret_slot[2] = saved_ring0_regs.eflags;
+
+        /* Repair the two ring-0 stack words above the IRET frame that
+         * do_switch corrupted with ring-3's useresp/ss. */
+        *(uint32_t *)(ring0_E + 0u) = saved_ring0_regs.useresp;
+        *(uint32_t *)(ring0_E + 4u) = saved_ring0_regs.ss;
+
+        ring0_resume_target_esp = (uint32_t)iret_slot;
+
+        /* Restore ring-0 general-purpose registers and redirect EIP through
+         * the trampoline, which will switch ESP to the ring-0 stack and iret
+         * back to the original ring-0 execution point. */
+        *regs = saved_ring0_regs;
+        regs->eip    = (uint32_t)ring0_resume_trampoline;
+        regs->cs     = 0x08u;
+        regs->eflags = 0x02u;  /* IF=0; trampoline does cli before iret */
     } else {
         /* No saved context (e.g. very early crash) — fire trampoline anyway;
          * kernel_esp==0 will triple-fault but that is the existing behaviour. */

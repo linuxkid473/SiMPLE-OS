@@ -173,7 +173,7 @@ const kapp_def_t kapp_defs[NUM_KAPPS] = {
     [KAPP_CLOCK]    = { "Clock",        280, 160,
                         clock_create,    clock_destroy,    clock_render,
                         clock_key,       clock_click,      clock_mouse,    clock_tick },
-    [KAPP_ABOUT]    = { "About SiMPLE OS", 340, 220,
+    [KAPP_ABOUT]    = { "SiMPLE Racer", 400, 260,
                         about_create,    about_destroy,    about_render,
                         about_key,       about_click,      about_mouse,    about_tick },
     [KAPP_SYSINFO]  = { "System Info",  380, 300,
