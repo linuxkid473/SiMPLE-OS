@@ -1493,14 +1493,24 @@ void wm_push_key(uint8_t scancode) {
 }
 
 /* Route mouse event to the focused USER window's event queue.
- * Converts screen coords to client-area relative (0,0 = content top-left). */
+ * Converts screen coords to client-area relative (0,0 = content top-left),
+ * then inverse-scales to pixel-buffer coords if the window has been resized. */
 void wm_push_mouse_event(int x, int y, uint8_t buttons, uint8_t prev) {
     wm_window_t *w = &wm_windows[wm_active];
     if (w->hidden || w->type != WM_TYPE_USER) return;
+    int rx = x - (w->x + WM_BORDER);
+    int ry = y - (w->y + WM_TITLEBAR_H);
+    /* Map from current display size back to the pixel buffer coordinate space. */
+    int cw = w->width  - 2 * WM_BORDER;
+    int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
+    if (cw > 0 && ch > 0 && w->pix_w > 0 && w->pix_h > 0) {
+        rx = rx * w->pix_w / cw;
+        ry = ry * w->pix_h / ch;
+    }
     wm_event_t e;
     e.wid  = (uint16_t)wm_active;
-    e.x    = (int16_t)(x - (w->x + WM_BORDER));
-    e.y    = (int16_t)(y - (w->y + WM_TITLEBAR_H));
+    e.x    = (int16_t)rx;
+    e.y    = (int16_t)ry;
     e.btn  = buttons;
     e.type = (buttons != prev) ? 4u : 3u;
     wm_push_to_slot(w->owner_slot, e);
@@ -1653,13 +1663,14 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
         if (!uw_valid(wid))          return -(int32_t)9;    /* -EBADF  */
         if (b < USER_WM_ADDR_MIN)    return -(int32_t)22;   /* -EINVAL */
         wm_window_t *w = &wm_windows[wid];
-        int cw = w->width  - 2 * WM_BORDER;
-        int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
-        uint32_t expected = (uint32_t)cw * (uint32_t)ch * 4u;
+        /* Always use the original buffer dimensions (pix_w × pix_h).
+         * w->width/height may have changed if the user resized the window,
+         * but the backing store and the ELF's frame buffer are still pix_w×pix_h. */
+        uint32_t npix     = (uint32_t)w->pix_w * (uint32_t)w->pix_h;
+        uint32_t expected = npix * 4u;
         if (c < expected)            return -(int32_t)22;
 
         const uint32_t *src = (const uint32_t *)b;
-        uint32_t npix = (uint32_t)cw * (uint32_t)ch;
         for (uint32_t i = 0; i < npix; i++) w->pixels[i] = src[i];
 
         wm_draw_all();
