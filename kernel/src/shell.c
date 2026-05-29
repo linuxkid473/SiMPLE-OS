@@ -6,6 +6,7 @@
 #include "fd.h"
 #include "keyboard.h"
 #include "kmalloc.h"
+#include "paging.h"
 #include "pit.h"
 #include "power.h"
 #include "process.h"
@@ -1787,21 +1788,21 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 continue;
             }
 
-            kmalloc_reset();
-            char* buf = (char*)kmalloc(ELF_LOAD_BUF);
-            if (!buf) {
-                vga_write_line("ELF: out of kernel heap memory");
+            int spawn_slot = proc_find_spawn_slot();
+            if (spawn_slot < 0) {
+                vga_write_line("ELF: no free process slot");
                 continue;
             }
+            uint32_t phys = PROC_SLOT_PHYS(spawn_slot);
             uint32_t out_len = 0;
-            rc = fat16_read_file(fs, dir_cluster, file_name, buf, ELF_LOAD_BUF, &out_len);
+            rc = fat16_read_file(fs, dir_cluster, file_name,
+                                 (char *)phys, ELF_LOAD_BUF, &out_len);
             if (rc != FAT16_OK) {
                 vga_write_line("Failed to read file");
                 continue;
             }
-
-            int elf_rc = exec_elf(buf);
-            if (elf_rc != 0)
+            int elf_rc = exec_elf_spawn((void *)phys, out_len, spawn_slot);
+            if (elf_rc < 0)
                 vga_write_line("ELF: execution failed");
             vga_putc('\n');
             continue;

@@ -31,7 +31,11 @@ int          wm_event(wm_event_t *ev, int max);
 int          wm_setfocus(int wid);
 int          exec(const char *path);
 int          fork(void);
-int          wait(void);
+int          waitpid(int pid, int *status, int options);
+int          wait(int *status);
+int          pipe(int fds[2]);
+int          dup2(int oldfd, int newfd);
+int          read(int fd, void *buf, int len);
 int          open(const char *path, int flags);
 int          close(int fd);
 int          fd_read(int fd, void *buf, int len);
@@ -721,14 +725,14 @@ static void cmd_write(const char *name, const char *text) {
     tp(msg, C_TEXT);
 }
 
-/* run: fork → child exec's the ELF → parent waits, then resets focus.
- * Tries name as-is first, then with ".elf" appended. */
+/* run: fork → child exec's the ELF with stdout/stderr captured via pipe.
+ * Parent waits for child then drains pipe output to terminal scrollback.
+ * Pipe buffer is 4KB; programs producing more than that lose excess output. */
 static void cmd_run(int wid, const char *name, unsigned int *px) {
     if (!name || !*name) { tp("run: missing filename", C_ERROR); return; }
 
     char elf_name[32];
     t_strncpy(elf_name, name, sizeof(elf_name)-4);
-    /* Check if already ends in .elf */
     int n = t_strlen(elf_name);
     int has_ext = (n > 4 && t_strcmp(elf_name+n-4, ".elf") == 0);
 
@@ -737,9 +741,18 @@ static void cmd_run(int wid, const char *name, unsigned int *px) {
     tp(msg, C_INFO);
     redraw(wid, px);
 
+    int pfd[2];
+    int has_pipe = (pipe(pfd) == 0);
+
     int pid = fork();
     if (pid == 0) {
-        /* Child: exec the program */
+        /* Child: redirect stdout/stderr into pipe write end */
+        if (has_pipe) {
+            dup2(pfd[1], 1);
+            dup2(pfd[1], 2);
+            close(pfd[0]);
+            close(pfd[1]);
+        }
         exec(elf_name);
         if (!has_ext) {
             char with_elf[36];
@@ -750,13 +763,27 @@ static void cmd_run(int wid, const char *name, unsigned int *px) {
         exit(1);
     }
     if (pid < 0) {
+        if (has_pipe) { close(pfd[0]); close(pfd[1]); }
         tp("run: fork failed", C_ERROR);
         return;
     }
-    /* Parent: wait for child */
-    wait();
 
-    /* Reclaim focus and redraw */
+    /* Parent: close write end, wait for child, then drain pipe */
+    if (has_pipe) close(pfd[1]);
+    int status = 0;
+    wait(&status);
+
+    if (has_pipe) {
+        /* Drain pipe output — display each chunk as terminal lines */
+        static char pipe_buf[257];
+        int nr;
+        while ((nr = read(pfd[0], pipe_buf, sizeof(pipe_buf)-1)) > 0) {
+            pipe_buf[nr] = '\0';
+            term_print(pipe_buf, C_TEXT);
+        }
+        close(pfd[0]);
+    }
+
     wm_setfocus(wid);
     tp("Done.", C_INFO);
 }

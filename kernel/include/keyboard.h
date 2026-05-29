@@ -30,4 +30,13 @@ int keyboard_is_alt_pressed(void);
 /* Returns 1 if Ctrl key is currently held, 0 otherwise. */
 int keyboard_is_ctrl_pressed(void);
 
+/* IRQ1 handler — called by isr_handler when int_no == 0x21.
+ * Reads one PS/2 byte, pushes it to the scancode ring buffer,
+ * routes it to the active WM window, and wakes any process
+ * blocked waiting for keyboard input. */
+void keyboard_irq_handler(void);
+
+/* Returns 1 if the scancode ring buffer has at least one byte. */
+int kb_scancode_available(void);
+
 #endif

@@ -7,6 +7,10 @@
 #include "kmalloc.h"
 #include "fat16.h"
 #include "elf.h"
+#include "paging.h"
+#include "process.h"
+#include "serial.h"
+#include "kapp.h"
 
 /* ================================================================
  * Global window state
@@ -26,19 +30,31 @@ static int drag_off_x   = 0;   /* cursor-to-window-origin X offset        */
 static int drag_off_y   = 0;   /* cursor-to-window-origin Y offset        */
 
 /* ================================================================
- * Event queue — shared between wm_push_key, wm_push_mouse_event,
- * wm_close_window (CLOSE event), and SYS_WM_EVENT drain.
+ * Per-process event queues.
+ * Each process slot gets its own circular buffer so events from
+ * one app never bleed into another app's queue.
+ * slot_eq[0] is also used for the blocking exec_elf() path.
  * ================================================================ */
 #define UW_EQ_SIZE  32
-static wm_event_t  wm_eq[UW_EQ_SIZE];
-static uint8_t     wm_eq_head = 0;
-static uint8_t     wm_eq_tail = 0;
+static wm_event_t slot_eq     [MAX_PROCS][UW_EQ_SIZE];
+static uint8_t    slot_eq_head[MAX_PROCS];
+static uint8_t    slot_eq_tail[MAX_PROCS];
 
-static void wm_push_event_internal(wm_event_t e) {
-    uint8_t next = (uint8_t)((wm_eq_tail + 1u) % UW_EQ_SIZE);
-    if (next != wm_eq_head) {
-        wm_eq[wm_eq_tail] = e;
-        wm_eq_tail = next;
+/* Push event e into slot s's queue (drops silently if full). */
+static void wm_push_to_slot(int s, wm_event_t e) {
+    if (s < 0 || s >= MAX_PROCS) return;
+    uint8_t next = (uint8_t)((slot_eq_tail[s] + 1u) % UW_EQ_SIZE);
+    if (next != slot_eq_head[s]) {
+        slot_eq[s][slot_eq_tail[s]] = e;
+        slot_eq_tail[s] = next;
+    }
+}
+
+/* Flush the queue for slot s (e.g. after window cleanup). */
+static void wm_flush_slot_queue(int s) {
+    if (s >= 0 && s < MAX_PROCS) {
+        slot_eq_head[s] = 0;
+        slot_eq_tail[s] = 0;
     }
 }
 
@@ -61,9 +77,10 @@ static int launcher_open = 0;
 /* Dropdown menu — immediately below the button */
 #define LNCHR_MENU_X    4
 #define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
-#define LNCHR_MENU_W  100
-#define LNCHR_ITEM_H   16
-#define LNCHR_NITEMS    4   /* STerm, Calculator, SText, Run App... */
+#define LNCHR_MENU_W  148
+#define LNCHR_ITEM_H   14
+/* 13 items: STerm, Calc, SText, + 9 kapps + Run App... */
+#define LNCHR_NITEMS   13
 
 /* ELF browser panel dimensions */
 #define LNCHR_BROWSER_W    164
@@ -75,19 +92,19 @@ static fat16_dirent_t wm_elf_entries[LNCHR_BROWSER_MAX];
 static int            wm_elf_count = 0;
 
 /*
- * Re-entrancy guard for exec_elf().
+ * No re-entrancy guard needed here.
  *
- * When a ring-3 app is running it calls SYS_WM_EVENT which pumps PS/2
- * input via wm_pump_input → wm_handle_mouse.  If the user opens the ELF
- * browser and clicks a second ELF from there, exec_elf() would be called
- * while already inside a syscall handler for the first app.  That nested
- * call does kmalloc_reset() (destroying the live app's pixel buffers) and
- * corrupts the saved kernel ESP in launch_ring3 → EIP=0 page fault.
+ * When current_proc < 0 (no ring-3 process running) the launcher uses the
+ * blocking exec_elf() + launch_ring3() path, which saves kernel_esp so that
+ * exit_trampoline can return control when the last process exits.
  *
- * wm_app_running is set to 1 around any exec_elf() launch and checked
- * before entering the browser launch path.
+ * When current_proc >= 0 (a ring-3 process is already running and called
+ * SYS_WM_EVENT → wm_pump_input → wm_handle_mouse), the launcher uses the
+ * non-blocking exec_elf_spawn() path, which loads the new ELF into a
+ * dedicated physical memory slot and marks it PROC_RUNNABLE.  The preemptive
+ * PIT timer will schedule it on the next tick.  No kmalloc_reset(), no
+ * nested launch_ring3() — safe to call from within a syscall handler.
  */
-static int wm_app_running = 0;
 
 /* ================================================================
  * Calculator button grid
@@ -142,33 +159,39 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 };
 
 /* ================================================================
- * Colour palette
+ * Colour palette — Green Glass theme
  * ================================================================ */
-#define COL_DESKTOP       0x00001A   /* very dark navy desktop             */
-#define COL_BORDER_ACT    0x888888   /* mid-grey border, focused window    */
-#define COL_BORDER_INACT  0x333333   /* dark-grey border, unfocused        */
-#define COL_TITLEBG_ACT   0x0000AA   /* classic blue title, focused        */
-#define COL_TITLEBG_INACT 0x222255   /* dim blue title, unfocused          */
-#define COL_TITLEFG       0xFFFFFF   /* white title text                   */
-#define COL_CLIENTBG      0x000000   /* black client background            */
-#define COL_DISPBG        0x003300   /* dark-green calculator display bg   */
-#define COL_DISPFG        0x00FF00   /* bright-green calculator display fg */
-#define COL_BTNBG         0x223355   /* calculator button background       */
-#define COL_BTNBDR        0x4466AA   /* calculator button border           */
-#define COL_BTNFG         0xFFFFFF   /* calculator button label text       */
-#define COL_CLOSEBTN_BG   0x882222   /* close button background — dark red */
-#define COL_CLOSEBTN_BD   0xBB4444   /* close button border                */
-#define COL_LNCHR_BG      0x333366   /* launcher button background         */
-#define COL_LNCHR_BD      0x8888CC   /* launcher button border             */
-#define COL_MENU_BG       0x1A1A33   /* launcher dropdown background       */
-#define COL_MENU_BD       0x888888   /* launcher dropdown border           */
-#define COL_MENU_FG       0xFFFFFF   /* launcher menu item text            */
-#define COL_STEXT_FG      0xCCCCCC   /* SText editor text colour           */
-#define COL_MENUBAR_BG    0x111133   /* top menu bar background            */
-#define COL_DOCK_BG       0x0D0D22   /* bottom dock background             */
-#define COL_DOCK_BTN_BG   0x223399   /* dock button background             */
-#define COL_DOCK_BTN_BD   0x4455CC   /* dock button border                 */
-#define COL_DOCK_BTN_FG   0xFFFFFF   /* dock button label text             */
+#define COL_DESKTOP         0x070D09   /* near-black forest desktop             */
+#define COL_BORDER_ACT      0x33EE66   /* vivid green border, focused           */
+#define COL_BORDER_INACT    0x1A3322   /* muted forest border, unfocused        */
+#define COL_TITLEBG_ACT     0x00AA44   /* emerald titlebar, focused             */
+#define COL_TITLEBG_INACT   0x0C2A16   /* dim forest titlebar, unfocused        */
+#define COL_TITLEFG         0xFFFFFF   /* white title text                      */
+#define COL_CLIENTBG        0x080808   /* near-black client area                */
+#define COL_DISPBG          0x002200   /* dark-green calculator display bg      */
+#define COL_DISPFG          0x00FF88   /* bright mint calculator display fg     */
+#define COL_BTNBG           0x0A2015   /* dark green button fill                */
+#define COL_BTNBDR          0x33AA55   /* green button border                   */
+#define COL_BTNFG           0xCCFFCC   /* light-green button text               */
+#define COL_CLOSEBTN_BG     0xBB2233   /* close button — crimson                */
+#define COL_CLOSEBTN_BD     0xFF6677   /* close button top/left highlight       */
+#define COL_LNCHR_BG        0x0A2A15   /* launcher button background            */
+#define COL_LNCHR_BD        0x33DD66   /* launcher button border                */
+#define COL_MENU_BG         0x0A180E   /* launcher dropdown background          */
+#define COL_MENU_BD         0x33AA55   /* launcher dropdown border              */
+#define COL_MENU_FG         0xAAFFBB   /* launcher menu item text               */
+#define COL_STEXT_FG        0x99FFAA   /* SText editor text colour              */
+#define COL_MENUBAR_BG      0x050E08   /* top menu bar background               */
+#define COL_DOCK_BG         0x080D09   /* bottom dock background                */
+#define COL_DOCK_BTN_BG     0x0A2A15   /* dock button background                */
+#define COL_DOCK_BTN_BD     0x33CC55   /* dock button border                    */
+#define COL_DOCK_BTN_FG     0xAAFFBB   /* dock button label text                */
+
+/* Titlebar gradient bands */
+#define COL_TITLE_GLOS_ACT  0x44FF88   /* active titlebar gloss stripe (top)    */
+#define COL_TITLE_SHAD_ACT  0x007733   /* active titlebar shadow stripe (bot)   */
+#define COL_TITLE_GLOS_INAC 0x1E5533   /* inactive titlebar gloss stripe        */
+#define COL_TITLE_SHAD_INAC 0x061A0C   /* inactive titlebar shadow stripe       */
 
 /* ---- Permanent UI chrome heights ---- */
 #define UI_MENUBAR_H  24   /* top menu bar height (px)  */
@@ -509,40 +532,54 @@ static void stext_move(int key_type) {
  * ================================================================ */
 
 static void draw_window_chrome(wm_window_t *w, int is_active) {
-    int      wx = w->x, wy = w->y, ww = w->width, wh = w->height;
-    uint32_t cb = is_active ? COL_BORDER_ACT   : COL_BORDER_INACT;
-    uint32_t ct = is_active ? COL_TITLEBG_ACT  : COL_TITLEBG_INACT;
+    int wx = w->x, wy = w->y, ww = w->width, wh = w->height;
 
-    /* Four-sided border */
-    fb_fill_rect(wx,              wy,              ww,        WM_BORDER, cb);
-    fb_fill_rect(wx,              wy+wh-WM_BORDER, ww,        WM_BORDER, cb);
-    fb_fill_rect(wx,              wy,              WM_BORDER, wh,        cb);
-    fb_fill_rect(wx+ww-WM_BORDER, wy,              WM_BORDER, wh,        cb);
+    /* ---- Drop shadow (offset dark rect drawn first, behind everything) ---- */
+    fb_fill_rect(wx + 5, wy + 5, ww, wh, 0x000000);
 
-    /* Title bar */
-    fb_fill_rect(wx + WM_BORDER,
-                 wy + WM_BORDER,
-                 ww - 2*WM_BORDER,
-                 WM_TITLEBAR_H - WM_BORDER,
-                 ct);
-    fb_draw_string_px(wx + WM_BORDER + 4,
-                      wy + WM_BORDER + 3,
-                      w->title, COL_TITLEFG, ct);
+    /* ---- Four-sided beveled border (highlight top/left, shadow bot/right) ---- */
+    uint32_t b_hi  = is_active ? 0x55FF88 : 0x2A4433;
+    uint32_t b_sha = is_active ? 0x007722 : 0x0A1A0A;
+    fb_fill_rect(wx,              wy,              ww,        WM_BORDER, b_hi);
+    fb_fill_rect(wx,              wy,              WM_BORDER, wh,        b_hi);
+    fb_fill_rect(wx,              wy+wh-WM_BORDER, ww,        WM_BORDER, b_sha);
+    fb_fill_rect(wx+ww-WM_BORDER, wy,              WM_BORDER, wh,        b_sha);
 
-    /* Close button — 12×12 px, top-right of title bar */
+    /* ---- Gradient titlebar ---- */
+    int tx  = wx + WM_BORDER;
+    int ty  = wy + WM_BORDER;
+    int tw  = ww - 2 * WM_BORDER;
+    int tth = WM_TITLEBAR_H - WM_BORDER;   /* = 16 px */
+
+    uint32_t t_glos = is_active ? COL_TITLE_GLOS_ACT  : COL_TITLE_GLOS_INAC;
+    uint32_t t_base = is_active ? COL_TITLEBG_ACT      : COL_TITLEBG_INACT;
+    uint32_t t_shad = is_active ? COL_TITLE_SHAD_ACT   : COL_TITLE_SHAD_INAC;
+
+    fb_fill_rect(tx, ty,           tw, tth, t_base);  /* base fill              */
+    fb_fill_rect(tx, ty,           tw, 2,   t_glos);  /* gloss highlight (top)  */
+    fb_fill_rect(tx, ty + tth - 3, tw, 3,   t_shad);  /* shadow stripe (bottom) */
+
+    /* Separator line between titlebar and client area */
+    fb_fill_rect(tx, wy + WM_TITLEBAR_H - 1, tw, 1,
+                 is_active ? 0x22CC55 : 0x1A3322);
+
+    /* Title text — sits in the base-color band (rows 2..12) */
+    fb_draw_string_px(tx + 8, ty + 4, w->title, COL_TITLEFG, t_base);
+
+    /* ---- Close button — 12×12 px, top-right of title bar ---- */
     int cbx = wx + ww - 16;
     int cby = wy + 4;
     fb_fill_rect(cbx,      cby,      12, 12, COL_CLOSEBTN_BG);
-    fb_fill_rect(cbx,      cby,      12, 1,  COL_CLOSEBTN_BD);
-    fb_fill_rect(cbx,      cby + 11, 12, 1,  COL_CLOSEBTN_BD);
-    fb_fill_rect(cbx,      cby,      1,  12, COL_CLOSEBTN_BD);
-    fb_fill_rect(cbx + 11, cby,      1,  12, COL_CLOSEBTN_BD);
+    fb_fill_rect(cbx,      cby,      12, 1,  COL_CLOSEBTN_BD);  /* top hi    */
+    fb_fill_rect(cbx,      cby,      1,  12, COL_CLOSEBTN_BD);  /* left hi   */
+    fb_fill_rect(cbx,      cby + 11, 12, 1,  0x881122);          /* bot shad  */
+    fb_fill_rect(cbx + 11, cby,      1,  12, 0x881122);          /* right shad*/
     fb_draw_string_px(cbx + 2, cby + 2, "X", COL_TITLEFG, COL_CLOSEBTN_BG);
 
-    /* Client background */
-    fb_fill_rect(wx + WM_BORDER,
+    /* ---- Client background ---- */
+    fb_fill_rect(tx,
                  wy + WM_TITLEBAR_H,
-                 ww - 2*WM_BORDER,
+                 tw,
                  wh - WM_TITLEBAR_H - WM_BORDER,
                  COL_CLIENTBG);
 }
@@ -559,15 +596,18 @@ static void sync_terminal_client(wm_window_t *w) {
  * Calculator GUI rendering
  * ================================================================ */
 
-/* Draw one button: filled rect + 1-px border + centred label. */
+/* Draw one button: filled rect + beveled border + centred label. */
 static void draw_calc_button(int bx, int by, const char *label) {
     /* fill */
     fb_fill_rect(bx, by, CALC_BTN_W, CALC_BTN_H, COL_BTNBG);
-    /* border — top, bottom, left, right */
-    fb_fill_rect(bx,                  by,                  CALC_BTN_W, 1,          COL_BTNBDR);
-    fb_fill_rect(bx,                  by + CALC_BTN_H - 1, CALC_BTN_W, 1,          COL_BTNBDR);
+    /* gloss highlight (top 2 rows) */
+    fb_fill_rect(bx, by, CALC_BTN_W, 2, 0x1A4A28);
+    /* top/left highlight edges */
+    fb_fill_rect(bx,                  by,                  CALC_BTN_W, 1, COL_BTNBDR);
     fb_fill_rect(bx,                  by,                  1,          CALC_BTN_H, COL_BTNBDR);
-    fb_fill_rect(bx + CALC_BTN_W - 1, by,                  1,          CALC_BTN_H, COL_BTNBDR);
+    /* bottom/right shadow edges */
+    fb_fill_rect(bx,                  by + CALC_BTN_H - 1, CALC_BTN_W, 1, 0x051008);
+    fb_fill_rect(bx + CALC_BTN_W - 1, by,                  1,          CALC_BTN_H, 0x051008);
     /* label — single character, centred inside the button */
     int tx = bx + (CALC_BTN_W - 8) / 2;
     int ty = by + (CALC_BTN_H - 8) / 2;
@@ -632,42 +672,71 @@ static void draw_stext_content(wm_window_t *w) {
  * Launcher bar rendering
  * ================================================================ */
 
+/* Menu item labels (index 0-12) */
+static const char *lnchr_labels[LNCHR_NITEMS] = {
+    "STerm",          /* 0 */
+    "Calculator",     /* 1 */
+    "SText",          /* 2 */
+    "Clock",          /* 3  → KAPP_CLOCK   */
+    "About",          /* 4  → KAPP_ABOUT   */
+    "System Info",    /* 5  → KAPP_SYSINFO */
+    "Task Manager",   /* 6  → KAPP_TASKMGR */
+    "Paint",          /* 7  → KAPP_PAINT   */
+    "Notepad",        /* 8  → KAPP_NOTEPAD */
+    "File Manager",   /* 9  → KAPP_FILEMGR */
+    "File Viewer",    /* 10 → KAPP_FILEVIEW*/
+    "Settings",       /* 11 → KAPP_SETTINGS*/
+    "Run App...",     /* 12 → ELF browser  */
+};
+
+/* Separator lines drawn ABOVE items 3 and 12 */
+static int lnchr_is_separator_before(int item) {
+    return (item == 3 || item == 12);
+}
+
 static void draw_launcher(void) {
-    /* "Apps" button — always visible */
+    /* "Apps" button — always visible, with gloss effect */
     fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y, LNCHR_BTN_W, LNCHR_BTN_H, COL_LNCHR_BG);
+    /* gloss top stripe */
+    fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y, LNCHR_BTN_W, 2, 0x44EE77);
+    /* bottom shadow stripe */
+    fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y + LNCHR_BTN_H - 2, LNCHR_BTN_W, 2, 0x061508);
     /* border */
     fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y,                   LNCHR_BTN_W, 1,            COL_LNCHR_BD);
     fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y + LNCHR_BTN_H - 1, LNCHR_BTN_W, 1,            COL_LNCHR_BD);
     fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y,                   1,            LNCHR_BTN_H, COL_LNCHR_BD);
     fb_fill_rect(LNCHR_BTN_X + LNCHR_BTN_W - 1, LNCHR_BTN_Y,                   1,            LNCHR_BTN_H, COL_LNCHR_BD);
     /* label */
-    fb_draw_string_px(LNCHR_BTN_X + 4, LNCHR_BTN_Y + 4, "Apps", COL_TITLEFG, COL_LNCHR_BG);
+    fb_draw_string_px(LNCHR_BTN_X + 8, LNCHR_BTN_Y + 4, "Apps", COL_MENU_FG, COL_LNCHR_BG);
 
     if (!launcher_open) return;
 
     if (launcher_open == 1) {
         /* ---- Main dropdown menu ---- */
-        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2;   /* 1-px border top + bottom */
+        /* Compute total height including 2 extra pixels per separator */
+        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 2 * 3;  /* 2 separators × 3px */
         fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_MENU_W, menu_h, COL_MENU_BG);
         /* border */
         fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              LNCHR_MENU_W, 1,       COL_MENU_BD);
         fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y + menu_h - 1, LNCHR_MENU_W, 1,       COL_MENU_BD);
         fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              1,             menu_h, COL_MENU_BD);
         fb_fill_rect(LNCHR_MENU_X + LNCHR_MENU_W - 1, LNCHR_MENU_Y,             1,             menu_h, COL_MENU_BD);
-        /* item 0: STerm */
-        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 4,
-                          "STerm", COL_MENU_FG, COL_MENU_BG);
-        /* item 1: Calculator */
-        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
-                          "Calculator", COL_MENU_FG, COL_MENU_BG);
-        /* item 2: SText */
-        fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 2 * LNCHR_ITEM_H + 4,
-                          "SText", COL_MENU_FG, COL_MENU_BG);
-        /* item 3: Run App... (dim if no FS or another app is already running) */
-        {
-            uint32_t col = (wm_fs && !wm_app_running) ? COL_MENU_FG : 0x666699u;
-            fb_draw_string_px(LNCHR_MENU_X + 6, LNCHR_MENU_Y + 1 + 3 * LNCHR_ITEM_H + 4,
-                              "Run App...", col, COL_MENU_BG);
+
+        /* Draw items with separator lines */
+        int iy = LNCHR_MENU_Y + 1;
+        for (int i = 0; i < LNCHR_NITEMS; i++) {
+            if (lnchr_is_separator_before(i)) {
+                fb_fill_rect(LNCHR_MENU_X + 1, iy, LNCHR_MENU_W - 2, 3, COL_MENU_BG);
+                fb_fill_rect(LNCHR_MENU_X + 4, iy + 1, LNCHR_MENU_W - 8, 1, COL_MENU_BD);
+                iy += 3;
+            }
+            uint32_t fg = COL_MENU_FG;
+            /* Dim "Run App..." when no FS */
+            if (i == 12 && !wm_fs) fg = 0x556677u;
+            /* Highlight already-open kapps */
+            if (i >= 3 && i <= 11 && kapp_is_open(i - 3)) fg = 0x55FF88u;
+            fb_draw_string_px(LNCHR_MENU_X + 8, iy + 3, lnchr_labels[i], fg, COL_MENU_BG);
+            iy += LNCHR_ITEM_H;
         }
     } else {
         /* ---- ELF browser panel (launcher_open == 2) ---- */
@@ -687,12 +756,8 @@ static void draw_launcher(void) {
                           LNCHR_MENU_Y + 1 + 4,
                           "< Back", 0xFFAAAAu, COL_MENU_BG);
 
-        /* Rows 1+: ELF file names (dimmed if an app is currently running) */
-        if (wm_app_running) {
-            fb_draw_string_px(LNCHR_MENU_X + 6,
-                              LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
-                              "Close app first", 0x999977u, COL_MENU_BG);
-        } else if (wm_elf_count == 0) {
+        /* Rows 1+: ELF file names */
+        if (wm_elf_count == 0) {
             fb_draw_string_px(LNCHR_MENU_X + 6,
                               LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
                               "No .elf files", 0x777799u, COL_MENU_BG);
@@ -854,12 +919,14 @@ static void wm_close_window(int idx) {
         free_inst(calc_used, w->instance);
     else if (w->type == WM_TYPE_STEXT)
         free_inst(stext_used, w->instance);
-    else {
+    else if (w->type == WM_TYPE_KAPP) {
+        kapp_close(w->instance, idx);
+    } else {
         /* WM_TYPE_USER: notify the app via CLOSE event, clear pixel store */
         wm_event_t ev;
         ev.type = 5u; ev.wid = (uint16_t)idx;
         ev.x = 0; ev.y = 0; ev.btn = 0;
-        wm_push_event_internal(ev);
+        wm_push_to_slot(w->owner_slot, ev);
         w->pixels = (uint32_t *)0;
     }
 
@@ -886,23 +953,25 @@ static void wm_close_window(int idx) {
  * Called when a left-click lands inside a window but NOT in the
  * title bar.  Drag is never started from here.
  * ================================================================ */
-static void handle_client_click(wm_window_t *w, int x, int y) {
-    if (w->type != WM_TYPE_CALC) return;
-
+static void handle_client_click(wm_window_t *w, int wi, int x, int y) {
     int cx = w->x + WM_BORDER;
     int cy = w->y + WM_TITLEBAR_H;
+    int rx = x - cx;
+    int ry = y - cy;
 
-    /* Point calc at this window's instance before dispatching */
-    calc = &calc_instances[w->instance];
-
-    for (int i = 0; i < CALC_NCOLS * CALC_NROWS; i++) {
-        int bx = cx + calc_btns[i].rx;
-        int by = cy + calc_btns[i].ry;
-        if (x >= bx && x < bx + CALC_BTN_W &&
-            y >= by && y < by + CALC_BTN_H) {
-            wm_calc_handle_char(calc_btns[i].action);
-            return;
+    if (w->type == WM_TYPE_CALC) {
+        calc = &calc_instances[w->instance];
+        for (int i = 0; i < CALC_NCOLS * CALC_NROWS; i++) {
+            int bx = cx + calc_btns[i].rx;
+            int by = cy + calc_btns[i].ry;
+            if (x >= bx && x < bx + CALC_BTN_W &&
+                y >= by && y < by + CALC_BTN_H) {
+                wm_calc_handle_char(calc_btns[i].action);
+                return;
+            }
         }
+    } else if (w->type == WM_TYPE_KAPP) {
+        kapp_handle_click(w->instance, wi, rx, ry);
     }
 }
 
@@ -933,10 +1002,20 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
 
         /* ---- 2a. Launcher main menu (launcher_open == 1) ---- */
         if (!launcher_handled && launcher_open == 1) {
-            int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2;
+            int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 2 * 3;
             if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
                               LNCHR_MENU_W, menu_h)) {
-                int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
+                /* Map click Y to item index, accounting for separator gaps */
+                int rel = y - LNCHR_MENU_Y - 1;
+                int item = -1;
+                {
+                    int iy = 0;
+                    for (int i = 0; i < LNCHR_NITEMS; i++) {
+                        if (lnchr_is_separator_before(i)) iy += 3;
+                        if (rel >= iy && rel < iy + LNCHR_ITEM_H) { item = i; break; }
+                        iy += LNCHR_ITEM_H;
+                    }
+                }
                 if (item == 0) {        /* "STerm" */
                     wm_spawn(WM_TYPE_TERMINAL);
                     launcher_open = 0;
@@ -946,8 +1025,10 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 } else if (item == 2) { /* "SText" */
                     wm_spawn(WM_TYPE_STEXT);
                     launcher_open = 0;
-                } else if (item == 3 && wm_fs && !wm_app_running) { /* "Run App..." → open ELF browser */
-                    /* Enumerate .elf files from FAT16 root */
+                } else if (item >= 3 && item <= 11) { /* Kapp items */
+                    wm_spawn_kapp(item - 3);
+                    launcher_open = 0;
+                } else if (item == 12 && wm_fs) { /* "Run App..." → ELF browser */
                     fat16_dirent_t tmp[32];
                     int total = 0;
                     fat16_list_entries(wm_fs, 0, tmp, 32, &total);
@@ -955,7 +1036,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                     {
                         int ei;
                         for (ei = 0; ei < total && wm_elf_count < LNCHR_BROWSER_MAX; ei++) {
-                            if (tmp[ei].attr & 0x10u) continue; /* skip directories */
+                            if (tmp[ei].attr & 0x10u) continue;
                             char *n = tmp[ei].name;
                             int l = (int)strlen(n);
                             if (l >= 4 && n[l-4] == '.' &&
@@ -972,7 +1053,6 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 }
                 launcher_handled = 1;
             } else {
-                /* Click outside open menu → close it, fall through to windows */
                 launcher_open = 0;
             }
         }
@@ -990,56 +1070,30 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                     launcher_open = 1;
                 } else {
                     int elf_idx = item - 1;
-                    if (elf_idx >= 0 && elf_idx < wm_elf_count && wm_fs && !wm_app_running) {
-                        /*
-                         * Launch the selected ELF.
-                         * exec_elf() blocks until the app calls exit().
-                         * wm_app_running prevents re-entrant calls if the user
-                         * opens the launcher again from within SYS_WM_EVENT.
-                         */
+                    if (elf_idx >= 0 && elf_idx < wm_elf_count && wm_fs) {
                         launcher_open = 0;
                         wm_draw_all();
-                        wm_app_running = 1;
-                        kmalloc_reset();
-                        char *buf = (char *)kmalloc(ELF_LOAD_BUF);
-                        if (buf) {
-                            uint32_t elen = 0;
-                            int rc = fat16_read_file(wm_fs, 0,
-                                         wm_elf_entries[elf_idx].name,
-                                         buf, ELF_LOAD_BUF, &elen);
-                            if (rc == FAT16_OK && elen > 0)
-                                exec_elf(buf);
-                        }
-                        wm_app_running = 0;
+
                         /*
-                         * After exec_elf returns, forcibly hide any USER windows
-                         * the app left open (crash / unclean exit path).
-                         * Their pixel pointers now point into freed kmalloc
-                         * memory — rendering them would corrupt the display or
-                         * fault.
+                         * Always use the non-blocking exec_elf_spawn() path.
+                         * The ring-0 shell stays live (STerm keeps updating),
+                         * and proc_timer_tick switches to the new ring-3
+                         * process on the next PIT tick.  When the last process
+                         * exits, proc_exit restores the saved ring-0 ISR frame
+                         * so the shell resumes transparently.
                          */
                         {
-                            int ci;
-                            for (ci = 0; ci < WM_MAX_WINDOWS; ci++) {
-                                if (!wm_windows[ci].hidden &&
-                                    wm_windows[ci].type == WM_TYPE_USER) {
-                                    wm_windows[ci].hidden = 1;
-                                    wm_windows[ci].pixels = (uint32_t *)0;
-                                    if (drag_win_idx == ci) {
-                                        drag_active  = 0;
-                                        drag_win_idx = -1;
-                                    }
-                                }
-                            }
-                            /* Re-focus the terminal if it was knocked off */
-                            if (wm_windows[wm_active].hidden) {
-                                int fi;
-                                for (fi = 0; fi < WM_MAX_WINDOWS; fi++) {
-                                    if (!wm_windows[fi].hidden) {
-                                        wm_set_active(fi);
-                                        break;
-                                    }
-                                }
+                            int spawn_slot = proc_find_spawn_slot();
+                            if (spawn_slot >= 0) {
+                                uint32_t phys = PROC_SLOT_PHYS(spawn_slot);
+                                uint32_t elen = 0;
+                                int rc = fat16_read_file(wm_fs, 0,
+                                             wm_elf_entries[elf_idx].name,
+                                             (char *)phys, ELF_LOAD_BUF,
+                                             &elen);
+                                if (rc == FAT16_OK && elen > 0)
+                                    exec_elf_spawn((void *)phys, elen,
+                                                   spawn_slot);
                             }
                         }
                     } else {
@@ -1082,7 +1136,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                     }
                 } else {
                     /* Client-area click → route to the app */
-                    handle_client_click(&wm_windows[i], x, y);
+                    handle_client_click(&wm_windows[i], i, x, y);
                 }
                 break;
             }
@@ -1102,6 +1156,16 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
 
     /* ---- Button released → end drag ---- */
     if (!left_now && left_prev) drag_active = 0;
+
+    /* ---- Route mouse position to active KAPP (e.g. Paint dragging) ---- */
+    {
+        wm_window_t *aw = &wm_windows[wm_active];
+        if (!aw->hidden && aw->type == WM_TYPE_KAPP) {
+            int rx = x - (aw->x + WM_BORDER);
+            int ry = y - (aw->y + WM_TITLEBAR_H);
+            kapp_handle_mouse(aw->instance, wm_active, rx, ry, left_now);
+        }
+    }
 
     wm_draw_all();
 }
@@ -1165,6 +1229,12 @@ void wm_draw_all(void) {
                     int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
                     fb_blit_pixels(cx, cy, w->pixels, cw, ch);
                 }
+            } else if (w->type == WM_TYPE_KAPP) {
+                int cx = w->x + WM_BORDER;
+                int cy = w->y + WM_TITLEBAR_H;
+                int cw = w->width  - 2 * WM_BORDER;
+                int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
+                kapp_render_window(w->instance, i, cx, cy, cw, ch);
             }
         }
     }
@@ -1187,6 +1257,7 @@ void wm_draw_all(void) {
      * The launcher ("Apps" dropdown, top-left) is kept as a fallback for
      * sessions where desktop.elf is not running.
      */
+    kapp_tick_all();
     draw_launcher();
     draw_cursor(mouse_get_x(), mouse_get_y());
 }
@@ -1200,6 +1271,7 @@ void wm_init(int sw, int sh) {
     scr_w         = sw;
     scr_h         = sh;
     launcher_open = 0;
+    kapp_init();
 
     /* Mark all window slots as free */
     for (i = 0; i < WM_MAX_WINDOWS; i++) wm_windows[i].hidden = 1;
@@ -1314,7 +1386,7 @@ void wm_push_key(uint8_t scancode) {
     e.x    = (int16_t)scancode;
     e.y    = 0;
     e.btn  = 0;
-    wm_push_event_internal(e);
+    wm_push_to_slot(w->owner_slot, e);
 }
 
 /* Route mouse event to the focused USER window's event queue.
@@ -1328,21 +1400,27 @@ void wm_push_mouse_event(int x, int y, uint8_t buttons, uint8_t prev) {
     e.y    = (int16_t)(y - (w->y + WM_TITLEBAR_H));
     e.btn  = buttons;
     e.type = (buttons != prev) ? 4u : 3u;
-    wm_push_event_internal(e);
+    wm_push_to_slot(w->owner_slot, e);
 }
 
 /* Drain available PS/2 bytes non-blocking — called at SYS_WM_EVENT time. */
 static void wm_pump_input(void) {
+    /*
+     * Keyboard scancodes are now handled by keyboard_irq_handler (IRQ1):
+     * they go into the scancode ring buffer AND are routed to the active
+     * window's slot queue via wm_push_key.  This pump only needs to drain
+     * any pending mouse bytes (bit 5 of PS/2 status = MOBF).
+     */
     for (int i = 0; i < 32; i++) {
         uint8_t st = inb(0x64);
-        if (!(st & 0x01u)) break;
+        if (!(st & 0x01u)) break;   /* output buffer empty */
         uint8_t data = inb(0x60);
         if (st & 0x20u) {
-            mouse_handle_byte(data);
-        } else {
-            if (data != 0xE0u)
-                wm_push_key(data);
+            mouse_handle_byte(data);   /* PS/2 mouse packet byte */
         }
+        /* Keyboard bytes (MOBF=0) are already consumed by IRQ1 handler;
+         * any stray keyboard byte here is silently dropped to avoid
+         * double-injecting into WM slot queues. */
     }
 }
 
@@ -1389,17 +1467,29 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
         for (uint32_t i = 0; i < npix; i++) buf[i] = 0;
 
         wm_window_t *w = &wm_windows[slot];
-        w->x        = wx;
-        w->y        = wy;
-        w->width    = cw + 2 * WM_BORDER;
-        w->height   = ch + WM_TITLEBAR_H + WM_BORDER;
-        w->type     = WM_TYPE_USER;
-        w->instance = 0;
-        w->hidden   = 0;
-        w->pixels   = buf;
+        w->x          = wx;
+        w->y          = wy;
+        w->width      = cw + 2 * WM_BORDER;
+        w->height     = ch + WM_TITLEBAR_H + WM_BORDER;
+        w->type       = WM_TYPE_USER;
+        w->instance   = 0;
+        w->hidden     = 0;
+        w->pixels     = buf;
+        w->owner_slot = (current_proc >= 0) ? current_proc : -1;
         strncpy(w->title_buf, "App", 31);
         w->title_buf[31] = '\0';
         w->title    = w->title_buf;
+
+        serial_write(COM1, "[WM] CREATE wid=");
+        serial_write_dec(COM1, (uint32_t)slot);
+        serial_write(COM1, " owner_slot=");
+        serial_write_dec(COM1, (uint32_t)w->owner_slot);
+        serial_write(COM1, " cw=");
+        serial_write_dec(COM1, (uint32_t)cw);
+        serial_write(COM1, " ch=");
+        serial_write_dec(COM1, (uint32_t)ch);
+        serial_write(COM1, "\n");
+        proc_dump_table("SYS_WM_CREATE");
 
         wm_set_active(slot);
         wm_draw_all();
@@ -1498,11 +1588,12 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
 
         wm_pump_input();
 
-        if (wm_eq_head == wm_eq_tail) return 0;   /* queue empty */
+        int s = (current_proc >= 0) ? current_proc : 0;
+        if (slot_eq_head[s] == slot_eq_tail[s]) return 0;   /* queue empty */
 
         wm_event_t *dst = (wm_event_t *)a;
-        *dst = wm_eq[wm_eq_head];
-        wm_eq_head = (uint8_t)((wm_eq_head + 1u) % UW_EQ_SIZE);
+        *dst = slot_eq[s][slot_eq_head[s]];
+        slot_eq_head[s] = (uint8_t)((slot_eq_head[s] + 1u) % UW_EQ_SIZE);
         return (int32_t)dst->type;
     }
 
@@ -1536,10 +1627,123 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 /* ================================================================
+ * wm_cleanup_for_slot / wm_cleanup_all_user_windows
+ *
+ * Called from proc_exit() and proc_register_initial() to tear down
+ * any USER windows owned by a dying process slot.
+ * ================================================================ */
+void wm_cleanup_for_slot(int slot) {
+    int focus_gone = 0;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        wm_window_t *w = &wm_windows[i];
+        if (!w->hidden && w->type == WM_TYPE_USER && w->owner_slot == slot) {
+            w->hidden = 1;
+            w->pixels = (uint32_t *)0;
+            if (drag_win_idx == i) { drag_active = 0; drag_win_idx = -1; }
+            if (wm_active == i) focus_gone = 1;
+        }
+    }
+    /* Flush the dead process's event queue */
+    wm_flush_slot_queue(slot);
+    /* Restore focus to another visible window */
+    if (focus_gone) {
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (!wm_windows[i].hidden) { wm_set_active(i); break; }
+        }
+    }
+}
+
+void wm_cleanup_all_user_windows(void) {
+    int focus_gone = 0;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        wm_window_t *w = &wm_windows[i];
+        if (!w->hidden && w->type == WM_TYPE_USER) {
+            w->hidden = 1;
+            w->pixels = (uint32_t *)0;
+            if (drag_win_idx == i) { drag_active = 0; drag_win_idx = -1; }
+            if (wm_active == i) focus_gone = 1;
+        }
+    }
+    /* Flush all per-slot queues */
+    for (int s = 0; s < MAX_PROCS; s++)
+        wm_flush_slot_queue(s);
+    /* Restore focus */
+    if (focus_gone) {
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (!wm_windows[i].hidden) { wm_set_active(i); break; }
+        }
+    }
+}
+
+/* ================================================================
+ * wm_spawn_kapp — open a ring-0 kernel application window.
+ * If the kapp is already open, just focus it.
+ * ================================================================ */
+void wm_spawn_kapp(int kapp_id) {
+    if (kapp_id < 0 || kapp_id >= NUM_KAPPS) return;
+
+    /* Already open? Just focus it. */
+    if (kapp_is_open(kapp_id)) {
+        int wi = kapp_window_index(kapp_id);
+        if (wi >= 0 && !wm_windows[wi].hidden) {
+            wm_set_active(wi);
+            wm_draw_all();
+            return;
+        }
+    }
+
+    /* Find a free window slot */
+    int wi = -1;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++)
+        if (wm_windows[i].hidden) { wi = i; break; }
+    if (wi < 0) return;
+
+    const kapp_def_t *def = &kapp_defs[kapp_id];
+    wm_window_t *w = &wm_windows[wi];
+
+    /* Position: centered on screen (within desktop usable area) */
+    int avail_y = UI_MENUBAR_H;
+    int avail_h = scr_h - UI_DOCK_H - UI_MENUBAR_H;
+    w->x        = (scr_w - def->def_w) / 2;
+    w->y        = avail_y + (avail_h - def->def_h) / 2;
+    w->width    = def->def_w;
+    w->height   = def->def_h;
+    w->type     = WM_TYPE_KAPP;
+    w->instance = kapp_id;  /* repurpose instance field as kapp type ID */
+    w->hidden   = 0;
+    w->pixels   = (uint32_t *)0;
+    w->owner_slot = -1;
+
+    /* Use the kapp title */
+    strncpy(w->title_buf, def->title, 31);
+    w->title_buf[31] = '\0';
+    w->title = w->title_buf;
+
+    /* Notify the kapp framework */
+    kapp_open(kapp_id, wi);
+
+    wm_set_active(wi);
+    wm_draw_all();
+}
+
+int wm_active_is_kapp(void) {
+    if (wm_windows[wm_active].hidden) return 0;
+    return wm_windows[wm_active].type == WM_TYPE_KAPP;
+}
+
+void wm_kapp_handle_key(int key_type, char ch) {
+    if (!wm_active_is_kapp()) return;
+    wm_window_t *w = &wm_windows[wm_active];
+    kapp_handle_key(w->instance, wm_active, key_type, ch);
+    wm_draw_all();
+}
+
+/* ================================================================
  * wm_set_fs — give the WM a reference to the mounted FAT16 FS.
  * Called by shell_run() after syscall_set_fs().  Enables "Run App..."
  * in the Apps launcher dropdown.
  * ================================================================ */
 void wm_set_fs(fat16_fs_t *fs) {
     wm_fs = fs;
+    kapp_set_fs(fs);   /* also propagate to kapp framework */
 }

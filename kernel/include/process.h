@@ -107,9 +107,40 @@ void proc_send_signal_group(pgid_t pgid, int sig);
 /* Helpers */
 int  proc_find_by_pid(pid_t pid);
 
+/* Instrumentation */
+void proc_dump_table(const char *tag);
+
 /* Pipe blocking: block current process waiting for pipe idx; wake waiters */
 void proc_block_on_pipe(int pipe_idx, registers_t *regs);
 void proc_wake_pipe_waiters(int pipe_idx);
+
+/*
+ * proc_block_on_kbd — put the current process to sleep waiting for a
+ * keyboard scancode.  Saves the register frame with EIP-=2 so that on
+ * wake-up the process re-executes "int $0x80" and retries the read syscall.
+ * Switches to the next runnable process immediately.
+ *
+ * proc_wake_kbd_waiters — called by keyboard_irq_handler after putting a
+ * byte in the scancode ring buffer; sets all kbd-blocked processes RUNNABLE.
+ */
+void proc_block_on_kbd(registers_t *regs);
+void proc_wake_kbd_waiters(void);
+
+/*
+ * Concurrent ELF spawning — non-blocking alternative to exec_elf().
+ *
+ * proc_find_spawn_slot() — return the first free slot index (1–7), or -1.
+ *
+ * proc_spawn_user() — configure process slot `slot` with the given entry
+ *   point, user stack pointer, and physical memory base for 0x300000-0x3FFFFF,
+ *   then mark it PROC_RUNNABLE.  The preemptive timer (IRQ0) will schedule
+ *   it on the next tick.  Does NOT reset the kmalloc heap or the physical
+ *   page pool — safe to call while another process is running.
+ *   Returns `slot` on success, -1 on failure.
+ */
+int proc_find_spawn_slot(void);
+int proc_spawn_user(uint32_t entry, uint32_t user_sp,
+                    int slot, uint32_t phys_user_base);
 
 /* Used by elf.c */
 extern uint32_t kernel_esp;

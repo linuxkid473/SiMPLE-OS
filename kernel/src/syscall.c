@@ -9,7 +9,7 @@
 #include "fat16.h"
 #include "fd.h"
 #include "gdt.h"
-#include "keyboard.h"
+#include "keyboard.h"   /* kb_scancode_available, proc_block_on_kbd */
 #include "klog.h"
 #include "paging.h"
 #include "pipe.h"
@@ -495,6 +495,12 @@ int32_t sys_linux_write(int32_t fd, const char *buf, uint32_t len) {
     if (len > 0x8000) len = 0x8000;
 
     if (fd == 1 || fd == 2) {
+        /* Check if stdout/stderr has been redirected via dup2 to a pipe */
+        file_desc_t *f01 = fd_get(syscall_get_fd_table(), fd);
+        if (f01 && f01->type == FD_PIPE_W) {
+            if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
+            return (int32_t)pipe_write(f01->pipe.pipe_idx, buf, len);
+        }
         /* stdout / stderr: write to VGA */
         if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
         for (uint32_t i = 0; i < len; i++)
@@ -542,12 +548,25 @@ int32_t sys_linux_write(int32_t fd, const char *buf, uint32_t len) {
 }
 
 int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
-    (void)regs;
     if (len == 0) return 0;
     if (!user_ptr_ok(buf, len)) return -(int32_t)EFAULT;
 
     if (fd == 0) {
-        /* stdin: keyboard */
+        /* stdin: keyboard.
+         *
+         * If the scancode ring buffer is empty AND other processes are
+         * runnable, block this process (PROC_BLOCKED) and switch away.
+         * keyboard_irq_handler() will set it PROC_RUNNABLE when a key
+         * arrives, and the re-executed int $0x80 will retry from scratch.
+         *
+         * This prevents process 0's stdin poll from starving GUI processes
+         * by holding the CPU in a ring-0 busy loop. */
+        if (!kb_scancode_available() && current_proc >= 0) {
+            proc_block_on_kbd(regs);
+            /* If we returned (no other process to switch to), fall through
+             * and call console_read_line normally. */
+        }
+
         if (tty_is_canon()) {
             /* Canonical mode: read a full line */
             console_read_line(buf, len);
@@ -1152,7 +1171,7 @@ typedef struct {
     int32_t tv_nsec;
 } timespec_t;
 
-int32_t sys_linux_nanosleep(const void *req, void *rem) {
+int32_t sys_linux_nanosleep(const void *req, void *rem, registers_t *regs) {
     if (!user_ptr_ok(req, sizeof(timespec_t))) return -(int32_t)EFAULT;
     const timespec_t *rq = (const timespec_t *)req;
 
@@ -1170,12 +1189,14 @@ int32_t sys_linux_nanosleep(const void *req, void *rem) {
 
     if (ticks == 0) return 0;
 
-    /* Use proc_sleep but we can't call it directly here since we need regs */
-    /* Simple busy-wait for small sleeps */
-    uint32_t wake_at = pit_ticks() + ticks;
-    while (pit_ticks() < wake_at)
-        __asm__ volatile("hlt");
-
+    /*
+     * Use proc_sleep() so that other processes can run while this one sleeps.
+     * proc_sleep saves the current register frame, marks this process as
+     * PROC_SLEEPING, and switches to the next runnable process.  When the
+     * PIT timer wakes this process again it resumes here with eax=0.
+     * Falls back to a single-process HLT loop when no other process exists.
+     */
+    proc_sleep(regs, ticks);
     return 0;
 }
 

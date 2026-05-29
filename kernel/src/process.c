@@ -14,9 +14,17 @@
 #include "serial.h"
 #include "signal.h"
 #include "types.h"
+#include "wm.h"
 
 process_t proc_table[MAX_PROCS];
 int       current_proc = -1;
+
+/* Saved ISR frame for the ring-0 shell (hlt loop).
+ * Captured by proc_timer_tick before the first ever switch to ring-3.
+ * Restored by proc_exit when the last ring-3 process exits and kernel_esp==0
+ * (i.e., exec_elf_spawn was used, not the blocking exec_elf). */
+static registers_t saved_ring0_regs;
+static int         ring0_has_saved_context = 0;
 
 /* Per-process page directories, page tables, and ISR kernel stacks. */
 static uint32_t proc_pdirs  [MAX_PROCS][1024] __attribute__((aligned(4096)));
@@ -45,6 +53,9 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     /* Reset any leftover zombie child slots from a previous run. */
     for (int i = 1; i < MAX_PROCS; i++)
         proc_table[i].state = PROC_DEAD;
+
+    /* Clean up any stale USER windows from a previous ELF session. */
+    wm_cleanup_all_user_windows();
 
     kmalloc_reset();
 
@@ -149,14 +160,37 @@ static int sched_next_after(int from) {
     return -1;
 }
 
-static int proc_alive_count(void) {
-    int n = 0;
+/* ------------------------------------------------------------------ *
+ * INSTRUMENTATION — dumps full process table + WM window table to    *
+ * COM1 serial.  Call from SYS_WM_CREATE, proc_exit, etc. for Phase   *
+ * 1/2 evidence capture.                                               *
+ * ------------------------------------------------------------------ */
+static const char *state_names[] = {
+    "DEAD", "RUNNING", "RUNNABLE", "ZOMBIE", "BLOCKED", "SLEEPING"
+};
+
+void proc_dump_table(const char *tag) {
+    serial_write(COM1, "[PTBL] --- ");
+    serial_write(COM1, tag);
+    serial_write(COM1, " current_proc=");
+    if (current_proc < 0)
+        serial_write(COM1, "ring0");
+    else
+        serial_write_dec(COM1, (uint32_t)current_proc);
+    serial_write(COM1, " ring0_saved=");
+    serial_write_dec(COM1, (uint32_t)ring0_has_saved_context);
+    serial_write(COM1, "\n");
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (proc_table[i].state == PROC_RUNNING ||
-            proc_table[i].state == PROC_RUNNABLE)
-            n++;
+        if (proc_table[i].state == PROC_DEAD) continue;
+        serial_write(COM1, "[PTBL]   slot=");
+        serial_write_dec(COM1, (uint32_t)i);
+        serial_write(COM1, " pid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[i].pid);
+        serial_write(COM1, " state=");
+        uint32_t s = (uint32_t)proc_table[i].state;
+        serial_write(COM1, s < 6 ? state_names[s] : "?");
+        serial_write(COM1, "\n");
     }
-    return n;
 }
 
 static void do_switch(int next_slot, registers_t *regs) {
@@ -204,12 +238,18 @@ void proc_exit(registers_t *regs, int status) {
             if (proc_table[dying].fd_table.fds[fd].type != FD_NONE)
                 fd_close(&proc_table[dying].fd_table, fd);
 
-        proc_table[dying].state       = PROC_ZOMBIE;
+        /* Release any USER windows owned by this process */
+        wm_cleanup_for_slot(dying);
+
         proc_table[dying].exit_status = status;
 
         /* Send SIGCHLD to parent; if parent is blocked in wait, reap and wake */
         pid_t ppid = proc_table[dying].parent_pid;
-        if (ppid >= 0) {
+        if (ppid < 0) {
+            /* Orphan (no parent) — auto-reap immediately so slot can be reused */
+            proc_table[dying].state = PROC_DEAD;
+        } else {
+            proc_table[dying].state = PROC_ZOMBIE;
             for (int i = 0; i < MAX_PROCS; i++) {
                 if (proc_table[i].pid == ppid) {
                     /* Send SIGCHLD */
@@ -259,9 +299,32 @@ void proc_exit(registers_t *regs, int status) {
 
     current_proc   = -1;
     process_exited = 1;
-    regs->eip    = (uint32_t)exit_trampoline;
-    regs->cs     = SEG_KCODE;
-    regs->eflags = 0x02;
+
+    proc_dump_table("last-exit");
+
+    if (kernel_esp != 0) {
+        /* Blocking exec_elf() path — exit_trampoline restores the kernel stack
+         * saved by launch_ring3 and returns into exec_elf(). */
+        serial_write(COM1, "[proc] restoring via exit_trampoline\n");
+        regs->eip    = (uint32_t)exit_trampoline;
+        regs->cs     = SEG_KCODE;
+        regs->eflags = 0x02;
+    } else if (ring0_has_saved_context) {
+        /* Non-blocking exec_elf_spawn() path — restore the ring-0 shell's ISR
+         * frame so IRET resumes the hlt loop inside console_read_line_opts. */
+        serial_write(COM1, "[proc] restoring ring-0 context\n");
+        wm_cleanup_all_user_windows();
+        kmalloc_reset();
+        paging_reset_phys_heap();
+        *regs = saved_ring0_regs;
+        ring0_has_saved_context = 0;
+    } else {
+        /* No saved context (e.g. very early crash) — fire trampoline anyway;
+         * kernel_esp==0 will triple-fault but that is the existing behaviour. */
+        regs->eip    = (uint32_t)exit_trampoline;
+        regs->cs     = SEG_KCODE;
+        regs->eflags = 0x02;
+    }
 }
 
 int proc_fork(registers_t *regs) {
@@ -572,8 +635,15 @@ void proc_timer_tick(registers_t *regs) {
     }
 
     if (current_proc < 0) {
+        /* Ring-0 shell is active.  Check for any runnable ring-3 process. */
         for (int i = 0; i < MAX_PROCS; i++) {
             if (proc_table[i].state == PROC_RUNNABLE) {
+                /* Always save the current ring-0 ISR frame before switching.
+                 * This keeps saved_ring0_regs up-to-date on every yield so
+                 * that proc_exit restores the LATEST ring-0 position, not a
+                 * stale snapshot from the very first switch. */
+                saved_ring0_regs = *regs;
+                ring0_has_saved_context = 1;
                 do_switch(i, regs);
                 return;
             }
@@ -581,8 +651,10 @@ void proc_timer_tick(registers_t *regs) {
         return;
     }
 
+    /* current_proc >= 0: a ring-3 process is running. */
+
+    /* Interrupted inside a kernel (ring-0) path — never preempt. */
     if ((regs->cs & 3) != 3) return;
-    if (proc_alive_count() < 2) return;
 
     if (proc_table[current_proc].ticks_remaining > 0)
         proc_table[current_proc].ticks_remaining--;
@@ -590,16 +662,30 @@ void proc_timer_tick(registers_t *regs) {
     if (proc_table[current_proc].ticks_remaining > 0)
         return;
 
+    /* Timeslice exhausted.  Try another ring-3 process first. */
     int next = sched_next_after(current_proc);
-    if (next < 0) {
-        proc_table[current_proc].ticks_remaining = PROC_TIMESLICE;
+    if (next >= 0) {
+        proc_table[current_proc].saved_regs = *regs;
+        proc_table[current_proc].state      = PROC_RUNNABLE;
+        do_switch(next, regs);
         return;
     }
 
-    proc_table[current_proc].saved_regs = *regs;
-    proc_table[current_proc].state      = PROC_RUNNABLE;
+    /* No other ring-3 process is runnable.
+     * Yield to the ring-0 shell so STerm / console_read_line can process
+     * keyboard input and update its display.  Ring-0 runs briefly (until its
+     * own hlt wakes on the next timer tick) then switches back to ring-3. */
+    if (ring0_has_saved_context) {
+        proc_table[current_proc].saved_regs = *regs;
+        proc_table[current_proc].state      = PROC_RUNNABLE;
+        current_proc = -1;
+        *regs = saved_ring0_regs;
+        serial_write(COM1, "[sched] yield ring3→ring0\n");
+        return;
+    }
 
-    do_switch(next, regs);
+    /* Fallback: no ring-0 context (shouldn't happen in spawn-only path). */
+    proc_table[current_proc].ticks_remaining = PROC_TIMESLICE;
 }
 
 /*
@@ -622,6 +708,134 @@ void proc_block_on_pipe(int pipe_idx, registers_t *regs) {
         return;
     }
     do_switch(next, regs);
+}
+
+/* ================================================================
+ * Keyboard blocking — used by sys_linux_read(fd=0) so that a process
+ * waiting for stdin yields the CPU to GUI processes instead of
+ * busy-spinning in ring-0 via keyboard_read_event.
+ *
+ * pipe_wait_idx == -2 is the sentinel for "blocked on keyboard".
+ * ================================================================ */
+#define KBD_WAIT_SENTINEL  (-2)
+
+void proc_block_on_kbd(registers_t *regs) {
+    if (current_proc < 0) return;
+
+    proc_table[current_proc].pipe_wait_idx  = KBD_WAIT_SENTINEL;
+    proc_table[current_proc].saved_regs     = *regs;
+    proc_table[current_proc].saved_regs.eip -= 2;   /* re-execute int $0x80 */
+    proc_table[current_proc].state          = PROC_BLOCKED;
+
+    int next = sched_next_after(current_proc);
+    if (next < 0) {
+        /* No other runnable process — fall back to staying alive */
+        proc_table[current_proc].state          = PROC_RUNNABLE;
+        proc_table[current_proc].pipe_wait_idx  = -1;
+        return;
+    }
+    do_switch(next, regs);
+}
+
+void proc_wake_kbd_waiters(void) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state          == PROC_BLOCKED &&
+            proc_table[i].pipe_wait_idx  == KBD_WAIT_SENTINEL) {
+            proc_table[i].state         = PROC_RUNNABLE;
+            proc_table[i].pipe_wait_idx = -1;
+        }
+    }
+}
+
+/* ================================================================
+ * Concurrent ELF spawning
+ * ================================================================ */
+
+int proc_find_spawn_slot(void) {
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (proc_table[i].state == PROC_DEAD) return i;
+    return -1;
+}
+
+/*
+ * Set up process slot `slot` as a fresh ring-3 user process and make it
+ * PROC_RUNNABLE.  The preemptive timer will switch to it at the next tick.
+ *
+ * phys_user_base — physical (= supervisor virtual) address of the 1 MB
+ *   block that will back 0x300000–0x3FFFFF in the new process's page dir.
+ *   The caller has already copied ELF segments there.
+ */
+int proc_spawn_user(uint32_t entry, uint32_t user_sp,
+                    int slot, uint32_t phys_user_base)
+{
+    if (slot < 1 || slot >= MAX_PROCS) return -1;
+    if (proc_table[slot].state != PROC_DEAD)  return -1;
+
+    process_t *p = &proc_table[slot];
+
+    /* Identity */
+    p->pid             = slot + 1;
+    p->parent_pid      = -1;          /* independent — not a fork() child */
+    p->pgid            = slot + 1;
+    p->sid             = slot + 1;
+    p->uid  = p->euid  = 0;
+    p->gid  = p->egid  = 0;
+    p->umask           = 022;
+    p->exit_status     = 0;
+    p->ticks_remaining = PROC_TIMESLICE;
+    p->brk             = USER_STACK;  /* spawned apps don't use sbrk */
+    p->pipe_wait_idx   = -1;
+    p->sig_pending     = 0;
+    p->sig_mask        = 0;
+    p->cwd[0] = '/'; p->cwd[1] = '\0';
+    for (int s = 0; s < NSIG; s++) {
+        p->sig_actions[s].sa_handler = SIG_DFL;
+        p->sig_actions[s].sa_flags   = 0;
+        p->sig_actions[s].sa_mask    = 0;
+    }
+    fd_table_init(&p->fd_table);
+    /* Pre-wire stdin/stdout/stderr so the first open() gets fd=3, not fd=0.
+     * Without this, fopen() returns fd=0 and read(0,...) hits the stdin
+     * special-case, turning every file read into a keyboard read. */
+    fd_alloc_tty(&p->fd_table, O_RDONLY);  /* fd 0 = stdin  */
+    fd_alloc_tty(&p->fd_table, O_WRONLY);  /* fd 1 = stdout */
+    fd_alloc_tty(&p->fd_table, O_WRONLY);  /* fd 2 = stderr */
+
+    /* Page directory: kernel layout + user region remapped to phys_user_base */
+    paging_clone(proc_pdirs[slot], proc_ptabs[slot],
+                 proc_ptabs1[slot], phys_user_base);
+    p->page_dir = proc_pdirs[slot];
+
+    /*
+     * Initial CPU state for IRET into ring-3.
+     * The ISR pops registers_t in order then executes IRET.
+     * Fields that matter: eip, cs, eflags, useresp, ss.
+     * Segment regs ds/es/fs/gs are restored by the ISR's pop instructions.
+     */
+    registers_t *r = &p->saved_regs;
+    r->ds = r->es = r->fs = r->gs = 0x23;  /* user data DPL=3 */
+    r->ss         = 0x23;
+    r->cs         = 0x1B;   /* user code DPL=3 */
+    r->eip        = entry;
+    r->useresp    = user_sp;
+    r->eflags     = 0x200;  /* IF=1 — enable timer preemption in ring3 */
+    r->eax = r->ebx = r->ecx = r->edx = 0;
+    r->esi = r->edi = r->ebp = r->esp  = 0;
+    r->int_no = r->err_code = 0;
+
+    /* Mark runnable — do_switch() will call tss_set_esp0(proc_kstacks[slot])
+     * when the scheduler actually runs this process. */
+    p->state = PROC_RUNNABLE;
+
+    serial_write(COM1, "[proc] spawn pid=");
+    serial_write_dec(COM1, (uint32_t)p->pid);
+    serial_write(COM1, " slot=");
+    serial_write_dec(COM1, (uint32_t)slot);
+    serial_write(COM1, " phys=");
+    serial_write_hex(COM1, phys_user_base);
+    serial_write(COM1, "\n");
+
+    return slot;
 }
 
 /* Wake any process blocked on pipe pipe_idx. */

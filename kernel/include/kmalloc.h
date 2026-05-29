@@ -9,5 +9,7 @@ void kmalloc_init(uint32_t heap_start);
 void* kmalloc(size_t size);
 void kfree(void* ptr);
 void kmalloc_reset(void);
+uint32_t kmalloc_used(void);
+uint32_t kmalloc_total(void);
 
 #endif

@@ -163,13 +163,16 @@ void console_read_line_opts(
         if (!wm_active_is_terminal()) {
             if (wm_active_is_stext()) {
                 wm_stext_handle_key((int)event.type, event.ch);
-            } else {
-                /* Calculator */
+            } else if (wm_windows[wm_active].type == WM_TYPE_CALC) {
                 if (event.type == KEY_EVENT_CHAR)
                     wm_calc_handle_char(event.ch);
                 else if (event.type == KEY_EVENT_BACKSPACE)
                     wm_calc_handle_char('\b');
+            } else if (wm_active_is_kapp()) {
+                wm_kapp_handle_key((int)event.type, event.ch);
             }
+            /* WM_TYPE_USER: keys already queued by wm_push_key() in the
+             * keyboard IRQ handler — nothing more to do here. */
             continue;
         }
 

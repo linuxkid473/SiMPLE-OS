@@ -1,12 +1,71 @@
 #include "keyboard.h"
 #include "io.h"
 #include "mouse.h"
+#include "pic.h"
+#include "process.h"
 #include "wm.h"
 
 static int shift_pressed    = 0;
 static int alt_pressed      = 0;
 static int ctrl_pressed     = 0;
 static int extended_prefix  = 0;
+
+/* ================================================================
+ * Scancode ring buffer — filled by keyboard_irq_handler (IRQ1),
+ * drained by keyboard_read_event().
+ * ================================================================ */
+#define KB_BUF_SIZE 64
+static volatile uint8_t kb_buf [KB_BUF_SIZE];
+static volatile uint8_t kb_head = 0;   /* write pointer (IRQ1 side) */
+static volatile uint8_t kb_tail = 0;   /* read  pointer (poll side) */
+
+static void kb_push(uint8_t sc) {
+    uint8_t next = (uint8_t)((kb_head + 1u) % KB_BUF_SIZE);
+    if (next != kb_tail) {   /* drop if full */
+        kb_buf[kb_head] = sc;
+        kb_head = next;
+    }
+}
+
+static int kb_pop(uint8_t *sc) {
+    if (kb_tail == kb_head) return 0;
+    *sc = kb_buf[kb_tail];
+    kb_tail = (uint8_t)((kb_tail + 1u) % KB_BUF_SIZE);
+    return 1;
+}
+
+int kb_scancode_available(void) {
+    return kb_tail != kb_head;
+}
+
+/* ================================================================
+ * keyboard_irq_handler — IRQ1 (vector 0x21), called from isr_handler.
+ *
+ * Reads the byte from the PS/2 output buffer.
+ * - Mouse bytes  (status bit 5 set): forwarded to mouse_handle_byte.
+ * - Keyboard bytes: pushed to kb_buf AND injected into the WM slot
+ *   queue via wm_push_key so GUI apps receive key events even while
+ *   another process is sleeping.
+ * Wakes any process blocked in proc_block_on_kbd().
+ * Sends EOI before returning.
+ * ================================================================ */
+void keyboard_irq_handler(void) {
+    uint8_t status = inb(0x64);
+    if (status & 0x01u) {
+        uint8_t data = inb(0x60);
+        if (status & 0x20u) {
+            mouse_handle_byte(data);
+        } else {
+            kb_push(data);
+            /* Route to WM event system (non-blocking, just queue push) */
+            if (data != 0xE0u)
+                wm_push_key(data);
+            /* Wake any process blocked waiting for keyboard stdin */
+            proc_wake_kbd_waiters();
+        }
+    }
+    pic_eoi(1);
+}
 
 static const char keymap[128] = {
     0, 27, '1', '2', '3', '4', '5', '6',
@@ -35,6 +94,8 @@ void keyboard_init(void) {
     alt_pressed     = 0;
     ctrl_pressed    = 0;
     extended_prefix = 0;
+    kb_head = 0;
+    kb_tail = 0;
 
     /* Re-enable the keyboard port (command 0xAE to the PS/2 controller).
      * Limine and some firmware leave the port disabled before handoff. */
@@ -47,6 +108,33 @@ void keyboard_init(void) {
         if ((inb(0x64) & 0x01) == 0) break;
         (void)inb(0x60);
     }
+
+    /*
+     * Enable keyboard interrupt (IRQ1) in the PS/2 controller command byte.
+     * Without setting bit 0 of the command byte, the PS/2 controller never
+     * asserts IRQ1 — unmasking it in the PIC alone is not sufficient.
+     *
+     * Command sequence:
+     *   0x20 → read current command byte from controller
+     *   0x60 → write new command byte to controller
+     */
+    for (uint32_t i = 0; i < 100000; i++)
+        if ((inb(0x64) & 0x02) == 0) break;
+    outb(0x64, 0x20);   /* Read Command Byte */
+    for (uint32_t i = 0; i < 100000; i++)
+        if (inb(0x64) & 0x01) break;
+    uint8_t cb = inb(0x60);
+    cb |= 0x01u;        /* bit 0: enable keyboard interrupt (IRQ1) */
+    cb &= (uint8_t)~0x10u;  /* bit 4 clear: enable keyboard clock */
+    for (uint32_t i = 0; i < 100000; i++)
+        if ((inb(0x64) & 0x02) == 0) break;
+    outb(0x64, 0x60);   /* Write Command Byte */
+    for (uint32_t i = 0; i < 100000; i++)
+        if ((inb(0x64) & 0x02) == 0) break;
+    outb(0x60, cb);
+
+    /* Unmask IRQ1 in the PIC so keyboard interrupts reach the CPU. */
+    pic_unmask(1);
 }
 
 int keyboard_is_alt_pressed(void) {
@@ -62,27 +150,44 @@ void keyboard_read_event(key_event_t* event) {
     event->ch = 0;
 
     while (1) {
-        uint8_t status = inb(0x64);
-        if ((status & 0x01) == 0) {
-            continue;
+        uint8_t scancode;
+
+        /* Fast path: drain ring buffer filled by IRQ1 handler */
+        if (kb_pop(&scancode)) {
+            /* wm_push_key() already called by keyboard_irq_handler */
+            goto process_scancode;
         }
 
-        uint8_t scancode = inb(0x60);
-        if (status & 0x20) {
-            mouse_handle_byte(scancode);
-            continue;
+        /* Fallback: poll PS/2 directly.
+         * Mouse bytes: forward to mouse driver.
+         * Keyboard bytes: process directly WITHOUT pushing to ring buffer
+         *   (avoids doubles — byte is consumed here, IRQ1 won't fire for it). */
+        {
+            uint8_t st = inb(0x64);
+            if (st & 0x01u) {
+                uint8_t data = inb(0x60);
+                if (st & 0x20u) {
+                    mouse_handle_byte(data);
+                    continue;
+                }
+                /* Keyboard byte: process in-place, skip ring buffer */
+                scancode = data;
+                goto process_scancode;
+            }
         }
 
+        /* Both ring buffer and PS/2 are empty — sleep until next interrupt */
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+        continue;
+
+process_scancode:
         if (scancode == 0xE0) {
             extended_prefix = 1;
             continue;
         }
 
-        /* Inject raw scancode into the user WM event queue.
-         * Extended-key prefixes (0xE0) are filtered above; all other
-         * scancodes — presses (bit7=0) and releases (bit7=1) — are
-         * forwarded so user programs get the full PS/2 stream. */
-        wm_push_key(scancode);
+        /* NOTE: wm_push_key() called by IRQ handler (fast path) or
+         * by the polling fallback above.  Do NOT call it again here. */
 
         if (extended_prefix) {
             extended_prefix = 0;

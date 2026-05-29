@@ -77,11 +77,10 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
 #define WM_STEXT_W 364
 #define WM_STEXT_H 156
 
-/* Maximum simultaneous windows on screen.
- * 3 app types × 3 instances each = 9 worst case. */
-#define WM_MAX_WINDOWS    9
+/* Maximum simultaneous windows on screen. */
+#define WM_MAX_WINDOWS    20
 
-/* Per-type instance pool sizes.  Sum must fit in WM_MAX_WINDOWS. */
+/* Per-type instance pool sizes.  Sum + NUM_KAPPS must fit in WM_MAX_WINDOWS. */
 #define WM_MAX_TERM_INST  3
 #define WM_MAX_CALC_INST  3
 #define WM_MAX_STEXT_INST 3
@@ -91,7 +90,8 @@ typedef enum {
     WM_TYPE_TERMINAL = 0,
     WM_TYPE_CALC,
     WM_TYPE_STEXT,
-    WM_TYPE_USER    /* ring-3 pixel-buffer window created via SYS_WM_CREATE */
+    WM_TYPE_USER,   /* ring-3 pixel-buffer window created via SYS_WM_CREATE */
+    WM_TYPE_KAPP    /* ring-0 kernel application window */
 } wm_win_type_t;
 
 /* ---- window descriptor ---- */
@@ -105,6 +105,7 @@ typedef struct {
     int            hidden;      /* 1 = not rendered, not focusable,
                                  *     not hit-tested by mouse             */
     uint32_t      *pixels;      /* backing store for WM_TYPE_USER only    */
+    int            owner_slot;  /* process slot that owns this window (-1=kernel) */
 } wm_window_t;
 
 /* ---- global state (read-only outside wm.c) ---- */
@@ -158,5 +159,21 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons);
 /* Give the WM a reference to the mounted FAT16 filesystem.
  * Enables "Run App..." in the Apps launcher.  Pass NULL to disable. */
 void wm_set_fs(fat16_fs_t *fs);
+
+/* Spawn a ring-0 kernel application window by kapp ID.
+ * If the kapp is already open, just focuses it.  No-op if no free slot. */
+void wm_spawn_kapp(int kapp_id);
+
+/* Key routing for the active kapp window (called from console.c). */
+int  wm_active_is_kapp(void);
+void wm_kapp_handle_key(int key_type, char ch);
+
+/* Hide and free all USER windows owned by the given process slot.
+ * Safe to call from proc_exit(); no-op if slot has no USER windows. */
+void wm_cleanup_for_slot(int slot);
+
+/* Hide and free every WM_TYPE_USER window regardless of owner.
+ * Called by proc_register_initial() for a clean slate before each ELF run. */
+void wm_cleanup_all_user_windows(void);
 
 #endif

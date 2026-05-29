@@ -30,6 +30,7 @@
 .global isr29
 .global isr30
 .global isr31
+.global isr33
 .global isr34
 .global isr48
 /* IRQ stubs — hardware interrupts remapped to 0x20-0x2F after pic_init() */
@@ -128,6 +129,7 @@ MAKE_ISR_NOERR 30
 MAKE_ISR_NOERR 31
 
 /* software interrupt stubs for inttest2 (0x22=34) and inttest (0x30=48) */
+MAKE_ISR_NOERR 33   /* IRQ1 — keyboard interrupt */
 MAKE_ISR_NOERR 34
 MAKE_ISR_NOERR 48
 

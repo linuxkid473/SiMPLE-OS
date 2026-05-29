@@ -176,6 +176,54 @@ uint32_t build_posix_stack(const char *path) {
 }
 
 /* -------------------------------------------------------------------------
+   Physical-memory POSIX stack builder (used by exec_elf_spawn)
+   ---------------------------------------------------------------------- */
+
+/*
+ * Identical logic to build_posix_stack() but writes into a physical memory
+ * block instead of the live virtual user address space.
+ *
+ * phys_mem  — start of the 1 MB block (kernel virtual = physical addr).
+ *   In the spawned process's page dir, this block is mapped to USER_BASE,
+ *   so virtual address = USER_BASE + offset_within_block.
+ */
+uint32_t build_posix_stack_phys(uint8_t *phys_mem, const char *path) {
+    /* Stack top in physical memory: offset of USER_INITIAL_SP within user space */
+    uint32_t top_off = USER_INITIAL_SP - USER_BASE;
+    uint8_t *p       = phys_mem + top_off;
+
+    /* argv[0] path string */
+    size_t len = strlen(path) + 1;
+    p -= len;
+    for (size_t i = 0; i < len; i++) p[i] = path[i];
+    /* Virtual address of the path string as seen by the process */
+    uint32_t argv0_vaddr = USER_BASE + (uint32_t)(p - phys_mem);
+
+    /* Align to 4 bytes */
+    p = (uint8_t *)((uint32_t)p & ~3U);
+
+    /* auxv: AT_NULL (type=0, value=0) */
+    p -= 4; *(uint32_t *)p = 0;
+    p -= 4; *(uint32_t *)p = 0;
+
+    /* envp: NULL terminator */
+    p -= 4; *(uint32_t *)p = 0;
+
+    /* argv: argv[0] pointer, NULL terminator */
+    p -= 4; *(uint32_t *)p = 0;
+    p -= 4; *(uint32_t *)p = argv0_vaddr;
+
+    /* argc = 1 */
+    p -= 4; *(uint32_t *)p = 1;
+
+    /* Fake return address: lands on exit stub if _start does a bare ret */
+    p -= 4; *(uint32_t *)p = EXIT_STUB_ADDR;
+
+    /* Return the VIRTUAL user ESP (process sees USER_BASE-relative addresses) */
+    return USER_BASE + (uint32_t)(p - phys_mem);
+}
+
+/* -------------------------------------------------------------------------
    ELF validation
    ---------------------------------------------------------------------- */
 int elf_validate(void *data) {
@@ -320,4 +368,122 @@ int exec_elf(void *data) {
 
     klog("elf", "program exited");
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+   exec_elf_spawn — non-blocking ELF launcher for concurrent processes
+   ---------------------------------------------------------------------- */
+
+/*
+ * Load the ELF binary at `data` (= PROC_SLOT_PHYS(slot)) into slot `slot`
+ * and make it PROC_RUNNABLE.  Does NOT block, does NOT call kmalloc_reset().
+ *
+ * The ELF binary has already been read from disk into the slot's physical
+ * memory region.  Segments are rearranged in-place (forward copy, safe for
+ * our single-PT_LOAD linker.ld layout where dst_offset ≤ src_offset).
+ *
+ * After this function returns the scheduler will switch to the new process
+ * on the next PIT tick.  When the new process calls SYS_EXIT, proc_exit()
+ * either switches to another live process or fires exit_trampoline (which
+ * returns control to the blocking exec_elf() call that set kernel_esp).
+ */
+int exec_elf_spawn(void *data, uint32_t data_len, int slot) {
+    if (!data || data_len == 0) return -1;
+    if (slot < 1 || slot >= MAX_PROCS) return -1;
+    if (proc_table[slot].state != PROC_DEAD) return -1;
+
+    if (elf_validate(data) != 0) {
+        klog("elf_spawn", "invalid ELF");
+        return -1;
+    }
+
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)data;
+    Elf32_Phdr *phdr = (Elf32_Phdr *)((uint8_t *)data + ehdr->e_phoff);
+
+    /* Compute load bias so first PT_LOAD lands at USER_BASE */
+    uint32_t base = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) { base = USER_BASE - phdr[i].p_vaddr; break; }
+    }
+
+    /* Bounds-check all segments before touching memory */
+    uint32_t entry = ehdr->e_entry + base;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t ds = phdr[i].p_vaddr + base;
+        uint32_t de = ds + phdr[i].p_memsz;
+        if (ds < USER_BASE || de > USER_STACK) { klog("elf_spawn", "segment OOB"); return -1; }
+        if (phdr[i].p_filesz > phdr[i].p_memsz) return -1;
+        if (phdr[i].p_offset + phdr[i].p_filesz < phdr[i].p_offset) return -1;
+    }
+    if (entry < USER_BASE || entry >= USER_STACK) { klog("elf_spawn", "entry OOB"); return -1; }
+
+    /*
+     * Save segment info before any in-place moves that could overwrite the
+     * ELF header / program headers at the start of the buffer.
+     */
+    struct { uint32_t src_off, dst_off, filesz, memsz; } segs[4];
+    int nseg = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum && nseg < 4; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t dst_off = (phdr[i].p_vaddr + base) - USER_BASE;
+        uint32_t filesz  = phdr[i].p_filesz;
+        if (phdr[i].p_offset < data_len && filesz > data_len - phdr[i].p_offset)
+            filesz = data_len - phdr[i].p_offset;
+        segs[nseg].src_off = phdr[i].p_offset;
+        segs[nseg].dst_off = dst_off;
+        segs[nseg].filesz  = filesz;
+        segs[nseg].memsz   = phdr[i].p_memsz;
+        nseg++;
+    }
+
+    uint8_t *pm = (uint8_t *)data;  /* physical base pointer */
+
+    /*
+     * Rearrange segments in-place.
+     * For our single-PT_LOAD layout (p_vaddr=0x300000=USER_BASE),
+     * dst_off = 0 and src_off = p_offset (small, e.g. 0 or 0x1000).
+     * When src_off > dst_off a forward copy is safe (dst ≤ src).
+     * Then zero BSS (p_memsz − p_filesz bytes past the copied data).
+     */
+    for (int s = 0; s < nseg; s++) {
+        uint8_t *dst   = pm + segs[s].dst_off;
+        uint8_t *src   = pm + segs[s].src_off;
+        uint32_t fsz   = segs[s].filesz;
+        uint32_t msz   = segs[s].memsz;
+
+        if (dst != src) {
+            /* Forward copy: safe when dst ≤ src */
+            for (uint32_t j = 0; j < fsz; j++) dst[j] = src[j];
+        }
+        /* Zero BSS */
+        for (uint32_t j = fsz; j < msz; j++) dst[j] = 0;
+    }
+
+    /* Plant exit stub and signal trampoline in physical memory */
+    static const uint8_t sigret_stub[] = {
+        0xB8, 0x77, 0x00, 0x00, 0x00,  /* mov $119, %eax */
+        0xCD, 0x80,                      /* int $0x80      */
+        0xF4                             /* hlt            */
+    };
+    static const uint8_t exit_stub_bytes[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov $1, %eax   */
+        0x31, 0xDB,                      /* xor %ebx,%ebx  */
+        0xCD, 0x80,                      /* int $0x80      */
+        0xF4                             /* hlt            */
+    };
+    uint8_t *sp = pm + (SIG_TRAMPOLINE_ADDR - USER_BASE);
+    for (uint32_t i = 0; i < sizeof(sigret_stub); i++) sp[i] = sigret_stub[i];
+    uint8_t *ep = pm + (EXIT_STUB_ADDR - USER_BASE);
+    for (uint32_t i = 0; i < sizeof(exit_stub_bytes); i++) ep[i] = exit_stub_bytes[i];
+
+    /* Build POSIX stack in physical memory; returns virtual user_sp */
+    uint32_t user_sp = build_posix_stack_phys(pm, "kernel");
+
+    klog_hex("elf_spawn", "slot",     (uint32_t)slot);
+    klog_hex("elf_spawn", "entry",    entry);
+    klog_hex("elf_spawn", "user_sp",  user_sp);
+    klog_hex("elf_spawn", "phys_base",(uint32_t)pm);
+
+    return proc_spawn_user(entry, user_sp, slot, (uint32_t)pm);
 }

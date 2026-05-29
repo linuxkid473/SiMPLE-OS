@@ -51,4 +51,20 @@ int       paging_page_mapped(uint32_t *page_dir, uint32_t vaddr);
  */
 void      paging_reset_phys_heap(void);
 
+/*
+ * Per-slot physical memory for spawned user processes.
+ *
+ * Each process slot 1-7 gets a dedicated 1 MB identity-mapped physical
+ * region above the phys-heap pool (0x900000-0x9FFFFF).  These addresses
+ * live inside PDE[2..3] supervisor 4 MB PSE pages and are always writable
+ * by the kernel as identity-mapped supervisor memory (physical == virtual).
+ *
+ * Slot  1: 0xA00000-0xAFFFFF
+ * Slot  2: 0xB00000-0xBFFFFF
+ * ...
+ * Slot  7: 0x1000000-0x10FFFFF
+ */
+#define PROC_SLOT_PHYS(n)   (0xA00000U + ((uint32_t)((n) - 1) * 0x100000U))
+#define PROC_SLOT_SIZE      0x100000U   /* 1 MB per slot */
+
 #endif

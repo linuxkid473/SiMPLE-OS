@@ -15,6 +15,7 @@
 #include "elf.h"
 #include "fd.h"
 #include "gdt.h"
+#include "keyboard.h"
 #include "klog.h"
 #include "panic.h"
 #include "pic.h"
@@ -62,7 +63,8 @@ extern void isr28(void);
 extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
-extern void isr32(void);   /* IRQ0 — PIT timer, vector 0x20 */
+extern void isr32(void);   /* IRQ0 — PIT timer,     vector 0x20 */
+extern void isr33(void);   /* IRQ1 — keyboard IRQ,  vector 0x21 */
 extern void isr34(void);
 extern void isr48(void);
 extern void isr_syscall(void);
@@ -148,6 +150,7 @@ void idt_init(void) {
     idt_set_gate(31, (uint32_t)isr31, IDT_TYPE_INTERRUPT_GATE);
 
     idt_set_gate(0x20, (uint32_t)isr32, IDT_TYPE_INTERRUPT_GATE);
+    idt_set_gate(0x21, (uint32_t)isr33, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(0x22, (uint32_t)isr34, IDT_TYPE_INTERRUPT_GATE);
     idt_set_gate(0x30, (uint32_t)isr48, IDT_TYPE_INTERRUPT_GATE);
 
@@ -250,7 +253,7 @@ int32_t sys_linux_munmap(uint32_t addr, uint32_t len);
 int32_t sys_linux_chdir(const char *path);
 int32_t sys_linux_getcwd(char *buf, uint32_t len);
 int32_t sys_linux_uname(void *buf);
-int32_t sys_linux_nanosleep(const void *req, void *rem);
+int32_t sys_linux_nanosleep(const void *req, void *rem, registers_t *regs);
 int32_t sys_linux_gettimeofday(void *tv, void *tz);
 int32_t sys_linux_clock_gettime(int clk, void *tp);
 int32_t sys_linux_getdents(int32_t fd, void *buf, uint32_t count);
@@ -437,7 +440,7 @@ static void syscall_handler(registers_t *regs) {
         break;
 
     case 162: /* nanosleep(req, rem) */
-        regs->eax = (uint32_t)sys_linux_nanosleep((const void *)a0, (void *)a1);
+        sys_linux_nanosleep((const void *)a0, (void *)a1, regs);
         break;
 
     case 168: /* poll(fds, nfds, timeout) */
@@ -589,6 +592,14 @@ void isr_handler(registers_t *regs) {
         pit_timer_tick(regs);
         /* Deliver signals after timer tick if returning to user */
         proc_deliver_signals(regs);
+        return;
+    }
+
+    if (regs->int_no == 0x21) {
+        /* IRQ1 — keyboard interrupt.  Reads one byte from PS/2, pushes
+         * it to the scancode ring buffer, wakes kbd-blocked processes.
+         * keyboard_irq_handler() sends EOI before returning. */
+        keyboard_irq_handler();
         return;
     }
 

@@ -37,3 +37,6 @@ void kfree(void* ptr) {
 void kmalloc_reset(void) {
     heap_ptr = heap_start;
 }
+
+uint32_t kmalloc_used(void)  { return (uint32_t)(heap_ptr - heap_start); }
+uint32_t kmalloc_total(void) { return KMALLOC_HEAP_SIZE; }
