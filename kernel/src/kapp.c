@@ -259,6 +259,12 @@ int kapp_is_open(int id) {
     return kapp_win[id] >= 0;
 }
 
+int kapp_any_open(void) {
+    for (int i = 0; i < NUM_KAPPS; i++)
+        if (kapp_win[i] >= 0) return 1;
+    return 0;
+}
+
 int kapp_window_index(int id) {
     if (id < 0 || id >= NUM_KAPPS) return -1;
     return kapp_win[id];

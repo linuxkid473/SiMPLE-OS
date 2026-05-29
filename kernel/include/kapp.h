@@ -78,6 +78,7 @@ void kapp_handle_click(int kapp_id, int wi, int client_x, int client_y);
 void kapp_handle_mouse(int kapp_id, int wi, int client_x, int client_y, int btn_held);
 void kapp_tick_all(void);
 int  kapp_is_open(int kapp_id);
+int  kapp_any_open(void);
 int  kapp_window_index(int kapp_id);
 
 /* FAT16 access shared among kapps */

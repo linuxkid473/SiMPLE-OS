@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "io.h"
+#include "kapp.h"
 #include "mouse.h"
 #include "pic.h"
 #include "pit.h"
@@ -202,8 +203,8 @@ void keyboard_read_event(key_event_t* event) {
 
         /* Both ring buffer and PS/2 are empty — sleep until next interrupt */
         __asm__ volatile("sti; hlt; cli" ::: "memory");
-        /* Idle redraw at ~25 fps so games animate without user input */
-        {
+        /* Idle redraw only when animated kapps are open (games, clock, etc.) */
+        if (kapp_any_open()) {
             static uint32_t idle_frame = 0;
             uint32_t t = pit_ticks();
             if (t - idle_frame >= 4) { idle_frame = t; wm_draw_all(); }
