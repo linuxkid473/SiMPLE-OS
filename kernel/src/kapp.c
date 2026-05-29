@@ -168,6 +168,34 @@ void settings_click(int wi, int x, int y);
 void settings_mouse(int wi, int x, int y, int btn);
 void settings_tick(int wi);
 
+void snake_create(int wi);    void snake_destroy(int wi);
+void snake_render(int wi, int cx, int cy, int cw, int ch);
+void snake_key(int wi, int kt, char ch);
+void snake_click(int wi, int x, int y);
+void snake_mouse(int wi, int x, int y, int btn);
+void snake_tick(int wi);
+
+void breakout_create(int wi); void breakout_destroy(int wi);
+void breakout_render(int wi, int cx, int cy, int cw, int ch);
+void breakout_key(int wi, int kt, char ch);
+void breakout_click(int wi, int x, int y);
+void breakout_mouse(int wi, int x, int y, int btn);
+void breakout_tick(int wi);
+
+void pong_create(int wi);     void pong_destroy(int wi);
+void pong_render(int wi, int cx, int cy, int cw, int ch);
+void pong_key(int wi, int kt, char ch);
+void pong_click(int wi, int x, int y);
+void pong_mouse(int wi, int x, int y, int btn);
+void pong_tick(int wi);
+
+void g2048_create(int wi);    void g2048_destroy(int wi);
+void g2048_render(int wi, int cx, int cy, int cw, int ch);
+void g2048_key(int wi, int kt, char ch);
+void g2048_click(int wi, int x, int y);
+void g2048_mouse(int wi, int x, int y, int btn);
+void g2048_tick(int wi);
+
 /* Global kapp definitions table */
 const kapp_def_t kapp_defs[NUM_KAPPS] = {
     [KAPP_CLOCK]    = { "Clock",        280, 160,
@@ -197,6 +225,18 @@ const kapp_def_t kapp_defs[NUM_KAPPS] = {
     [KAPP_SETTINGS] = { "Settings",     340, 260,
                         settings_create, settings_destroy, settings_render,
                         settings_key,    settings_click,   settings_mouse, settings_tick },
+    [KAPP_SNAKE]    = { "Snake",        296, 230,
+                        snake_create,    snake_destroy,    snake_render,
+                        snake_key,       snake_click,      snake_mouse,    snake_tick },
+    [KAPP_BREAKOUT] = { "Breakout",     364, 262,
+                        breakout_create, breakout_destroy, breakout_render,
+                        breakout_key,    breakout_click,   breakout_mouse, breakout_tick },
+    [KAPP_PONG]     = { "Pong",         368, 252,
+                        pong_create,     pong_destroy,     pong_render,
+                        pong_key,        pong_click,       pong_mouse,     pong_tick },
+    [KAPP_2048]     = { "2048",         256, 296,
+                        g2048_create,    g2048_destroy,    g2048_render,
+                        g2048_key,       g2048_click,      g2048_mouse,    g2048_tick },
 };
 
 /* ================================================================

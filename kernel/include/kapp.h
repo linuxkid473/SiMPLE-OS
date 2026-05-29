@@ -16,7 +16,11 @@
 #define KAPP_FILEMGR  6
 #define KAPP_FILEVIEW 7
 #define KAPP_SETTINGS 8
-#define NUM_KAPPS     9
+#define KAPP_SNAKE    9
+#define KAPP_BREAKOUT 10
+#define KAPP_PONG     11
+#define KAPP_2048     12
+#define NUM_KAPPS     13
 
 /* ---- Color palette ---- */
 #define KA_BG      0x080808U

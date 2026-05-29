@@ -94,8 +94,8 @@ static int launcher_open = 0;
 #define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
 #define LNCHR_MENU_W  148
 #define LNCHR_ITEM_H   14
-/* 13 items: STerm, Calc, SText, + 9 kapps + Run App... */
-#define LNCHR_NITEMS   13
+/* 17 items: STerm, Calc, SText, + 9 utility kapps + 4 game kapps + Run App... */
+#define LNCHR_NITEMS   17
 
 /* ELF browser panel dimensions */
 #define LNCHR_BROWSER_W    164
@@ -702,24 +702,28 @@ static void draw_stext_content(wm_window_t *w) {
 
 /* Menu item labels (index 0-12) */
 static const char *lnchr_labels[LNCHR_NITEMS] = {
-    "STerm",          /* 0 */
-    "Calculator",     /* 1 */
-    "SText",          /* 2 */
-    "Clock",          /* 3  → KAPP_CLOCK   */
-    "SiMPLE Racer",   /* 4  → KAPP_ABOUT   */
-    "System Info",    /* 5  → KAPP_SYSINFO */
-    "Task Manager",   /* 6  → KAPP_TASKMGR */
-    "Paint",          /* 7  → KAPP_PAINT   */
-    "Notepad",        /* 8  → KAPP_NOTEPAD */
-    "File Manager",   /* 9  → KAPP_FILEMGR */
-    "File Viewer",    /* 10 → KAPP_FILEVIEW*/
-    "Settings",       /* 11 → KAPP_SETTINGS*/
-    "Run App...",     /* 12 → ELF browser  */
+    "STerm",          /*  0 */
+    "Calculator",     /*  1 */
+    "SText",          /*  2 */
+    "Clock",          /*  3 → KAPP_CLOCK    */
+    "SiMPLE Racer",   /*  4 → KAPP_ABOUT    */
+    "System Info",    /*  5 → KAPP_SYSINFO  */
+    "Task Manager",   /*  6 → KAPP_TASKMGR  */
+    "Paint",          /*  7 → KAPP_PAINT    */
+    "Notepad",        /*  8 → KAPP_NOTEPAD  */
+    "File Manager",   /*  9 → KAPP_FILEMGR  */
+    "File Viewer",    /* 10 → KAPP_FILEVIEW */
+    "Settings",       /* 11 → KAPP_SETTINGS */
+    "Snake",          /* 12 → KAPP_SNAKE    */
+    "Breakout",       /* 13 → KAPP_BREAKOUT */
+    "Pong",           /* 14 → KAPP_PONG     */
+    "2048",           /* 15 → KAPP_2048     */
+    "Run App...",     /* 16 → ELF browser   */
 };
 
-/* Separator lines drawn ABOVE items 3 and 12 */
+/* Separators above items 3 (utilities), 12 (games), 16 (ELF browser) */
 static int lnchr_is_separator_before(int item) {
-    return (item == 3 || item == 12);
+    return (item == 3 || item == 12 || item == 16);
 }
 
 static void draw_launcher(void) {
@@ -742,7 +746,7 @@ static void draw_launcher(void) {
     if (launcher_open == 1) {
         /* ---- Main dropdown menu ---- */
         /* Compute total height including 2 extra pixels per separator */
-        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 2 * 3;  /* 2 separators × 3px */
+        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 3 * 3;  /* 3 separators × 3px */
         fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_MENU_W, menu_h, COL_MENU_BG);
         /* border */
         fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              LNCHR_MENU_W, 1,       COL_MENU_BD);
@@ -760,9 +764,9 @@ static void draw_launcher(void) {
             }
             uint32_t fg = COL_MENU_FG;
             /* Dim "Run App..." when no FS */
-            if (i == 12 && !wm_fs) fg = 0x556677u;
+            if (i == 16 && !wm_fs) fg = 0x556677u;
             /* Highlight already-open kapps */
-            if (i >= 3 && i <= 11 && kapp_is_open(i - 3)) fg = 0x55FF88u;
+            if (i >= 3 && i <= 15 && kapp_is_open(i - 3)) fg = 0x55FF88u;
             fb_draw_string_px(LNCHR_MENU_X + 8, iy + 3, lnchr_labels[i], fg, COL_MENU_BG);
             iy += LNCHR_ITEM_H;
         }
@@ -1046,7 +1050,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
 
         /* ---- 2a. Launcher main menu (launcher_open == 1) ---- */
         if (!launcher_handled && launcher_open == 1) {
-            int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 2 * 3;
+            int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 3 * 3;
             if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
                               LNCHR_MENU_W, menu_h)) {
                 /* Map click Y to item index, accounting for separator gaps */
@@ -1069,10 +1073,10 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                 } else if (item == 2) { /* "SText" */
                     wm_spawn(WM_TYPE_STEXT);
                     launcher_open = 0;
-                } else if (item >= 3 && item <= 11) { /* Kapp items */
+                } else if (item >= 3 && item <= 15) { /* Kapp items */
                     wm_spawn_kapp(item - 3);
                     launcher_open = 0;
-                } else if (item == 12 && wm_fs) { /* "Run App..." → ELF browser */
+                } else if (item == 16 && wm_fs) { /* "Run App..." → ELF browser */
                     fat16_dirent_t tmp[32];
                     int total = 0;
                     fat16_list_entries(wm_fs, 0, tmp, 32, &total);
