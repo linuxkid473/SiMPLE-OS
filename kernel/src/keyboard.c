@@ -3,6 +3,7 @@
 #include "mouse.h"
 #include "pic.h"
 #include "process.h"
+#include "serial.h"
 #include "wm.h"
 
 static int shift_pressed    = 0;
@@ -38,6 +39,13 @@ int kb_scancode_available(void) {
     return kb_tail != kb_head;
 }
 
+void keyboard_inject_scancode(uint8_t sc) {
+    kb_push(sc);
+    if (sc != 0xE0u)
+        wm_push_key(sc);
+    proc_wake_kbd_waiters();
+}
+
 /* ================================================================
  * keyboard_irq_handler — IRQ1 (vector 0x21), called from isr_handler.
  *
@@ -58,8 +66,23 @@ void keyboard_irq_handler(void) {
         } else {
             kb_push(data);
             /* Route to WM event system (non-blocking, just queue push) */
-            if (data != 0xE0u)
+            if (data != 0xE0u) {
                 wm_push_key(data);
+                /* Phase 5: log key routing so we can see which slot owns input */
+                if (!(data & 0x80u)) {  /* key-down only, reduce noise */
+                    serial_write(COM1, "[INPUT] sc=0x");
+                    serial_write_hex(COM1, data);
+                    serial_write(COM1, " current_proc=");
+                    if (current_proc >= 0) {
+                        serial_write_dec(COM1, (uint32_t)current_proc);
+                        serial_write(COM1, " pid=");
+                        serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
+                    } else {
+                        serial_write(COM1, "ring0");
+                    }
+                    serial_write(COM1, "\n");
+                }
+            }
             /* Wake any process blocked waiting for keyboard stdin */
             proc_wake_kbd_waiters();
         }

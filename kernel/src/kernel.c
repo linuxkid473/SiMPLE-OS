@@ -1,3 +1,4 @@
+#include "ehci.h"
 #include "fat16.h"
 #include "gdt.h"
 #include "idt.h"
@@ -137,9 +138,13 @@ void kernel_main(struct stivale2_struct *s2) {
     vga_set_color(0x0F, 0x00);
     vga_clear();
 
-    kmalloc_init(0x200000);
+    /* Place the heap right after the kernel image so BSS never overlaps it.
+     * _kernel_end is defined by the linker script (page-aligned end of .bss). */
+    extern uint32_t _kernel_end;
+    uint32_t heap_base = (uint32_t)&_kernel_end;
+    kmalloc_init(heap_base);
     klog_boot("memory manager initialized");
-    klog_hex("kmalloc", "heap_start", 0x200000);
+    klog_hex("kmalloc", "heap_start", heap_base);
     klog_hex("kmalloc", "heap_size", KMALLOC_HEAP_SIZE);
 
     proc_init();
@@ -186,6 +191,9 @@ void kernel_main(struct stivale2_struct *s2) {
      * already get IF=1 from launch_ring3's EFLAGS setup */
     __asm__ volatile("sti");
     klog_boot("interrupts enabled (sti)");
+
+    usb_init();
+    klog_boot("USB initialized");
 
     vga_write_line("Welcome to SiMPLE OS");
 

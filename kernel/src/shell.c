@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "console.h"
 #include "editor.h"
+#include "ehci.h"
 #include "elf.h"
 #include "fat16.h"
 #include "fd.h"
@@ -45,7 +46,7 @@ static const char* command_names[] = {
     "help", "about", "ilovelinux", "clear", "echo", "ls", "cd", "open", "edit", "touch",
     "mkdir", "rm", "cp", "mv", "write", "seek", "poweroff", "reboot", "kmalloc-test",
     "kmalloc-stress", "run", "inttest", "inttest2", "div0", "badop",
-    "getpid", "sleep", "stat", "getticks"
+    "getpid", "sleep", "stat", "getticks", "usb"
 };
 static const uint32_t command_count = sizeof(command_names) / sizeof(command_names[0]);
 
@@ -792,6 +793,9 @@ static void shell_help(void) {
     vga_write_line("  sleep <ticks>  - sleep for N PIT ticks (100 Hz)");
     vga_write_line("  stat <file>    - print file/dir size and type");
     vga_write_line("  getticks       - print global PIT tick counter");
+    vga_write_line("  usb            - show USB controllers and HID devices");
+    vga_write_line("  usb ports      - show root hub port status");
+    vga_write_line("  usb devices    - show enumerated HID devices");
 }
 
 static void shell_kmalloc_test(void) {
@@ -1947,6 +1951,55 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
             u32_to_dec(t, num, sizeof(num));
             vga_write("ticks: ");
             vga_write_line(num);
+            continue;
+        }
+
+        if (strcmp(command, "usb") == 0) {
+            const char *sub = next_token(&parse);
+            int show_ports   = sub && strcmp(sub, "ports")   == 0;
+            int show_devices = sub && strcmp(sub, "devices")  == 0;
+            int show_all     = !sub;
+
+            if (show_all || show_ports) {
+                int nc = usb_get_ctrl_count();
+                char ibuf[64];
+                char nbuf[8];
+                vga_write("USB controllers: ");
+                u32_to_dec((uint32_t)nc, nbuf, sizeof(nbuf));
+                vga_write_line(nbuf);
+                for (int i = 0; i < nc; i++) {
+                    vga_write("  [");
+                    u32_to_dec((uint32_t)i, nbuf, sizeof(nbuf));
+                    vga_write(nbuf);
+                    vga_write("] ");
+                    vga_write_line(usb_ctrl_info(i, ibuf, sizeof(ibuf)));
+                }
+            }
+
+            if (show_all || show_devices) {
+                int nh = usb_get_hid_count();
+                char nbuf[8];
+                vga_write("HID devices: ");
+                u32_to_dec((uint32_t)nh, nbuf, sizeof(nbuf));
+                vga_write_line(nbuf);
+                for (int i = 0; i < nh; i++) {
+                    const ehci_hid_t *h = usb_get_hid(i);
+                    if (!h || !h->active) continue;
+                    char tmp[8];
+                    vga_write("  [");
+                    u32_to_dec((uint32_t)i, tmp, sizeof(tmp));
+                    vga_write(tmp);
+                    vga_write("] ");
+                    vga_write((h->hid_type == HID_TYPE_KBD) ? "keyboard" : "mouse");
+                    vga_write(" vid:pid=");
+                    vga_write_hex((uint32_t)h->vendor_id);
+                    vga_write(":");
+                    vga_write_hex((uint32_t)h->product_id);
+                    vga_write(" addr=");
+                    u32_to_dec((uint32_t)h->dev_addr, tmp, sizeof(tmp));
+                    vga_write_line(tmp);
+                }
+            }
             continue;
         }
 

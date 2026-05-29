@@ -276,19 +276,27 @@ void proc_exit(registers_t *regs, int status) {
                     proc_table[i].sig_pending |= (1U << SIGCHLD);
 
                     if (proc_table[i].state == PROC_BLOCKED) {
-                        proc_table[dying].state          = PROC_DEAD;
-                        proc_table[i].saved_regs.eax     = (uint32_t)proc_table[dying].pid;
-                        proc_table[i].state              = PROC_RUNNABLE;
-                        klog_dec("proc", "exit: woke blocked parent", (uint32_t)ppid);
+                        /* Leave dying as ZOMBIE — parent re-executes waitpid()
+                         * via eip-2 and reaps it there (reads exit_status too). */
+                        proc_table[i].state = PROC_RUNNABLE;
+                        serial_write(COM1, "[PROC] pid=");
+                        serial_write_dec(COM1, (uint32_t)proc_table[dying].pid);
+                        serial_write(COM1, " state=ZOMBIE woke parent pid=");
+                        serial_write_dec(COM1, (uint32_t)ppid);
+                        serial_write(COM1, "\n");
                     }
                     break;
                 }
             }
         }
 
-        serial_write(COM1, "[proc] exit pid=");
+        serial_write(COM1, "[PROC] pid=");
         serial_write_dec(COM1, (uint32_t)proc_table[dying].pid);
-        serial_write(COM1, "\n");
+        serial_write(COM1, " ppid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[dying].parent_pid);
+        serial_write(COM1, " state=");
+        serial_write(COM1, (proc_table[dying].state == PROC_DEAD) ? "DEAD" : "ZOMBIE");
+        serial_write(COM1, " (exit)\n");
     }
 
     int next = sched_next_after(dying >= 0 ? dying : 0);
@@ -434,8 +442,12 @@ int proc_fork(registers_t *regs) {
 
     child->state = PROC_RUNNABLE;
 
-    serial_write(COM1, "[proc] fork: child pid=");
+    serial_write(COM1, "[PROC] fork parent_pid=");
+    serial_write_dec(COM1, (uint32_t)parent->pid);
+    serial_write(COM1, " child_pid=");
     serial_write_dec(COM1, (uint32_t)child->pid);
+    serial_write(COM1, " child_slot=");
+    serial_write_dec(COM1, (uint32_t)child_slot);
     serial_write(COM1, " phys=");
     serial_write_hex(COM1, child_phys_base);
     serial_write(COM1, "\n");
@@ -448,7 +460,6 @@ pid_t proc_waitpid(pid_t pid, int *status, int options, registers_t *regs) {
 
     pid_t my_pid = proc_table[current_proc].pid;
 
-retry:
     /* First scan for zombie children matching pid */
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state != PROC_ZOMBIE) continue;
@@ -460,7 +471,11 @@ retry:
         pid_t child_pid = proc_table[i].pid;
         if (status) *status = proc_table[i].exit_status;
         proc_table[i].state = PROC_DEAD;
-        klog_dec("proc", "waitpid: reaped", (uint32_t)child_pid);
+        serial_write(COM1, "[PROC] waitpid: reaped child pid=");
+        serial_write_dec(COM1, (uint32_t)child_pid);
+        serial_write(COM1, " by pid=");
+        serial_write_dec(COM1, (uint32_t)my_pid);
+        serial_write(COM1, "\n");
         return child_pid;
     }
 
@@ -479,21 +494,46 @@ retry:
 
     if (options & WNOHANG) return 0;
 
-    /* Block until a child exits */
-    proc_table[current_proc].saved_regs = *regs;
-    proc_table[current_proc].state      = PROC_BLOCKED;
+    /* Block this process until a child exits.
+     *
+     * Use the eip-2 re-entry pattern (same as proc_block_on_kbd): subtract 2
+     * from the saved EIP so that when proc_exit() wakes us, re-executing
+     * int $0x80 re-enters waitpid and hits the zombie-scan above.
+     *
+     * CRITICAL: capture the waiter slot BEFORE calling do_switch().
+     * do_switch() changes current_proc to the scheduled process.  The old
+     * "goto retry" pattern ran with current_proc = child, which accidentally
+     * blocked the child (PROC_BLOCKED), triggered deadlock-avoidance, then
+     * returned -ECHILD as the child's fork() return value.  The child took
+     * the "fork failed" error path, ran forever as an orphan term.elf clone
+     * that could not receive keyboard events, and the parent stayed
+     * PROC_BLOCKED forever. */
+    int waiter = current_proc;
 
-    int next = sched_next_after(current_proc);
+    serial_write(COM1, "[PROC] pid=");
+    serial_write_dec(COM1, (uint32_t)proc_table[waiter].pid);
+    serial_write(COM1, " ppid=");
+    serial_write_dec(COM1, (uint32_t)proc_table[waiter].parent_pid);
+    serial_write(COM1, " state=BLOCKED reason=WAITPID\n");
+
+    proc_table[waiter].saved_regs     = *regs;
+    proc_table[waiter].saved_regs.eip -= 2;   /* re-execute int $0x80 on wakeup */
+    proc_table[waiter].state          = PROC_BLOCKED;
+
+    int next = sched_next_after(waiter);
     if (next < 0) {
-        /* Deadlock avoidance */
-        proc_table[current_proc].state = PROC_RUNNING;
+        /* No other runnable process — undo block and let caller handle */
+        proc_table[waiter].state          = PROC_RUNNING;
+        proc_table[waiter].saved_regs.eip += 2;
         return -ECHILD;
     }
 
     do_switch(next, regs);
-    /* When we wake, proc_exit set our saved_regs.eax to child pid.
-     * The caller in idt.c will use regs->eax, so go retry to do a real reap. */
-    goto retry;
+    /* IRET takes execution to the next process.  The syscall handler stores
+     * our return value (0) in regs->eax, which is correct: fork() returns 0
+     * to the child.  When the child exits, proc_exit() makes the waiter
+     * RUNNABLE; it re-executes int $0x80 and hits the zombie-scan above. */
+    return 0;
 }
 
 /* Legacy proc_wait wrapper */
@@ -728,13 +768,56 @@ void proc_timer_tick(registers_t *regs) {
     /* No other ring-3 process is runnable.
      * Yield to the ring-0 shell so STerm / console_read_line can process
      * keyboard input and update its display.  Ring-0 runs briefly (until its
-     * own hlt wakes on the next timer tick) then switches back to ring-3. */
+     * own hlt wakes on the next timer tick) then switches back to ring-3.
+     *
+     * IMPORTANT: we must use ring0_resume_trampoline here, same as proc_exit.
+     *
+     * When the PIT originally fired in ring-0 (during sti;hlt;cli),
+     * do_switch() wrote 76 bytes of ring-3 context over the ring-0 ISR frame.
+     * The ring-0 ISR frame is only 68 bytes (no useresp/ss for ring-0→ring-0
+     * interrupts), so ring-3's useresp and ss landed at ring0_E+0 and ring0_E+4,
+     * corrupting whatever was above the ring-0 interrupt frame on the ring-0
+     * kernel stack (e.g. keyboard_read_event's caller return address).
+     *
+     * saved_ring0_regs holds the pre-corruption snapshot.  We:
+     *   1. Repair the two corrupted words above the ring-0 IRET frame.
+     *   2. Rebuild the 3-word IRET frame (EIP/CS/EFLAGS) at ring0_E-12.
+     *   3. Set ring0_resume_target_esp to point at the rebuilt frame.
+     *   4. Redirect execution through ring0_resume_trampoline, which does
+     *         movl ring0_resume_target_esp, %esp; iret
+     *      This switches from the ring-3 kernel stack back to the correct
+     *      ring-0 stack position before executing IRET, restoring the ring-0
+     *      shell with the correct ESP. */
     if (ring0_has_saved_context) {
         proc_table[current_proc].saved_regs = *regs;
         proc_table[current_proc].state      = PROC_RUNNABLE;
         current_proc = -1;
-        *regs = saved_ring0_regs;
-        serial_write(COM1, "[sched] yield ring3→ring0\n");
+
+        /* ring0_E = original ESP value at the moment the ring-0 PIT fired.
+         * saved_ring0_regs.esp = ESP at pusha time = ring0_E - 20. */
+        uint32_t ring0_E    = saved_ring0_regs.esp + 20u;
+        uint32_t *iret_slot = (uint32_t *)(ring0_E - 12u);
+
+        /* Rebuild 3-word IRET frame on the ring-0 stack. */
+        iret_slot[0] = saved_ring0_regs.eip;
+        iret_slot[1] = 0x08u;   /* CS = kernel code segment */
+        iret_slot[2] = saved_ring0_regs.eflags;
+
+        /* Repair the two words above the IRET frame that do_switch corrupted
+         * with ring-3's useresp/ss. */
+        *(uint32_t *)(ring0_E + 0u) = saved_ring0_regs.useresp;
+        *(uint32_t *)(ring0_E + 4u) = saved_ring0_regs.ss;
+
+        ring0_resume_target_esp = (uint32_t)iret_slot;
+
+        /* Restore ring-0 GP registers and redirect EIP through the trampoline
+         * so it switches ESP to the ring-0 stack before executing IRET. */
+        *regs        = saved_ring0_regs;
+        regs->eip    = (uint32_t)ring0_resume_trampoline;
+        regs->cs     = 0x08u;
+        regs->eflags = 0x02u;  /* IF=0; trampoline does cli before iret */
+
+        serial_write(COM1, "[sched] yield ring3→ring0 (trampoline)\n");
         return;
     }
 

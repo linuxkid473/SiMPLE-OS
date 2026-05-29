@@ -33,4 +33,8 @@ int     mouse_get_y(void);
 /* Bitmask: bit 0 = left button, bit 1 = right button, bit 2 = middle. */
 uint8_t mouse_get_buttons(void);
 
+/* Inject a USB HID mouse report directly, bypassing PS/2 packet assembly.
+ * dx/dy are signed relative movement; btns is LMR button bitmask. */
+void mouse_inject_usb(int dx, int dy, uint8_t btns);
+
 #endif

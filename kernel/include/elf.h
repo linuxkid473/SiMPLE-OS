@@ -15,8 +15,8 @@
  * before copying its PT_LOAD segments into user space.
  *
  * Largest binary on disk: term.elf ≈ 873 KB.
- * The buffer is allocated via kmalloc(ELF_LOAD_BUF) starting at 0x200000;
- * 1 MB brings heap_ptr to exactly 0x300000 = USER_BASE (safe, non-overlapping).
+ * The buffer is allocated via kmalloc(ELF_LOAD_BUF) from _kernel_end upwards.
+ * 1 MB is sufficient for the largest ELF (term.elf ≈ 873 KB).
  *
  * sys_exec (fork+exec path) does NOT use this buffer — it reads directly
  * into user space and does an in-place copy, avoiding any size limit.

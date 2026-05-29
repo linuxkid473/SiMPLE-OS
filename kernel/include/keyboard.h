@@ -39,4 +39,9 @@ void keyboard_irq_handler(void);
 /* Returns 1 if the scancode ring buffer has at least one byte. */
 int kb_scancode_available(void);
 
+/* Inject a scancode from a non-PS/2 source (e.g. USB HID).
+ * Behaves exactly like keyboard_irq_handler receiving that byte:
+ * pushes to the ring buffer, routes to WM, wakes kbd waiters. */
+void keyboard_inject_scancode(uint8_t sc);
+
 #endif

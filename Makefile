@@ -180,7 +180,10 @@ user: \
     user/calc.elf    \
     user/term.elf    \
     user/desktop.elf \
-    user/paint.elf
+    user/paint.elf   \
+    user/ticker_a.elf \
+    user/ticker_b.elf \
+    user/ticker_c.elf
 
 # =============================================================================
 # MODERN POSIX user programs — define main(), link against USER_RUNTIME
@@ -193,6 +196,16 @@ user/hello.elf: user/hello.c $(USER_RUNTIME_DEPS)
 # posixtest.elf — simpler smoke-test
 user/posixtest.elf: user/posixtest.c $(USER_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/posixtest.c $(USER_RUNTIME_SRCS)
+
+# ticker_a/b/c.elf — Phase 2 scheduler verification (print A/B/C in a loop)
+user/ticker_a.elf: user/ticker_a.c $(USER_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/ticker_a.c $(USER_RUNTIME_SRCS)
+
+user/ticker_b.elf: user/ticker_b.c $(USER_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/ticker_b.c $(USER_RUNTIME_SRCS)
+
+user/ticker_c.elf: user/ticker_c.c $(USER_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/ticker_c.c $(USER_RUNTIME_SRCS)
 
 # =============================================================================
 # LEGACY user programs — define _start(), link against LEGACY_RUNTIME only
@@ -336,6 +349,9 @@ image: \
 	mcopy -i $(IMAGE)@@1048576 user/term.elf          ::term.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/desktop.elf       ::desktop.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/paint.elf         ::paint.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/ticker_a.elf      ::ticker_a.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/ticker_b.elf      ::ticker_b.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/ticker_c.elf      ::ticker_c.elf; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% \
 	    set 1 boot on 2>/dev/null || true; \
 	$(LIMINE_DEPLOY) $(IMAGE)

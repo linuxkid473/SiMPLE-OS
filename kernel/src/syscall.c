@@ -123,7 +123,7 @@ int32_t sys_close(int32_t fd) {
     return (int32_t)fd_close(syscall_get_fd_table(), (int)fd);
 }
 
-/* File-read staging buffer.  Kernel BSS; must stay < 0x200000 (kmalloc base).
+/* File-read staging buffer.  Kernel BSS; placed before _kernel_end (kmalloc start).
  * 64 KB handles all text/config files; ELF loading uses a separate path. */
 #define FREAD_BUF_SIZE (64 * 1024)
 static char fread_buf[FREAD_BUF_SIZE];

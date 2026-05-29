@@ -30,4 +30,7 @@ SECTIONS
         *(COMMON)
         *(.bss*)
     } :data
+
+    /* Exported so kernel.c can place kmalloc right after kernel image. */
+    _kernel_end = ALIGN(4096);
 }

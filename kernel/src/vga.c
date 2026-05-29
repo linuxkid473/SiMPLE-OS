@@ -176,6 +176,40 @@ void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h) {
     }
 }
 
+/* Blit src (src_w x src_h) scaled to fill dst_w x dst_h at (x,y).
+ * Nearest-neighbour.  Precomputes source-X table to avoid per-pixel division. */
+void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
+                    const uint32_t *src, int src_w, int src_h) {
+    if (!fb_addr || !src || dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) return;
+
+    /* Clip destination rect to framebuffer bounds. */
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + dst_w; if ((uint32_t)x1 > fb_width)  x1 = (int)fb_width;
+    int y1 = y + dst_h; if ((uint32_t)y1 > fb_height) y1 = (int)fb_height;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    uint32_t stride  = fb_pitch / 4;
+    int      draw_w  = x1 - x0;
+
+    /* Precompute source-X indices for the output columns.
+     * Static: kernel is single-threaded, so no re-entrancy issue.
+     * Eliminates the division from the inner loop — the hot path is now just
+     * two indexed loads and one store per pixel. */
+    static uint16_t sx_map[2048];
+    if (draw_w > 2048) return;
+    for (int dx = 0; dx < draw_w; dx++)
+        sx_map[dx] = (uint16_t)(((dx + x0 - x) * src_w) / dst_w);
+
+    for (int py = y0; py < y1; py++) {
+        int sy = ((py - y) * src_h) / dst_h;
+        const uint32_t *src_row = src + (uint32_t)sy * (uint32_t)src_w;
+        uint32_t       *dst_row = fb_addr + (uint32_t)py * stride + (uint32_t)x0;
+        for (int dx = 0; dx < draw_w; dx++)
+            dst_row[dx] = src_row[sx_map[dx]];
+    }
+}
+
 /*
  * Draw a string at a raw pixel position with explicit RGB fg/bg.
  * Used by wm.c to render the title bar text outside the cell grid.

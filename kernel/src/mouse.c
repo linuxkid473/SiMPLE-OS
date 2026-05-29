@@ -122,6 +122,20 @@ void mouse_init(void) {
  * Y axis: positive PS/2 = move up = decrease screen Y.
  * We negate dy so moving the physical mouse up moves the cursor up.
  */
+void mouse_inject_usb(int dx, int dy, uint8_t btns) {
+    if (!mouse_ready) return;
+    prev_btns = buttons;
+    buttons   = btns & 0x07u;
+    mx += dx;
+    my += dy;
+    if (mx < 0)      mx = 0;
+    if (mx >= scr_w) mx = scr_w - 1;
+    if (my < 0)      my = 0;
+    if (my >= scr_h) my = scr_h - 1;
+    wm_handle_mouse(mx, my, buttons, prev_btns);
+    wm_push_mouse_event(mx, my, buttons, prev_btns);
+}
+
 void mouse_handle_byte(uint8_t data) {
     if (!mouse_ready) return;
 

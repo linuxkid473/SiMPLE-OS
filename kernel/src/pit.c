@@ -13,6 +13,7 @@
  *   → return up call chain → iret into next (or same) process
  */
 
+#include "ehci.h"
 #include "io.h"
 #include "klog.h"
 #include "pic.h"
@@ -65,4 +66,6 @@ void pit_timer_tick(registers_t *regs) {
 
     /* Hand off to the scheduler — may modify *regs to switch processes */
     proc_timer_tick(regs);
+
+    usb_poll();
 }

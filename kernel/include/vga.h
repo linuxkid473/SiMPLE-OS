@@ -69,4 +69,9 @@ void fb_draw_string_px(int x, int y, const char* s, uint32_t fg, uint32_t bg);
  * Clips to framebuffer bounds. Used by WM syscalls. */
 void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h);
 
+/* Nearest-neighbour scale-blit: src (src_w x src_h) stretched to
+ * fill dst_w x dst_h at (x, y).  No extra buffer or malloc needed. */
+void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
+                    const uint32_t *src, int src_w, int src_h);
+
 #endif

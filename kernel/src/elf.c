@@ -12,8 +12,8 @@
 /*
  * User address space layout:
  *
- *   0x100000 – ~0x1FFFFF  kernel code + data + BSS  (supervisor)
- *   0x200000 – 0x2FFFFF   kmalloc heap               (supervisor)
+ *   0x100000 – _kernel_end kernel code + data + BSS  (supervisor)
+ *   _kernel_end – ~0x3F0000 kmalloc heap             (supervisor)
  *   0x300000 – 0x3EFFFF   user ELF code/data/BSS     (USER_BASE, user-accessible)
  *   0x3F0000 – 0x3FFFC7   user stack (grows down)    (user-accessible)
  *   0x3FFFC8 – 0x3FFFFF   exit stub + stack frame    (user-accessible)

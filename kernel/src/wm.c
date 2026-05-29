@@ -12,6 +12,12 @@
 #include "serial.h"
 #include "kapp.h"
 
+/* Wallpaper pixel data (400x300, nearest-neighbour scaled to screen at draw time).
+ * Defined in wallpaper.c, compiled as a separate translation unit. */
+#define WP_W 400
+#define WP_H 300
+extern const uint32_t wm_wallpaper[WP_W * WP_H];
+
 /* ================================================================
  * Global window state
  * ================================================================ */
@@ -1185,7 +1191,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
  * the terminal window, so subsequent vga_putc() calls land there.
  * ================================================================ */
 void wm_draw_all(void) {
-    fb_fill_rect(0, 0, scr_w, scr_h, COL_DESKTOP);
+    fb_blit_scaled(0, 0, scr_w, scr_h, wm_wallpaper, WP_W, WP_H);
 
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < WM_MAX_WINDOWS; i++) {
@@ -1386,6 +1392,18 @@ void wm_push_key(uint8_t scancode) {
     e.x    = (int16_t)scancode;
     e.y    = 0;
     e.btn  = 0;
+    /* Phase 5: log which slot owns the focused window (key routing target) */
+    if (!(scancode & 0x80u)) {  /* key-down only */
+        serial_write(COM1, "[WM] key sc=0x");
+        serial_write_hex(COM1, scancode);
+        serial_write(COM1, " -> owner_slot=");
+        serial_write_dec(COM1, (uint32_t)w->owner_slot);
+        serial_write(COM1, " active_wid=");
+        serial_write_dec(COM1, (uint32_t)wm_active);
+        serial_write(COM1, " caller_proc=");
+        serial_write_dec(COM1, (uint32_t)current_proc);
+        serial_write(COM1, "\n");
+    }
     wm_push_to_slot(w->owner_slot, e);
 }
 
