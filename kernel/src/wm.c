@@ -30,10 +30,19 @@ static int scr_h;
 /* ================================================================
  * Drag state — mouse-driven window movement
  * ================================================================ */
-static int drag_active  = 0;   /* 1 while left button held on a title bar */
-static int drag_win_idx = -1;  /* index into wm_windows[]                 */
-static int drag_off_x   = 0;   /* cursor-to-window-origin X offset        */
-static int drag_off_y   = 0;   /* cursor-to-window-origin Y offset        */
+/* drag_mode: 0=none, 1=move (title bar), 2=resize bottom-right, 3=resize bottom-left */
+static int drag_active   = 0;
+static int drag_mode     = 0;
+static int drag_win_idx  = -1;
+static int drag_off_x    = 0;   /* cursor offset from window origin / corner */
+static int drag_off_y    = 0;
+static int drag_right_edge = 0; /* fixed right edge for bottom-left resize   */
+
+/* Size of the corner resize handles (pixels). */
+#define RESIZE_HANDLE  10
+/* Minimum window dimensions. */
+#define WIN_MIN_W      80
+#define WIN_MIN_H      (WM_TITLEBAR_H + 40)
 
 /* ================================================================
  * Per-process event queues.
@@ -588,6 +597,19 @@ static void draw_window_chrome(wm_window_t *w, int is_active) {
                  tw,
                  wh - WM_TITLEBAR_H - WM_BORDER,
                  COL_CLIENTBG);
+
+    /* ---- Resize corner handles (bottom-left / bottom-right) ---- */
+    uint32_t corner_col = is_active ? 0x44FF88 : 0x1A5533;
+    /* Bottom-right — draw a small L-shape (right border + bottom strip) */
+    fb_fill_rect(wx + ww - RESIZE_HANDLE, wy + wh - WM_BORDER,
+                 RESIZE_HANDLE, WM_BORDER, corner_col);
+    fb_fill_rect(wx + ww - WM_BORDER, wy + wh - RESIZE_HANDLE,
+                 WM_BORDER, RESIZE_HANDLE, corner_col);
+    /* Bottom-left — mirror */
+    fb_fill_rect(wx, wy + wh - WM_BORDER,
+                 RESIZE_HANDLE, WM_BORDER, corner_col);
+    fb_fill_rect(wx, wy + wh - RESIZE_HANDLE,
+                 WM_BORDER, RESIZE_HANDLE, corner_col);
 }
 
 static void sync_terminal_client(wm_window_t *w) {
@@ -815,6 +837,22 @@ static int point_in_titlebar(const wm_window_t *w, int px, int py) {
 /* 1 if (px,py) is inside the close button (12×12 at top-right of title bar) */
 static int point_in_close_btn(const wm_window_t *w, int px, int py) {
     return point_in_rect(px, py, w->x + w->width - 16, w->y + 4, 12, 12);
+}
+
+/* Bottom-right corner resize handle */
+static int point_in_resize_br(const wm_window_t *w, int px, int py) {
+    return point_in_rect(px, py,
+                         w->x + w->width  - RESIZE_HANDLE,
+                         w->y + w->height - RESIZE_HANDLE,
+                         RESIZE_HANDLE, RESIZE_HANDLE);
+}
+
+/* Bottom-left corner resize handle */
+static int point_in_resize_bl(const wm_window_t *w, int px, int py) {
+    return point_in_rect(px, py,
+                         w->x,
+                         w->y + w->height - RESIZE_HANDLE,
+                         RESIZE_HANDLE, RESIZE_HANDLE);
 }
 
 /* ================================================================
@@ -1129,13 +1167,29 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
 
                 wm_set_active(i);
 
-                if (point_in_titlebar(&wm_windows[i], x, y)) {
+                if (point_in_resize_br(&wm_windows[i], x, y)) {
+                    /* Bottom-right resize: anchor = top-left corner */
+                    drag_active  = 1;
+                    drag_mode    = 2;
+                    drag_win_idx = i;
+                    drag_off_x   = (wm_windows[i].x + wm_windows[i].width)  - x;
+                    drag_off_y   = (wm_windows[i].y + wm_windows[i].height) - y;
+                } else if (point_in_resize_bl(&wm_windows[i], x, y)) {
+                    /* Bottom-left resize: anchor = top-right corner */
+                    drag_active       = 1;
+                    drag_mode         = 3;
+                    drag_win_idx      = i;
+                    drag_off_x        = x - wm_windows[i].x;
+                    drag_off_y        = (wm_windows[i].y + wm_windows[i].height) - y;
+                    drag_right_edge   = wm_windows[i].x + wm_windows[i].width;
+                } else if (point_in_titlebar(&wm_windows[i], x, y)) {
                     if (point_in_close_btn(&wm_windows[i], x, y)) {
                         /* Close button — hide window and transfer focus */
                         wm_close_window(i);
                     } else {
-                        /* Start drag — only title bar, never client area */
+                        /* Start move drag on title bar */
                         drag_active  = 1;
+                        drag_mode    = 1;
                         drag_win_idx = i;
                         drag_off_x   = x - wm_windows[i].x;
                         drag_off_y   = y - wm_windows[i].y;
@@ -1149,19 +1203,44 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
         }
     }
 
-    /* ---- Drag: move the grabbed window with the cursor ---- */
+    /* ---- Drag update ---- */
     if (drag_active && left_now) {
         wm_window_t *w = &wm_windows[drag_win_idx];
-        w->x = x - drag_off_x;
-        w->y = y - drag_off_y;
-        if (w->x < 0)                w->x = 0;
-        if (w->y < UI_MENUBAR_H)     w->y = UI_MENUBAR_H;
-        if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
-        if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
+        if (drag_mode == 1) {
+            /* Move */
+            w->x = x - drag_off_x;
+            w->y = y - drag_off_y;
+            if (w->x < 0)                           w->x = 0;
+            if (w->y < UI_MENUBAR_H)                w->y = UI_MENUBAR_H;
+            if (w->x + w->width  > scr_w)           w->x = scr_w - w->width;
+            if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
+        } else if (drag_mode == 2) {
+            /* Resize bottom-right: top-left corner fixed */
+            int new_w = (x + drag_off_x) - w->x;
+            int new_h = (y + drag_off_y) - w->y;
+            if (new_w < WIN_MIN_W) new_w = WIN_MIN_W;
+            if (new_h < WIN_MIN_H) new_h = WIN_MIN_H;
+            if (w->x + new_w > scr_w) new_w = scr_w - w->x;
+            if (w->y + new_h > scr_h - UI_DOCK_H) new_h = scr_h - UI_DOCK_H - w->y;
+            w->width  = new_w;
+            w->height = new_h;
+        } else if (drag_mode == 3) {
+            /* Resize bottom-left: right edge and top fixed */
+            int new_x = x - drag_off_x;
+            int new_h = (y + drag_off_y) - w->y;
+            int new_w = drag_right_edge - new_x;
+            if (new_w < WIN_MIN_W) { new_x = drag_right_edge - WIN_MIN_W; new_w = WIN_MIN_W; }
+            if (new_x < 0)        { new_x = 0; new_w = drag_right_edge; }
+            if (new_h < WIN_MIN_H) new_h = WIN_MIN_H;
+            if (w->y + new_h > scr_h - UI_DOCK_H) new_h = scr_h - UI_DOCK_H - w->y;
+            w->x      = new_x;
+            w->width  = new_w;
+            w->height = new_h;
+        }
     }
 
     /* ---- Button released → end drag ---- */
-    if (!left_now && left_prev) drag_active = 0;
+    if (!left_now && left_prev) { drag_active = 0; drag_mode = 0; }
 
     /* ---- Route mouse position to active KAPP (e.g. Paint dragging) ---- */
     {
@@ -1233,7 +1312,13 @@ void wm_draw_all(void) {
                     int cy = w->y + WM_TITLEBAR_H;
                     int cw = w->width  - 2 * WM_BORDER;
                     int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
-                    fb_blit_pixels(cx, cy, w->pixels, cw, ch);
+                    if (cw == w->pix_w && ch == w->pix_h) {
+                        fb_blit_pixels(cx, cy, w->pixels, cw, ch);
+                    } else {
+                        /* Window was resized: scale pixel content to fit. */
+                        fb_blit_scaled(cx, cy, cw, ch,
+                                       w->pixels, w->pix_w, w->pix_h);
+                    }
                 }
             } else if (w->type == WM_TYPE_KAPP) {
                 int cx = w->x + WM_BORDER;
@@ -1493,6 +1578,8 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
         w->instance   = 0;
         w->hidden     = 0;
         w->pixels     = buf;
+        w->pix_w      = cw;
+        w->pix_h      = ch;
         w->owner_slot = (current_proc >= 0) ? current_proc : -1;
         strncpy(w->title_buf, "App", 31);
         w->title_buf[31] = '\0';

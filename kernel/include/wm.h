@@ -105,6 +105,7 @@ typedef struct {
     int            hidden;      /* 1 = not rendered, not focusable,
                                  *     not hit-tested by mouse             */
     uint32_t      *pixels;      /* backing store for WM_TYPE_USER only    */
+    int            pix_w, pix_h; /* pixel buffer dimensions at alloc time */
     int            owner_slot;  /* process slot that owns this window (-1=kernel) */
 } wm_window_t;
 
