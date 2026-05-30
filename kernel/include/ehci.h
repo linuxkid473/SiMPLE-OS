@@ -84,7 +84,12 @@ typedef struct {
 /* Error status mask (excludes ACTIVE and HALTED) */
 #define QTD_ERR_MASK  (QTD_XACTERR | QTD_BABBLE | QTD_DBERR)
 
-/* ── Queue Head - 48 bytes, 32-byte aligned ── */
+/* ── Queue Head - 64 bytes, 32-byte aligned ── */
+/*
+ * EHCI requires QH base addresses to be 32-byte aligned.  The EHCI spec
+ * hardware state is 48 bytes (4 static words + 8 overlay words), so we pad
+ * to 64 bytes so that every element of a g_hid_qh[] array is aligned.
+ */
 typedef struct {
     volatile uint32_t hlp;       /* Horizontal Link Pointer */
     volatile uint32_t ep_char;   /* Endpoint Characteristics */
@@ -95,15 +100,17 @@ typedef struct {
     volatile uint32_t ov_alt;
     volatile uint32_t ov_token;
     volatile uint32_t ov_buf[5];
+    /* Padding: bring sizeof to 64 so array elements stay 32-byte aligned */
+    uint32_t          _pad[4];
 } __attribute__((packed)) ehci_qh_t;
 
 /* QH ep_char bits */
 #define QH_DEVADDR(a)  ((uint32_t)(a) & 0x7Fu)
 #define QH_INACT       (1u <<  7)
 #define QH_EP(n)       ((uint32_t)(n) << 8)
-#define QH_EPS_FULL    (1u << 12)   /* Full speed */
-#define QH_EPS_LOW     (2u << 12)   /* Low speed */
-#define QH_EPS_HIGH    (2u << 12)   /* High speed */
+#define QH_EPS_FULL    (0u << 12)   /* Full speed  (EPS=00b) */
+#define QH_EPS_LOW     (1u << 12)   /* Low speed   (EPS=01b) */
+#define QH_EPS_HIGH    (2u << 12)   /* High speed  (EPS=10b) */
 #define QH_DTC         (1u << 14)   /* Data Toggle Control */
 #define QH_RECLH       (1u << 15)   /* Head of Reclamation List */
 #define QH_MAXPKT(n)   ((uint32_t)(n) << 16)
@@ -115,6 +122,13 @@ typedef struct {
 #define QH_CMASK(m)    (((uint32_t)(m) & 0xFFu) << 8)
 #define QH_HUBADDR(a)  (((uint32_t)(a) & 0x7Fu) << 16)
 #define QH_HUBPORT(p)  (((uint32_t)(p) & 0x7Fu) << 23)
+/*
+ * High-Bandwidth Pipe Multiplier (EHCI spec Table 3-15, bits 31:30).
+ * MUST be 1, 2, or 3 for any periodic (interrupt/isochronous) QH.
+ * A value of 0 is defined as "HC shall not execute transactions" —
+ * leaving this zero silently disables all periodic transfers.
+ */
+#define QH_MULT(n)     (((uint32_t)(n) & 0x3u) << 30)
 
 /* HLP / qTD pointer type field */
 #define HLP_TYPE_ITD   (0u << 1)

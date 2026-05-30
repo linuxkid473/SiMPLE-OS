@@ -142,6 +142,17 @@ static const uint16_t g_mod_ps2[8] = {
     0x100|0x5C,  /* Right GUI */
 };
 
+/* Signed decimal to COM1 */
+static void hid_write_sdec(int val)
+{
+    if (val < 0) {
+        serial_putc(COM1, '-');
+        serial_write_dec(COM1, (uint32_t)(-val));
+    } else {
+        serial_write_dec(COM1, (uint32_t)val);
+    }
+}
+
 /* Inject a PS/2 Set 1 make or break scancode (may need E0 prefix). */
 static void inject(uint16_t ps2code, int press) {
     if (!ps2code) return;
@@ -186,7 +197,13 @@ void usb_hid_kbd_report(const uint8_t *report, uint8_t *prev)
         for (int j = 2; j < 8; j++) {
             if (prev[j] == k) { was_held = 1; break; }
         }
-        if (!was_held) inject(g_hid2ps2[k], 1);
+        if (!was_held) {
+            serial_write(COM1, "[USB KBD] press HID=0x");
+            serial_putc(COM1, "0123456789ABCDEF"[k >> 4]);
+            serial_putc(COM1, "0123456789ABCDEF"[k & 0xF]);
+            serial_write(COM1, "\n");
+            inject(g_hid2ps2[k], 1);
+        }
     }
 
     /* Update previous report */
@@ -198,5 +215,14 @@ void usb_hid_mouse_report(const uint8_t *report)
     uint8_t btns = report[0] & 0x07;
     int dx = (int)(int8_t)report[1];
     int dy = (int)(int8_t)report[2];
+    if (dx || dy || btns) {
+        serial_write(COM1, "[USB MOUSE] dx=");
+        hid_write_sdec(dx);
+        serial_write(COM1, " dy=");
+        hid_write_sdec(dy);
+        serial_write(COM1, " btns=");
+        serial_write_dec(COM1, btns);
+        serial_write(COM1, "\n");
+    }
     mouse_inject_usb(dx, dy, btns);
 }

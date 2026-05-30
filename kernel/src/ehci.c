@@ -542,19 +542,27 @@ static void hid_arm_qtd(int slot)
 
     qtd->next     = QTD_TERM;
     qtd->alt_next = QTD_TERM;
+    /* No QTD_TOGGLE: DTC=0 in QH so EHCI manages the DATA0/DATA1 sequence.
+     * Forcing DATA1 here caused QEMU to see a toggle mismatch on the first
+     * transfer (device sends DATA0) and return USB_RET_IOERROR → HC reset. */
     qtd->token    = QTD_ACTIVE | QTD_CERR(3) | QTD_PID_IN
-                  | QTD_BYTES(mps) | QTD_TOGGLE | QTD_IOC;
+                  | QTD_BYTES(mps) | QTD_IOC;
     qtd->buf[0]   = (uint32_t)buf;
-    qtd->buf[1]   = 0;
+    /* Next 4 K page pointer — required if buf straddles a page boundary */
+    qtd->buf[1]   = ((uint32_t)buf + 4095u) & ~4095u;
     qtd->buf[2]   = 0;
     qtd->buf[3]   = 0;
     qtd->buf[4]   = 0;
 
-    /* Reload the QH overlay */
-    ehci_qh_t *qh = &g_hid_qh[slot];
+    /* Reload the QH overlay.
+     * Preserve the toggle bit so EHCI continues the correct DATA0/DATA1
+     * sequence after a re-arm.  On the very first arm the overlay comes
+     * from zero-initialised BSS so ov_token=0 → DATA0 (correct). */
+    ehci_qh_t *qh  = &g_hid_qh[slot];
+    uint32_t toggle = qh->ov_token & QTD_TOGGLE;
     qh->ov_next   = (uint32_t)qtd;
     qh->ov_alt    = QTD_TERM;
-    qh->ov_token  = 0; /* clear HALTED etc. */
+    qh->ov_token  = toggle;   /* clear HALTED/errors, keep DATA toggle */
 }
 
 /* ── Add a HID device to the periodic schedule ── */
@@ -575,15 +583,45 @@ static int hid_add_periodic(int ci, int slot)
     uint32_t cmask = fs_ls ? 0x1Cu : 0x00u;
 
     qh->hlp      = QTD_TERM;   /* last in chain; will be set when inserted */
+    /* No QH_DTC: let EHCI manage the data toggle automatically.
+     * With DTC=1 the toggle came from the qTD (always DATA1), which caused
+     * a mismatch against the device's initial DATA0 → "processing error". */
     qh->ep_char  = QH_DEVADDR(h->dev_addr)
                  | QH_EP(ep_num)
                  | eps_bits
-                 | QH_DTC
                  | QH_MAXPKT(h->hid_mps > 64 ? 64 : h->hid_mps);
+    /* QH_MULT(1): EHCI spec Table 3-15 bits 31:30.
+     * Mult=0 means "HC shall not execute transactions" — this was the
+     * reason periodic transfers never ran before this fix was added. */
     qh->ep_cap   = QH_SMASK(smask)
                  | QH_CMASK(cmask)
-                 | (fs_ls ? (QH_HUBADDR(h->hub_addr) | QH_HUBPORT(h->hub_port)) : 0);
+                 | (fs_ls ? (QH_HUBADDR(h->hub_addr) | QH_HUBPORT(h->hub_port)) : 0)
+                 | QH_MULT(1);
     qh->curr_qtd = 0;
+
+    serial_write(COM1, "[EHCI] HID QH  phys=0x");
+    serial_write_hex(COM1, (uint32_t)qh);
+    serial_write(COM1, " sizeof_qh=");
+    serial_write_dec(COM1, (uint32_t)sizeof(ehci_qh_t));
+    serial_write(COM1, "\n");
+    serial_write(COM1, "[EHCI]   ep_char=0x");
+    serial_write_hex(COM1, qh->ep_char);
+    serial_write(COM1, " ep_cap=0x");
+    serial_write_hex(COM1, QH_SMASK(smask) | QH_CMASK(cmask)
+                           | (fs_ls ? (QH_HUBADDR(h->hub_addr)|QH_HUBPORT(h->hub_port)) : 0)
+                           | QH_MULT(1));
+    serial_write(COM1, " ep=");
+    serial_write_dec(COM1, ep_num);
+    serial_write(COM1, " mps=");
+    serial_write_dec(COM1, h->hid_mps > 64 ? 64 : h->hid_mps);
+    serial_write(COM1, " spd=");
+    serial_write_dec(COM1, h->speed);
+    serial_write(COM1, "\n");
+    serial_write(COM1, "[EHCI] HID qTD phys=0x");
+    serial_write_hex(COM1, (uint32_t)&g_hid_qtd[slot]);
+    serial_write(COM1, " buf=0x");
+    serial_write_hex(COM1, (uint32_t)g_hid_buf[slot]);
+    serial_write(COM1, "\n");
 
     hid_arm_qtd(slot);
 
@@ -598,8 +636,18 @@ static int hid_add_periodic(int ci, int slot)
     uint32_t cmd = op_read(op, EHCI_OP_USBCMD);
     if (!(cmd & USBCMD_PSE)) {
         op_write(op, EHCI_OP_USBCMD, cmd | USBCMD_PSE);
-        wait_bits(op, EHCI_OP_USBSTS, USBSTS_PSS, USBSTS_PSS, 500);
+        int pss_ok = wait_bits(op, EHCI_OP_USBSTS, USBSTS_PSS, USBSTS_PSS, 500);
+        serial_write(COM1, "[EHCI] PSE enabled PSS=");
+        serial_write(COM1, pss_ok ? "1 (running)\n" : "0 (TIMEOUT)\n");
+    } else {
+        serial_write(COM1, "[EHCI] PSE already set\n");
     }
+
+    serial_write(COM1, "[EHCI] after hid_add_periodic: USBCMD=0x");
+    serial_write_hex(COM1, op_read(op, EHCI_OP_USBCMD));
+    serial_write(COM1, " USBSTS=0x");
+    serial_write_hex(COM1, op_read(op, EHCI_OP_USBSTS));
+    serial_write(COM1, "\n");
     return 1;
 }
 
@@ -820,6 +868,30 @@ void usb_init(void)
         scan_ports(ci);
     }
 
+    /* Dump final controller register state before going live */
+    for (int ci = 0; ci < g_nctrl; ci++) {
+        uint32_t op = g_ctrl[ci].op_base;
+        serial_write(COM1, "[EHCI] final ctrl=");
+        serial_write_dec(COM1, (uint32_t)ci);
+        serial_write(COM1, " USBCMD=0x");
+        serial_write_hex(COM1, op_read(op, EHCI_OP_USBCMD));
+        serial_write(COM1, " USBSTS=0x");
+        serial_write_hex(COM1, op_read(op, EHCI_OP_USBSTS));
+        serial_write(COM1, "\n");
+        serial_write(COM1, "[EHCI] PERIODICBASE=0x");
+        serial_write_hex(COM1, op_read(op, EHCI_OP_PERIODICBASE));
+        serial_write(COM1, " ASYNCADDR=0x");
+        serial_write_hex(COM1, op_read(op, EHCI_OP_ASYNCADDR));
+        serial_write(COM1, "\n");
+        serial_write(COM1, "[EHCI] frame_list@0x");
+        serial_write_hex(COM1, (uint32_t)g_frame_list[ci]);
+        serial_write(COM1, " [0]=0x");
+        serial_write_hex(COM1, g_frame_list[ci][0]);
+        serial_write(COM1, " [1]=0x");
+        serial_write_hex(COM1, g_frame_list[ci][1]);
+        serial_write(COM1, "\n");
+    }
+
     g_ready = 1;
     serial_write(COM1, "[USB] init done, HID devices=");
     serial_write_dec(COM1, (uint32_t)g_nhid);
@@ -828,9 +900,79 @@ void usb_init(void)
 
 /* ── Public: usb_poll (called from pit_timer_tick every tick) ── */
 
+/* Hex-print one byte to COM1 */
+static void poll_hex8(uint8_t v)
+{
+    static const char h[] = "0123456789ABCDEF";
+    serial_putc(COM1, h[v >> 4]);
+    serial_putc(COM1, h[v & 0xF]);
+}
+
 void usb_poll(void)
 {
     if (!g_ready) return;
+
+    /* Rate-limit counters */
+    static uint32_t poll_tick   = 0;   /* counts every usb_poll() call    */
+    static int      poll_hello  = 0;   /* 1 after first-call banner printed */
+
+    /* Per-slot diagnostics */
+    static uint8_t err_count[EHCI_MAX_HID];  /* consecutive errors per slot */
+    static uint8_t first_rpt[EHCI_MAX_HID];  /* 1 after first good report   */
+
+    poll_tick++;
+
+    /* Print once to confirm the poll path is live */
+    if (!poll_hello) {
+        poll_hello = 1;
+        serial_write(COM1, "[USB] poll active nhid=");
+        serial_write_dec(COM1, (uint32_t)g_nhid);
+        serial_write(COM1, "\n");
+    }
+
+    /* Every second: dump qTD/QH state + controller registers for each slot */
+    if ((poll_tick % 100) == 0) {
+        for (int slot = 0; slot < g_nhid; slot++) {
+            ehci_hid_t *h = &g_hid[slot];
+            if (!h->active) continue;
+            ehci_qtd_t *qtd = &g_hid_qtd[slot];
+            ehci_qh_t  *qh  = &g_hid_qh[slot];
+            uint32_t    op  = g_ctrl[h->ctrl_idx].op_base;
+
+            serial_write(COM1, "[USB] slot=");
+            serial_write_dec(COM1, (uint32_t)slot);
+            serial_write(COM1, " type=");
+            serial_write(COM1, h->hid_type == HID_TYPE_KBD ? "KBD" : "MOUSE");
+            serial_write(COM1, " qtd.tok=0x");
+            serial_write_hex(COM1, qtd->token);
+            serial_write(COM1, " qh.ov_tok=0x");
+            serial_write_hex(COM1, qh->ov_token);
+            serial_write(COM1, " qh.ov_next=0x");
+            serial_write_hex(COM1, qh->ov_next);
+            serial_write(COM1, "\n");
+
+            serial_write(COM1, "[USB] USBCMD=0x");
+            serial_write_hex(COM1, op_read(op, EHCI_OP_USBCMD));
+            serial_write(COM1, " USBSTS=0x");
+            serial_write_hex(COM1, op_read(op, EHCI_OP_USBSTS));
+            serial_write(COM1, " PORT=0x");
+            serial_write_hex(COM1, op_read(op, EHCI_OP_PORTSC(h->port)));
+            serial_write(COM1, "\n");
+
+            serial_write(COM1, "[USB] ep_char=0x");
+            serial_write_hex(COM1, qh->ep_char);
+            serial_write(COM1, " ep_cap=0x");
+            serial_write_hex(COM1, qh->ep_cap);
+            serial_write(COM1, "\n");
+            serial_write(COM1, "[USB] framelist[0]=0x");
+            serial_write_hex(COM1, g_frame_list[h->ctrl_idx][0]);
+            serial_write(COM1, " QH@0x");
+            serial_write_hex(COM1, (uint32_t)qh);
+            serial_write(COM1, " qTD@0x");
+            serial_write_hex(COM1, (uint32_t)qtd);
+            serial_write(COM1, "\n");
+        }
+    }
 
     for (int slot = 0; slot < g_nhid; slot++) {
         ehci_hid_t *h = &g_hid[slot];
@@ -843,13 +985,50 @@ void usb_poll(void)
 
         /* Transfer complete — check for errors */
         if (tok & (QTD_ERR_MASK | QTD_HALTED)) {
-            /* Clear HALTED and re-arm */
+            if (err_count[slot] < 5) {
+                err_count[slot]++;
+                serial_write(COM1, "[EHCI] qTD error slot=");
+                serial_write_dec(COM1, (uint32_t)slot);
+                serial_write(COM1, " tok=0x");
+                serial_write_hex(COM1, tok);
+                if (tok & QTD_HALTED)  serial_write(COM1, " HALTED");
+                if (tok & QTD_BABBLE)  serial_write(COM1, " BABBLE");
+                if (tok & QTD_DBERR)   serial_write(COM1, " BUFERR");
+                if (tok & QTD_XACTERR) serial_write(COM1, " XACTERR");
+                if (tok & QTD_MMF)     serial_write(COM1, " MMF");
+                serial_write(COM1, "\n");
+                uint32_t op = g_ctrl[h->ctrl_idx].op_base;
+                serial_write(COM1, "[EHCI] USBSTS=0x");
+                serial_write_hex(COM1, op_read(op, EHCI_OP_USBSTS));
+                serial_write(COM1, " USBCMD=0x");
+                serial_write_hex(COM1, op_read(op, EHCI_OP_USBCMD));
+                serial_write(COM1, " PORTSC=0x");
+                serial_write_hex(COM1, op_read(op, EHCI_OP_PORTSC(h->port)));
+                serial_write(COM1, "\n");
+            }
             hid_arm_qtd(slot);
             continue;
         }
 
-        /* Process the report */
+        /* Successful report */
+        err_count[slot] = 0;
+
+        /* Hex-dump the first received report per slot */
         uint8_t *buf = g_hid_buf[slot];
+        if (!first_rpt[slot]) {
+            first_rpt[slot] = 1;
+            if (h->hid_type == HID_TYPE_KBD)
+                serial_write(COM1, "[USB KBD] first report: ");
+            else
+                serial_write(COM1, "[USB MOUSE] first report: ");
+            for (int b = 0; b < 8; b++) {
+                poll_hex8(buf[b]);
+                serial_putc(COM1, ' ');
+            }
+            serial_write(COM1, "\n");
+        }
+
+        /* Route report to keyboard/mouse subsystem */
         if (h->hid_type == HID_TYPE_KBD) {
             usb_hid_kbd_report(buf, h->prev_report);
         } else if (h->hid_type == HID_TYPE_MOUSE) {
