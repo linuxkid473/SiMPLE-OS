@@ -16,7 +16,10 @@ static uint32_t  fb_pitch  = 0;
  * page pool which ends at 0x9FFFFF, runs to ~0xBD4BFF (< 0xC00000). Using
  * a pointer rather than a static array keeps BSS below 0x400000 so it
  * stays within the pages that paging_init() maps present. */
-#define FB_BACK_PHYS 0xA00000U
+/* Process slots occupy 0xA00000–0x10FFFFF (7 slots × 1 MB).
+ * Place the back buffer after them at 0x1200000, inside PDE[4] which is
+ * a supervisor 4 MB PSE page (0x1000000–0x13FFFFF). */
+#define FB_BACK_PHYS 0x1200000U
 static uint32_t * const fb_back = (uint32_t *)FB_BACK_PHYS;
 
 /*
@@ -83,14 +86,16 @@ static const uint32_t vga_palette[16] = {
 static void draw_char_rgb(char c, int px, int py, uint32_t fg, uint32_t bg) {
     if (!fb_addr) return;
     char *bitmap = font8x8_basic[(uint8_t)c];
+    uint32_t stride = fb_pitch / 4;
     for (int r = 0; r < 8; r++) {
         int y = py + r;
         if (y < 0 || (uint32_t)y >= fb_height) continue;
         for (int cb = 0; cb < 8; cb++) {
             int x = px + cb;
             if (x < 0 || (uint32_t)x >= fb_width) continue;
-            fb_back[(uint32_t)y * fb_width + (uint32_t)x] =
-                (bitmap[r] & (1 << cb)) ? fg : bg;
+            uint32_t col = (bitmap[r] & (1 << cb)) ? fg : bg;
+            fb_back[(uint32_t)y * fb_width + (uint32_t)x] = col;
+            fb_addr[(uint32_t)y * stride    + (uint32_t)x] = col;
         }
     }
 }
@@ -310,13 +315,16 @@ static void vga_scroll(void) {
 
         for (uint32_t py = oy + 8; py < oy + ch; py++) {
             for (uint32_t px = ox; px < ox + cw; px++) {
-                fb_addr[(py - 8) * stride + px] = fb_addr[py * stride + px];
+                uint32_t p = fb_back[py * fb_width + px];
+                fb_back[(py - 8) * fb_width + px] = p;
+                fb_addr[(py - 8) * stride   + px] = p;
             }
         }
         uint32_t bg = vga_palette[(vga_color >> 4) & 0x0F];
         for (uint32_t py = oy + ch - 8; py < oy + ch; py++) {
             for (uint32_t px = ox; px < ox + cw; px++) {
-                fb_addr[py * stride + px] = bg;
+                fb_back[py * fb_width + px] = bg;
+                fb_addr[py * stride   + px] = bg;
             }
         }
 
