@@ -96,8 +96,12 @@ void pci_enable_bus_mastering(uint8_t bus, uint8_t dev, uint8_t fn) {
 }
 
 uint32_t pci_bar_base(uint8_t bus, uint8_t dev, uint8_t fn, int bar) {
-    uint8_t off = (uint8_t)(PCI_BAR0 + bar * 4);
+    uint8_t  off = (uint8_t)(PCI_BAR0 + bar * 4);
     uint32_t raw = pci_read32(bus, dev, fn, off);
-    if (raw & 1) return 0;            /* I/O BAR, not supported here */
+    if (raw & 1) return 0;            /* I/O BAR, not supported */
+    if ((raw & 6) == 4) {             /* 64-bit memory BAR: next register holds high 32 bits */
+        uint32_t hi = pci_read32(bus, dev, fn, (uint8_t)(off + 4));
+        if (hi) return 0;             /* address above 4 GB, can't handle in 32-bit mode */
+    }
     return raw & 0xFFFFFFF0u;
 }

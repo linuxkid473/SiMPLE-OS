@@ -40,6 +40,13 @@ void      paging_map_page(uint32_t *page_dir, uint32_t vaddr,
 int       paging_page_mapped(uint32_t *page_dir, uint32_t vaddr);
 
 /*
+ * Mark the 4 MB PSE page covering phys_addr as Uncacheable (PWT+PCD).
+ * Call this after obtaining an MMIO BAR address to prevent the CPU from
+ * caching MMIO register reads/writes.  Performs a full TLB flush.
+ */
+void      paging_mark_uc(uint32_t phys_addr);
+
+/*
  * Reset the physical page pool and clear all heap-range PTEs.
  *
  * Must be called by proc_register_initial() before loading a new ELF so that:

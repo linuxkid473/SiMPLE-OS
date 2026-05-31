@@ -12,6 +12,7 @@
 
 #include "ehci.h"
 #include "pci.h"
+#include "paging.h"
 #include "usb.h"
 #include "usb_hid.h"
 #include "pit.h"
@@ -93,13 +94,23 @@ static inline void op_write(uint32_t op, uint32_t off, uint32_t val) {
 /* ── Busy-wait helpers (loop-count based, safe inside IRQ handler) ── */
 
 static void udelay(uint32_t us) {
-    /* ~1 iteration ≈ 10 ns at ~100 MHz effective; 100 iters ≈ 1 µs */
+    /* NOP-loop busy wait. Approximate — only used for sub-ms pauses
+     * inside wait_bits() and small spec delays (≤ 1 ms).
+     * For delays ≥ 10 ms always use mdelay(). */
     volatile uint32_t n = us * 100u;
     while (n--) __asm__ volatile("nop");
 }
 
+/* PIT-based millisecond delay. 100 Hz PIT → 1 tick = 10 ms.
+ * Accurate on real hardware regardless of CPU speed.
+ * Always PIT-based; minimum wait is one full tick (10 ms) so even
+ * mdelay(1) and mdelay(2) give the USB device adequate recovery time. */
 static void mdelay(uint32_t ms) {
-    udelay(ms * 1000u);
+    uint32_t ticks = (ms + 9) / 10;           /* round up: 100 Hz → 10 ms/tick */
+    if (ticks == 0) ticks = 1;                /* minimum 1 tick = 10 ms */
+    uint32_t end   = pit_ticks() + ticks + 1; /* +1: guard against tick boundary */
+    while ((int32_t)(pit_ticks() - end) < 0)
+        __asm__ volatile("pause");
 }
 
 /* Spin until (reg & mask) == val, with loop-count timeout.
@@ -810,6 +821,46 @@ static void scan_ports(int ci)
     }
 }
 
+/* ── Intel XHCI → EHCI USB 2.0 port routing handoff ── */
+/*
+ * On Intel 8-series PCH (H81, H87, B85, …) the XHCI controller starts up
+ * owning all USB 2.0 ports.  EHCI sees no connected devices unless we
+ * release those ports here.  USB2PRM at PCI config offset 0xD4 is a bitmask
+ * of ports currently routed to XHCI; writing 0 routes them all to EHCI.
+ */
+static void intel_xhci_handoff(void)
+{
+    uint8_t bus, dev, fn;
+    if (!pci_find_device(0x0C, 0x03, 0x30, &bus, &dev, &fn)) {
+        serial_write(COM1, "[XHCI] no XHCI controller found\n");
+        return;
+    }
+
+    uint16_t vid = pci_read16(bus, dev, fn, PCI_VENDOR_ID);
+    if (vid != 0x8086) {
+        serial_write(COM1, "[XHCI] non-Intel XHCI (vid=0x");
+        serial_write_hex(COM1, vid);
+        serial_write(COM1, "), skipping USB2 port handoff\n");
+        return;
+    }
+
+    uint32_t usb2prm = pci_read32(bus, dev, fn, 0xD4); /* USB2 Port Routing Mask */
+    serial_write(COM1, "[XHCI] Intel XHCI found, USB2PRM=0x");
+    serial_write_hex(COM1, usb2prm);
+
+    if (usb2prm) {
+        serial_write(COM1, " — releasing USB2 ports to EHCI\n");
+        pci_write32(bus, dev, fn, 0xD4, 0);
+
+        uint32_t usb3prm = pci_read32(bus, dev, fn, 0xD0); /* USB3 Port Routing Mask */
+        serial_write(COM1, "[XHCI] USB3PRM=0x");
+        serial_write_hex(COM1, usb3prm);
+        serial_write(COM1, " (USB3 ports left with XHCI)\n");
+    } else {
+        serial_write(COM1, " — no USB2 ports owned by XHCI\n");
+    }
+}
+
 /* ── Public: usb_init ── */
 
 void usb_init(void)
@@ -818,6 +869,10 @@ void usb_init(void)
     g_nhid  = 0;
     g_next_addr = 1;
     for (int i = 0; i < EHCI_MAX_HID; i++) g_hid[i].active = 0;
+
+    /* On Intel PCH, XHCI owns all USB 2.0 ports at startup.
+     * Release them to EHCI before scanning. */
+    intel_xhci_handoff();
 
     /* Find up to MAX_EHCI_CTRL EHCI controllers */
     for (int n = 0; n < MAX_EHCI_CTRL; n++) {
@@ -828,6 +883,10 @@ void usb_init(void)
 
         uint32_t bar = pci_bar_base(bus, dev, fn, 0);
         if (!bar) { serial_write(COM1, "[EHCI] BAR0=0, skip\n"); continue; }
+
+        /* Mark the EHCI MMIO region uncacheable so register reads/writes
+         * bypass the CPU cache (PSE PDE covering this address gets PCD+PWT). */
+        paging_mark_uc(bar);
 
         serial_write(COM1, "[EHCI] Controller found BAR=");
         serial_write_hex(COM1, bar);

@@ -26,6 +26,8 @@
 #define PDE_PRESENT (1U << 0)
 #define PDE_RW      (1U << 1)
 #define PDE_USER    (1U << 2)
+#define PDE_PWT     (1U << 3)   /* Page Write Through */
+#define PDE_PCD     (1U << 4)   /* Page Cache Disable */
 #define PDE_PS      (1U << 7)   /* 4 MB page size */
 
 #define PTE_PRESENT (1U << 0)
@@ -237,4 +239,36 @@ void paging_map_page(uint32_t *page_dir, uint32_t vaddr, uint32_t paddr, int use
     if (user) flags |= PTE_USER;
     ptab[pte_idx] = (paddr & ~0xFFFU) | flags;
     __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+}
+
+/*
+ * paging_mark_uc — mark the 4 MB PSE page containing phys_addr as
+ * Uncacheable (PWT+PCD set in the PDE).
+ *
+ * EHCI MMIO registers must be accessed with strongly-ordered, uncacheable
+ * semantics.  The BIOS usually sets the MTRR for MMIO regions to UC, which
+ * overrides page-table settings on Intel.  Setting PWT+PCD here as well
+ * makes our intent explicit and protects against BIOS configurations that
+ * leave MTRRs at WB for the EHCI aperture.
+ *
+ * Only applies to 4 MB PSE PDEs (all MMIO above 0x400000 in this kernel).
+ * Flushes the TLB (CR3 reload) so the change takes effect immediately.
+ */
+void paging_mark_uc(uint32_t phys_addr) {
+    uint32_t pde_idx = phys_addr >> 22;
+    uint32_t pde     = page_dir[pde_idx];
+
+    if (!(pde & PDE_PRESENT) || !(pde & PDE_PS)) {
+        klog("paging", "mark_uc: not a present PSE PDE — skipping");
+        return;
+    }
+
+    page_dir[pde_idx] = pde | PDE_PWT | PDE_PCD;
+
+    /* CR3 reload flushes all non-global TLB entries including this 4 MB entry */
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+
+    klog_hex("paging", "mark_uc: PDE_idx", pde_idx);
 }
