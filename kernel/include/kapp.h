@@ -20,8 +20,9 @@
 #define KAPP_BREAKOUT 10
 #define KAPP_PONG     11
 #define KAPP_2048     12
-#define KAPP_SPEEDWAY 13
-#define NUM_KAPPS     14
+#define KAPP_SPEEDWAY      13
+#define KAPP_CONSTITUTION  14
+#define NUM_KAPPS          15
 
 /* ---- Color palette ---- */
 #define KA_BG      0x080808U
