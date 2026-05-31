@@ -165,6 +165,10 @@ void wm_set_fs(fat16_fs_t *fs);
  * If the kapp is already open, just focuses it.  No-op if no free slot. */
 void wm_spawn_kapp(int kapp_id);
 
+/* Close a kapp window by its window index and repaint.
+ * No-op if wi is out of range, hidden, or not a kapp window. */
+void wm_close_kapp(int wi);
+
 /* Key routing for the active kapp window (called from console.c). */
 int  wm_active_is_kapp(void);
 void wm_kapp_handle_key(int key_type, char ch);

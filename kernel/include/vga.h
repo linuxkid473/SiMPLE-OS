@@ -74,4 +74,8 @@ void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h);
 void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
                     const uint32_t *src, int src_w, int src_h);
 
+/* Flush the back buffer to the real framebuffer (eliminates flicker).
+ * Must be called once per fully-composed frame. */
+void fb_flush(void);
+
 #endif

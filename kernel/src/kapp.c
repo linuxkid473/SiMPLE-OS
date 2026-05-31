@@ -196,6 +196,13 @@ void g2048_click(int wi, int x, int y);
 void g2048_mouse(int wi, int x, int y, int btn);
 void g2048_tick(int wi);
 
+void speedway_create(int wi);  void speedway_destroy(int wi);
+void speedway_render(int wi, int cx, int cy, int cw, int ch);
+void speedway_key(int wi, int kt, char ch);
+void speedway_click(int wi, int x, int y);
+void speedway_mouse(int wi, int x, int y, int btn);
+void speedway_tick(int wi);
+
 /* Global kapp definitions table */
 const kapp_def_t kapp_defs[NUM_KAPPS] = {
     [KAPP_CLOCK]    = { "Clock",        280, 160,
@@ -237,6 +244,9 @@ const kapp_def_t kapp_defs[NUM_KAPPS] = {
     [KAPP_2048]     = { "2048",         256, 296,
                         g2048_create,    g2048_destroy,    g2048_render,
                         g2048_key,       g2048_click,      g2048_mouse,    g2048_tick },
+    [KAPP_SPEEDWAY] = { "SiMPLE Speedway", 720, 460,
+                        speedway_create,  speedway_destroy,  speedway_render,
+                        speedway_key,     speedway_click,    speedway_mouse, speedway_tick },
 };
 
 /* ================================================================

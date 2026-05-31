@@ -8,6 +8,17 @@ static uint32_t  fb_width  = 0;
 static uint32_t  fb_height = 0;
 static uint32_t  fb_pitch  = 0;
 
+/* Back buffer — all drawing goes here; fb_flush() blits to the real
+ * framebuffer in one shot so the display only ever shows complete frames.
+ *
+ * Lives at a fixed address in the supervisor PSE region (PDE[2], identity-
+ * mapped 4 MB page starting at 0x800000). Placed just above the physical
+ * page pool which ends at 0x9FFFFF, runs to ~0xBD4BFF (< 0xC00000). Using
+ * a pointer rather than a static array keeps BSS below 0x400000 so it
+ * stays within the pages that paging_init() maps present. */
+#define FB_BACK_PHYS 0xA00000U
+static uint32_t * const fb_back = (uint32_t *)FB_BACK_PHYS;
+
 /*
  * fb_cols / fb_rows are the *effective* character grid dimensions.
  * After wm_init() they equal the client area size (e.g. 80 × 49),
@@ -72,14 +83,13 @@ static const uint32_t vga_palette[16] = {
 static void draw_char_rgb(char c, int px, int py, uint32_t fg, uint32_t bg) {
     if (!fb_addr) return;
     char *bitmap = font8x8_basic[(uint8_t)c];
-    uint32_t stride = fb_pitch / 4;
     for (int r = 0; r < 8; r++) {
         int y = py + r;
         if (y < 0 || (uint32_t)y >= fb_height) continue;
         for (int cb = 0; cb < 8; cb++) {
             int x = px + cb;
             if (x < 0 || (uint32_t)x >= fb_width) continue;
-            fb_addr[(uint32_t)y * stride + (uint32_t)x] =
+            fb_back[(uint32_t)y * fb_width + (uint32_t)x] =
                 (bitmap[r] & (1 << cb)) ? fg : bg;
         }
     }
@@ -151,12 +161,11 @@ void vga_repaint_cells(void) {
  */
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (!fb_addr) return;
-    uint32_t stride = fb_pitch / 4;
     for (int ry = y; ry < y + h; ry++) {
         if (ry < 0 || (uint32_t)ry >= fb_height) continue;
         for (int rx = x; rx < x + w; rx++) {
             if (rx < 0 || (uint32_t)rx >= fb_width) continue;
-            fb_addr[(uint32_t)ry * stride + (uint32_t)rx] = color;
+            fb_back[(uint32_t)ry * fb_width + (uint32_t)rx] = color;
         }
     }
 }
@@ -164,14 +173,13 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
 /* Blit a row-major w*h 32bpp pixel array to (x,y) on the framebuffer. */
 void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h) {
     if (!fb_addr || !src || w <= 0 || h <= 0) return;
-    uint32_t stride = fb_pitch / 4;
     for (int row = 0; row < h; row++) {
         int dy = y + row;
         if (dy < 0 || (uint32_t)dy >= fb_height) continue;
         for (int col = 0; col < w; col++) {
             int dx = x + col;
             if (dx < 0 || (uint32_t)dx >= fb_width) continue;
-            fb_addr[(uint32_t)dy * stride + (uint32_t)dx] = src[row * w + col];
+            fb_back[(uint32_t)dy * fb_width + (uint32_t)dx] = src[row * w + col];
         }
     }
 }
@@ -189,8 +197,7 @@ void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
     int y1 = y + dst_h; if ((uint32_t)y1 > fb_height) y1 = (int)fb_height;
     if (x0 >= x1 || y0 >= y1) return;
 
-    uint32_t stride  = fb_pitch / 4;
-    int      draw_w  = x1 - x0;
+    int draw_w = x1 - x0;
 
     /* Precompute source-X indices for the output columns.
      * Static: kernel is single-threaded, so no re-entrancy issue.
@@ -204,9 +211,22 @@ void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
     for (int py = y0; py < y1; py++) {
         int sy = ((py - y) * src_h) / dst_h;
         const uint32_t *src_row = src + (uint32_t)sy * (uint32_t)src_w;
-        uint32_t       *dst_row = fb_addr + (uint32_t)py * stride + (uint32_t)x0;
+        uint32_t       *dst_row = fb_back + (uint32_t)py * fb_width + (uint32_t)x0;
         for (int dx = 0; dx < draw_w; dx++)
             dst_row[dx] = src_row[sx_map[dx]];
+    }
+}
+
+/* Copy the back buffer to the real framebuffer in one pass.
+ * Call once at the end of each fully-composed frame to eliminate flicker. */
+void fb_flush(void) {
+    if (!fb_addr) return;
+    uint32_t dst_stride = fb_pitch / 4;
+    uint32_t row_bytes  = fb_width * 4;
+    for (uint32_t row = 0; row < fb_height; row++) {
+        memcpy(fb_addr + row * dst_stride,
+               fb_back + row * fb_width,
+               row_bytes);
     }
 }
 
