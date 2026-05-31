@@ -47,6 +47,19 @@ int       paging_page_mapped(uint32_t *page_dir, uint32_t vaddr);
 void      paging_mark_uc(uint32_t phys_addr);
 
 /*
+ * Print all user-accessible virtual→physical mappings in pdir to COM1.
+ * tag is a short label printed in the header line.
+ */
+void      paging_dump_map(uint32_t *pdir, const char *tag);
+
+/*
+ * Return the number of user physical pages shared between dir_a and dir_b.
+ * 0 means the two address spaces are fully isolated.  Logs to COM1.
+ */
+int       paging_verify_isolation(uint32_t *dir_a, uint32_t *dir_b,
+                                   const char *na, const char *nb);
+
+/*
  * Reset the physical page pool and clear all heap-range PTEs.
  *
  * Must be called by proc_register_initial() before loading a new ELF so that:

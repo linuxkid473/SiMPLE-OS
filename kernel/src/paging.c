@@ -1,5 +1,6 @@
 #include "paging.h"
 #include "klog.h"
+#include "serial.h"
 #include "types.h"
 
 /*
@@ -208,9 +209,9 @@ void paging_clone(uint32_t *dst_dir, uint32_t *dst_tab0, uint32_t *dst_tab1,
         dst_tab1[i] = (0x400000U + i * PAGE_SIZE) | PTE_PRESENT | PTE_RW;
     dst_dir[1] = (uint32_t)dst_tab1 | PDE_PRESENT | PDE_RW | PDE_USER;
 
-    /* PDE[2..1023]: 4 MB supervisor large pages */
+    /* PDE[2..1023]: inherit from kernel's page_dir to preserve UC markings */
     for (uint32_t i = 2; i < PD_ENTRIES; i++)
-        dst_dir[i] = (i * LARGE_PAGE) | PDE_PRESENT | PDE_RW | PDE_PS;
+        dst_dir[i] = page_dir[i];
 }
 
 void paging_switch_dir(uint32_t *dir) {
@@ -271,4 +272,101 @@ void paging_mark_uc(uint32_t phys_addr) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
 
     klog_hex("paging", "mark_uc: PDE_idx", pde_idx);
+}
+
+/*
+ * paging_dump_map — print all user-accessible page ranges to COM1.
+ * Walks every PTE with U/S=1 and groups contiguous runs into one line.
+ */
+void paging_dump_map(uint32_t *pdir, const char *tag) {
+    serial_write(COM1, "[paging] dump_map: ");
+    serial_write(COM1, tag);
+    serial_write(COM1, "\n");
+
+    int in_range = 0;
+    uint32_t range_start = 0, range_phys = 0;
+
+    for (uint32_t pd = 0; pd < PD_ENTRIES; pd++) {
+        uint32_t pde = pdir[pd];
+        if (!(pde & PDE_PRESENT)) continue;
+        if (pde & PDE_PS) continue;  /* 4 MB supervisor pages — skip */
+
+        uint32_t *ptab = (uint32_t *)(pde & ~0xFFFU);
+        for (uint32_t pt = 0; pt < PT_ENTRIES; pt++) {
+            uint32_t pte = ptab[pt];
+            if ((pte & (PTE_PRESENT | PTE_USER)) == (PTE_PRESENT | PTE_USER)) {
+                uint32_t vaddr = (pd << 22) | (pt << 12);
+                uint32_t paddr = pte & ~0xFFFU;
+                if (!in_range) {
+                    in_range    = 1;
+                    range_start = vaddr;
+                    range_phys  = paddr;
+                }
+            } else {
+                if (in_range) {
+                    uint32_t vend = (pd << 22) | (pt << 12);
+                    serial_write(COM1, "  virt 0x");
+                    serial_write_hex(COM1, range_start);
+                    serial_write(COM1, "-0x");
+                    serial_write_hex(COM1, vend - 1);
+                    serial_write(COM1, " -> phys 0x");
+                    serial_write_hex(COM1, range_phys);
+                    serial_write(COM1, "\n");
+                    in_range = 0;
+                }
+            }
+        }
+    }
+    if (in_range) {
+        serial_write(COM1, "  virt 0x");
+        serial_write_hex(COM1, range_start);
+        serial_write(COM1, "-0xFFFFFFFF -> phys 0x");
+        serial_write_hex(COM1, range_phys);
+        serial_write(COM1, "\n");
+    }
+}
+
+/*
+ * paging_verify_isolation — count user physical pages shared between two
+ * page directories.  Returns 0 if fully isolated; >0 means aliased frames.
+ */
+int paging_verify_isolation(uint32_t *dir_a, uint32_t *dir_b,
+                             const char *na, const char *nb) {
+    int shared = 0;
+
+    for (uint32_t pd = 0; pd < PD_ENTRIES; pd++) {
+        uint32_t pdea = dir_a[pd];
+        uint32_t pdeb = dir_b[pd];
+        if (!(pdea & PDE_PRESENT) || (pdea & PDE_PS)) continue;
+        if (!(pdeb & PDE_PRESENT) || (pdeb & PDE_PS)) continue;
+
+        uint32_t *ta = (uint32_t *)(pdea & ~0xFFFU);
+        uint32_t *tb = (uint32_t *)(pdeb & ~0xFFFU);
+
+        for (uint32_t pt = 0; pt < PT_ENTRIES; pt++) {
+            uint32_t pte_a = ta[pt];
+            uint32_t pte_b = tb[pt];
+            if (!((pte_a & (PTE_PRESENT | PTE_USER)) == (PTE_PRESENT | PTE_USER))) continue;
+            if (!((pte_b & (PTE_PRESENT | PTE_USER)) == (PTE_PRESENT | PTE_USER))) continue;
+            if ((pte_a & ~0xFFFU) == (pte_b & ~0xFFFU))
+                shared++;
+        }
+    }
+
+    if (shared) {
+        serial_write(COM1, "[paging] WARN: isolation failure between ");
+        serial_write(COM1, na);
+        serial_write(COM1, " and ");
+        serial_write(COM1, nb);
+        serial_write(COM1, ": shared pages=");
+        serial_write_hex(COM1, (uint32_t)shared);
+        serial_write(COM1, "\n");
+    } else {
+        serial_write(COM1, "[paging] isolation OK: ");
+        serial_write(COM1, na);
+        serial_write(COM1, " vs ");
+        serial_write(COM1, nb);
+        serial_write(COM1, "\n");
+    }
+    return shared;
 }

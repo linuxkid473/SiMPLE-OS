@@ -3,7 +3,7 @@
 
 #include "types.h"
 
-#define KMALLOC_HEAP_SIZE 0x1A0000
+#define KMALLOC_HEAP_SIZE 0x1A0000  /* 1.7 MB: kernel heap up to 0x400000 boundary */
 
 void kmalloc_init(uint32_t heap_start);
 void* kmalloc(size_t size);

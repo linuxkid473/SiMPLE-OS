@@ -19,6 +19,29 @@
 extern const uint32_t wm_wallpaper[WP_W * WP_H];
 
 /* ================================================================
+ * Pixel buffer pool — dedicated 2 MB region for window backing stores.
+ *
+ * Lives at 0x700000–0x8FFFFF: inside the always-present supervisor range
+ * (PDE[1] covers 0x500000–0x7FFFFF; PDE[2] is a 4 MB PSE page covering
+ * 0x800000–0xBFFFFF).  This range is never used by kmalloc, the physical
+ * page pool (0x900000), or process slot memory (0xA00000+).
+ * ================================================================ */
+#define PIXBUF_POOL_BASE  0x700000U
+#define PIXBUF_POOL_LIMIT 0x900000U   /* 2 MB */
+static uint32_t pixbuf_pool_ptr = PIXBUF_POOL_BASE;
+
+static uint32_t *pixbuf_alloc(uint32_t bytes)
+{
+    bytes = (bytes + 15u) & ~15u;   /* 16-byte align */
+    if (pixbuf_pool_ptr + bytes > PIXBUF_POOL_LIMIT) return (uint32_t *)0;
+    uint32_t *p = (uint32_t *)pixbuf_pool_ptr;
+    pixbuf_pool_ptr += bytes;
+    return p;
+}
+
+static void pixbuf_reset(void) { pixbuf_pool_ptr = PIXBUF_POOL_BASE; }
+
+/* ================================================================
  * Global window state
  * ================================================================ */
 wm_window_t wm_windows[WM_MAX_WINDOWS];
@@ -1133,17 +1156,53 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
                          * so the shell resumes transparently.
                          */
                         {
+                            serial_write(COM1, "[launch] ELF browser click: file=");
+                            serial_write(COM1, wm_elf_entries[elf_idx].name);
+                            serial_write(COM1, " current_proc=");
+                            if (current_proc < 0)
+                                serial_write(COM1, "ring0");
+                            else
+                                serial_write_dec(COM1, (uint32_t)current_proc);
+                            serial_write(COM1, " heap_used=");
+                            serial_write_hex(COM1, kmalloc_used());
+                            serial_write(COM1, "/");
+                            serial_write_hex(COM1, kmalloc_total());
+                            serial_write(COM1, "\n");
+                            proc_dump_table("pre-launch");
+
                             int spawn_slot = proc_find_spawn_slot();
+                            serial_write(COM1, "[launch] spawn_slot=");
+                            if (spawn_slot < 0)
+                                serial_write(COM1, "NONE (no free slots!)");
+                            else
+                                serial_write_dec(COM1, (uint32_t)spawn_slot);
+                            serial_write(COM1, "\n");
+
                             if (spawn_slot >= 0) {
                                 uint32_t phys = PROC_SLOT_PHYS(spawn_slot);
                                 uint32_t elen = 0;
+                                serial_write(COM1, "[launch] reading ELF to phys=");
+                                serial_write_hex(COM1, phys);
+                                serial_write(COM1, "\n");
                                 int rc = fat16_read_file(wm_fs, 0,
                                              wm_elf_entries[elf_idx].name,
                                              (char *)phys, ELF_LOAD_BUF,
                                              &elen);
-                                if (rc == FAT16_OK && elen > 0)
-                                    exec_elf_spawn((void *)phys, elen,
+                                serial_write(COM1, "[launch] fat16_read rc=");
+                                serial_write_dec(COM1, (uint32_t)(rc < 0 ? (uint32_t)(-rc) : (uint32_t)rc));
+                                serial_write(COM1, " elen=");
+                                serial_write_hex(COM1, elen);
+                                serial_write(COM1, "\n");
+                                if (rc == FAT16_OK && elen > 0) {
+                                    int sr = exec_elf_spawn((void *)phys, elen,
                                                    spawn_slot);
+                                    serial_write(COM1, "[launch] exec_elf_spawn rc=");
+                                    serial_write_dec(COM1, (uint32_t)(sr < 0 ? (uint32_t)(-sr) : (uint32_t)sr));
+                                    if (sr < 0) serial_write(COM1, " (FAILED)");
+                                    serial_write(COM1, "\n");
+                                } else {
+                                    serial_write(COM1, "[launch] SKIP exec: fat16 failed or elen=0\n");
+                                }
                             }
                         }
                     } else {
@@ -1582,8 +1641,19 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
 
         /* Allocate pixel backing store for the client area only */
         uint32_t npix = (uint32_t)cw * (uint32_t)ch;
-        uint32_t *buf = (uint32_t *)kmalloc(npix * 4u);
-        if (!buf) return -(int32_t)12;
+        uint32_t bytes_needed = npix * 4u;
+        serial_write(COM1, "[WM] CREATE pixbuf need=");
+        serial_write_hex(COM1, bytes_needed);
+        serial_write(COM1, " pool_used=");
+        serial_write_hex(COM1, pixbuf_pool_ptr - PIXBUF_POOL_BASE);
+        serial_write(COM1, " pool_total=");
+        serial_write_hex(COM1, PIXBUF_POOL_LIMIT - PIXBUF_POOL_BASE);
+        serial_write(COM1, "\n");
+        uint32_t *buf = pixbuf_alloc(bytes_needed);
+        if (!buf) {
+            serial_write(COM1, "[WM] CREATE FAIL: pixbuf_alloc returned NULL (pool exhausted)\n");
+            return -(int32_t)12;
+        }
         for (uint32_t i = 0; i < npix; i++) buf[i] = 0;
 
         wm_window_t *w = &wm_windows[slot];
@@ -1787,6 +1857,8 @@ void wm_cleanup_all_user_windows(void) {
             if (wm_active == i) focus_gone = 1;
         }
     }
+    /* Reset the pixel buffer pool now that all windows are gone */
+    pixbuf_reset();
     /* Flush all per-slot queues */
     for (int s = 0; s < MAX_PROCS; s++)
         wm_flush_slot_queue(s);

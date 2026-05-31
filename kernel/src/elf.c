@@ -388,12 +388,25 @@ int exec_elf(void *data) {
  * returns control to the blocking exec_elf() call that set kernel_esp).
  */
 int exec_elf_spawn(void *data, uint32_t data_len, int slot) {
-    if (!data || data_len == 0) return -1;
-    if (slot < 1 || slot >= MAX_PROCS) return -1;
-    if (proc_table[slot].state != PROC_DEAD) return -1;
+    serial_write(COM1, "[elf_spawn] entry slot=");
+    serial_write_dec(COM1, (uint32_t)slot);
+    serial_write(COM1, " data_len=");
+    serial_write_hex(COM1, data_len);
+    serial_write(COM1, " state=");
+    serial_write_dec(COM1, (uint32_t)(slot >= 1 && slot < MAX_PROCS ? proc_table[slot].state : 99));
+    serial_write(COM1, "\n");
+
+    if (!data || data_len == 0) { serial_write(COM1, "[elf_spawn] FAIL: null/empty\n"); return -1; }
+    if (slot < 1 || slot >= MAX_PROCS) { serial_write(COM1, "[elf_spawn] FAIL: slot OOB\n"); return -1; }
+    if (proc_table[slot].state != PROC_DEAD) {
+        serial_write(COM1, "[elf_spawn] FAIL: slot not DEAD state=");
+        serial_write_dec(COM1, (uint32_t)proc_table[slot].state);
+        serial_write(COM1, "\n");
+        return -1;
+    }
 
     if (elf_validate(data) != 0) {
-        klog("elf_spawn", "invalid ELF");
+        serial_write(COM1, "[elf_spawn] FAIL: invalid ELF magic/header\n");
         return -1;
     }
 

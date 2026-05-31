@@ -55,7 +55,7 @@ void proc_init(void) {
     current_proc = -1;
 }
 
-void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
+void proc_register_initial(uint32_t *page_dir __attribute__((unused)), fd_table_t *fdt) {
     /* Reset any leftover zombie child slots from a previous run. */
     for (int i = 1; i < MAX_PROCS; i++)
         proc_table[i].state = PROC_DEAD;
@@ -87,7 +87,11 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     proc_table[0].egid            = 0;
     proc_table[0].umask           = 022;
     proc_table[0].state           = PROC_RUNNING;
-    proc_table[0].page_dir        = page_dir;
+    /* Give process 0 its own page directory cloned from the kernel layout.
+     * The ELF was loaded at physical 0x300000 (identity-mapped), so
+     * phys_user_base = USER_BASE is correct for the user region. */
+    paging_clone(proc_pdirs[0], proc_ptabs[0], proc_ptabs1[0], USER_BASE);
+    proc_table[0].page_dir        = proc_pdirs[0];
     proc_table[0].exit_status     = 0;
     proc_table[0].ticks_remaining = PROC_TIMESLICE;
     proc_table[0].brk             = 0x400000U;
@@ -105,7 +109,7 @@ void proc_register_initial(uint32_t *page_dir, fd_table_t *fdt) {
     else
         fd_table_init(&proc_table[0].fd_table);
     current_proc = 0;
-    paging_switch_dir(page_dir);
+    paging_switch_dir(proc_pdirs[0]);
     tss_set_esp0((uint32_t)(proc_kstacks[0] + 4096));
 
     serial_write(COM1, "[proc] initial pid=1\n");
@@ -433,6 +437,12 @@ int proc_fork(registers_t *regs) {
                  proc_ptabs1[child_slot], child_phys_base);
     child->page_dir = proc_pdirs[child_slot];
 
+    /* Inherit parent's heap PTEs so the child sees the same heap layout.
+     * Parent and child temporarily share physical heap pages; safe for
+     * fork+exec because exec() wipes the user address space on the next run. */
+    for (uint32_t i = 0; i < 0x100U; i++)
+        proc_ptabs1[child_slot][i] = proc_ptabs1[current_proc][i];
+
     /* Clone fd table from parent (bumping pipe refcounts) */
     fd_table_clone(&child->fd_table, &parent->fd_table, 0 /* don't close cloexec on fork */);
 
@@ -738,6 +748,11 @@ void proc_timer_tick(registers_t *regs) {
                  * stale snapshot from the very first switch. */
                 saved_ring0_regs = *regs;
                 ring0_has_saved_context = 1;
+                serial_write(COM1, "[sched] ring0→pid=");
+                serial_write_dec(COM1, (uint32_t)proc_table[i].pid);
+                serial_write(COM1, " slot=");
+                serial_write_dec(COM1, (uint32_t)i);
+                serial_write(COM1, "\n");
                 do_switch(i, regs);
                 return;
             }
