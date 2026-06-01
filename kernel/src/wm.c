@@ -2021,21 +2021,26 @@ void wm_push_mouse_event(int x, int y, uint8_t buttons, uint8_t prev) {
 /* Drain available PS/2 bytes non-blocking — called at SYS_WM_EVENT time. */
 static void wm_pump_input(void) {
     /*
-     * Keyboard scancodes are now handled by keyboard_irq_handler (IRQ1):
-     * they go into the scancode ring buffer AND are routed to the active
-     * window's slot queue via wm_push_key.  This pump only needs to drain
-     * any pending mouse bytes (bit 5 of PS/2 status = MOBF).
+     * Drain any bytes sitting in the PS/2 output buffer.
+     *
+     * In QEMU (and some real hardware) a polling read via inb(0x60) can race
+     * ahead of the IRQ1 delivery: the polling path wins the byte before the
+     * interrupt handler fires, so keyboard_irq_handler never sees it and
+     * wm_push_key is never called.  We must therefore call wm_push_key here
+     * for every keyboard byte we read, just as the IRQ handler does.
+     * Mouse bytes (MOBF set) go to mouse_handle_byte as before.
      */
     for (int i = 0; i < 32; i++) {
         uint8_t st = inb(0x64);
         if (!(st & 0x01u)) break;   /* output buffer empty */
         uint8_t data = inb(0x60);
         if (st & 0x20u) {
-            mouse_handle_byte(data);   /* PS/2 mouse packet byte */
+            mouse_handle_byte(data);
+        } else {
+            /* Keyboard byte: inject as if it came from IRQ1 (push to ring
+             * buffer, route to focused USER window slot queue, wake waiters). */
+            keyboard_inject_scancode(data);
         }
-        /* Keyboard bytes (MOBF=0) are already consumed by IRQ1 handler;
-         * any stray keyboard byte here is silently dropped to avoid
-         * double-injecting into WM slot queues. */
     }
 }
 

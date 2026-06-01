@@ -195,7 +195,11 @@ void keyboard_read_event(key_event_t* event) {
                     mouse_handle_byte(data);
                     continue;
                 }
-                /* Keyboard byte: process in-place, skip ring buffer */
+                /* Keyboard byte read directly (IRQ1 missed it). Route to the
+                 * focused USER window's slot queue so ring-3 apps like snake
+                 * receive the event even when ring-0 briefly holds the CPU. */
+                if (data != 0xE0u)
+                    wm_push_key(data);
                 scancode = data;
                 goto process_scancode;
             }
