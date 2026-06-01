@@ -25,21 +25,99 @@ extern const uint32_t wm_wallpaper[WP_W * WP_H];
  * (PDE[1] covers 0x500000–0x7FFFFF; PDE[2] is a 4 MB PSE page covering
  * 0x800000–0xBFFFFF).  This range is never used by kmalloc, the physical
  * page pool (0x900000), or process slot memory (0xA00000+).
+ *
+ * ALLOCATOR: tracked free-list (first-fit) so individual buffers can be
+ * reclaimed when a window is destroyed.  This prevents pool exhaustion
+ * across launch/close/relaunch cycles within a single session.
  * ================================================================ */
 #define PIXBUF_POOL_BASE  0x700000U
 #define PIXBUF_POOL_LIMIT 0x900000U   /* 2 MB */
-static uint32_t pixbuf_pool_ptr = PIXBUF_POOL_BASE;
+
+#define PIXBUF_MAX_BLKS   WM_MAX_WINDOWS
+
+typedef struct {
+    uint32_t base;  /* absolute address in pool */
+    uint32_t size;  /* bytes, 16-byte aligned   */
+    int      live;  /* 1 = currently in use     */
+} pixbuf_blk_t;
+
+static pixbuf_blk_t pixbuf_blks[PIXBUF_MAX_BLKS];
+static int          pixbuf_nblks    = 0;
+static uint32_t     pixbuf_pool_ptr = PIXBUF_POOL_BASE;
 
 static uint32_t *pixbuf_alloc(uint32_t bytes)
 {
-    bytes = (bytes + 15u) & ~15u;   /* 16-byte align */
-    if (pixbuf_pool_ptr + bytes > PIXBUF_POOL_LIMIT) return (uint32_t *)0;
+    bytes = (bytes + 15u) & ~15u;
+
+    /* First-fit: reuse a freed block large enough */
+    for (int i = 0; i < pixbuf_nblks; i++) {
+        if (!pixbuf_blks[i].live && pixbuf_blks[i].size >= bytes) {
+            pixbuf_blks[i].live = 1;
+            return (uint32_t *)pixbuf_blks[i].base;
+        }
+    }
+
+    /* Bump-allocate a new block from the pool */
+    if (pixbuf_pool_ptr + bytes > PIXBUF_POOL_LIMIT) {
+        serial_write(COM1, "[pixbuf] EXHAUST ptr=");
+        serial_write_hex(COM1, pixbuf_pool_ptr);
+        serial_write(COM1, " need=");
+        serial_write_hex(COM1, bytes);
+        serial_write(COM1, " pool_used=");
+        serial_write_hex(COM1, pixbuf_pool_ptr - PIXBUF_POOL_BASE);
+        serial_write(COM1, "/");
+        serial_write_hex(COM1, PIXBUF_POOL_LIMIT - PIXBUF_POOL_BASE);
+        serial_write(COM1, "\n");
+        return (uint32_t *)0;
+    }
+    if (pixbuf_nblks >= PIXBUF_MAX_BLKS) {
+        serial_write(COM1, "[pixbuf] REGISTRY FULL nblks=");
+        serial_write_dec(COM1, (uint32_t)pixbuf_nblks);
+        serial_write(COM1, "\n");
+        return (uint32_t *)0;
+    }
+
     uint32_t *p = (uint32_t *)pixbuf_pool_ptr;
+    pixbuf_blks[pixbuf_nblks].base = pixbuf_pool_ptr;
+    pixbuf_blks[pixbuf_nblks].size = bytes;
+    pixbuf_blks[pixbuf_nblks].live = 1;
+    pixbuf_nblks++;
     pixbuf_pool_ptr += bytes;
     return p;
 }
 
-static void pixbuf_reset(void) { pixbuf_pool_ptr = PIXBUF_POOL_BASE; }
+/* Return a USER pixel buffer to the pool.
+ * If the freed block is the topmost allocation, the bump pointer retreats,
+ * making that space available for future bump allocations as well. */
+static void pixbuf_free(uint32_t *buf)
+{
+    if (!buf) return;
+    uint32_t addr = (uint32_t)buf;
+
+    for (int i = 0; i < pixbuf_nblks; i++) {
+        if (pixbuf_blks[i].base == addr && pixbuf_blks[i].live) {
+            pixbuf_blks[i].live = 0;
+
+            /* Compact trailing free blocks: retreat the bump pointer */
+            while (pixbuf_nblks > 0 && !pixbuf_blks[pixbuf_nblks - 1].live) {
+                pixbuf_pool_ptr -= pixbuf_blks[pixbuf_nblks - 1].size;
+                pixbuf_nblks--;
+            }
+            return;
+        }
+    }
+}
+
+static void pixbuf_reset(void) {
+    pixbuf_pool_ptr = PIXBUF_POOL_BASE;
+    pixbuf_nblks = 0;
+    for (int i = 0; i < PIXBUF_MAX_BLKS; i++) {
+        pixbuf_blks[i].base = 0;
+        pixbuf_blks[i].size = 0;
+        pixbuf_blks[i].live = 0;
+    }
+    serial_write(COM1, "[pixbuf] pool reset\n");
+}
 
 /* ================================================================
  * Global window state
@@ -900,13 +978,62 @@ static void free_inst(int *used, int idx) { used[idx] = 0; }
 
 /*
  * Change focus to new_idx, saving / restoring terminal sessions as needed.
- * Always safe to call even when old wm_active is hidden.
+ * Also implements single-active-ELF mode: when focus switches between
+ * USER-window-owned process slots, the outgoing slot is frozen (PROC_STOPPED)
+ * and the incoming slot is thawed (PROC_RUNNABLE).  This ensures only the
+ * focused GUI ELF consumes CPU; background ELFs are completely frozen.
+ *
+ * Safe to call even when old wm_active is hidden or the same as new_idx.
  */
 static void wm_set_active(int new_idx) {
+    int old_idx = wm_active;
+
     /* Save outgoing terminal session into its struct */
-    if (!wm_windows[wm_active].hidden &&
-        wm_windows[wm_active].type == WM_TYPE_TERMINAL)
-        vga_save_session(&term_sessions[wm_windows[wm_active].instance]);
+    if (!wm_windows[old_idx].hidden &&
+        wm_windows[old_idx].type == WM_TYPE_TERMINAL)
+        vga_save_session(&term_sessions[wm_windows[old_idx].instance]);
+
+    /* ---- Single-active-ELF mode ----------------------------------------
+     * Determine the process slot that owns each window.  Only USER windows
+     * (ring-3 ELF pixel-buffer windows) have a meaningful owner_slot.
+     * Non-USER windows (terminal, calc, kapp) use -1 so we leave ring-3
+     * processes unaffected when focus moves to/from kernel-owned windows.
+     * -------------------------------------------------------------------- */
+    if (old_idx != new_idx) {
+        int old_slot = (!wm_windows[old_idx].hidden &&
+                        wm_windows[old_idx].type == WM_TYPE_USER)
+                       ? wm_windows[old_idx].owner_slot : -1;
+        int new_slot = (!wm_windows[new_idx].hidden &&
+                        wm_windows[new_idx].type == WM_TYPE_USER)
+                       ? wm_windows[new_idx].owner_slot : -1;
+
+        /* Suspend the outgoing ELF if it is different from the incoming one. */
+        if (old_slot >= 0 && old_slot < MAX_PROCS && old_slot != new_slot) {
+            proc_state_t s = proc_table[old_slot].state;
+            if (s == PROC_RUNNING || s == PROC_RUNNABLE) {
+                proc_table[old_slot].state = PROC_STOPPED;
+                serial_write(COM1, "[WM] focus-suspend slot=");
+                serial_write_dec(COM1, (uint32_t)old_slot);
+                serial_write(COM1, " (old_wid=");
+                serial_write_dec(COM1, (uint32_t)old_idx);
+                serial_write(COM1, " → new_wid=");
+                serial_write_dec(COM1, (uint32_t)new_idx);
+                serial_write(COM1, ")\n");
+            }
+        }
+
+        /* Resume the incoming ELF if it was frozen. */
+        if (new_slot >= 0 && new_slot < MAX_PROCS) {
+            if (proc_table[new_slot].state == PROC_STOPPED) {
+                proc_table[new_slot].state = PROC_RUNNABLE;
+                serial_write(COM1, "[WM] focus-resume slot=");
+                serial_write_dec(COM1, (uint32_t)new_slot);
+                serial_write(COM1, " (new_wid=");
+                serial_write_dec(COM1, (uint32_t)new_idx);
+                serial_write(COM1, ")\n");
+            }
+        }
+    }
 
     wm_active = new_idx;
 
@@ -995,11 +1122,25 @@ static void wm_close_window(int idx) {
     else if (w->type == WM_TYPE_KAPP) {
         kapp_close(w->instance, idx);
     } else {
-        /* WM_TYPE_USER: notify the app via CLOSE event, clear pixel store */
+        /* WM_TYPE_USER: notify the app via CLOSE event, reclaim pixel store */
         wm_event_t ev;
         ev.type = 5u; ev.wid = (uint16_t)idx;
         ev.x = 0; ev.y = 0; ev.btn = 0;
         wm_push_to_slot(w->owner_slot, ev);
+
+        /* If the owner was frozen by the focus system, wake it so it can
+         * dequeue the CLOSE event and exit.  Without this the process stays
+         * PROC_STOPPED forever and the slot is never reclaimed. */
+        int cs = w->owner_slot;
+        if (cs >= 0 && cs < MAX_PROCS &&
+            proc_table[cs].state == PROC_STOPPED) {
+            proc_table[cs].state = PROC_RUNNABLE;
+            serial_write(COM1, "[WM] wake-for-close slot=");
+            serial_write_dec(COM1, (uint32_t)cs);
+            serial_write(COM1, "\n");
+        }
+
+        pixbuf_free(w->pixels);
         w->pixels = (uint32_t *)0;
     }
 
@@ -1709,7 +1850,8 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
         if (!uw_valid(wid)) return -(int32_t)9;   /* -EBADF */
         {
             wm_window_t *w = &wm_windows[wid];
-            /* Free pixel backing store reference (kernel owns the buffer) */
+            /* Return pixel backing store to the pool */
+            pixbuf_free(w->pixels);
             w->pixels = (uint32_t *)0;
             w->hidden = 1;
 
@@ -1749,6 +1891,69 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
 
         const uint32_t *src = (const uint32_t *)b;
         for (uint32_t i = 0; i < npix; i++) w->pixels[i] = src[i];
+
+        /*
+         * Fast path: when a topmost (active) window blits, repaint ONLY its
+         * client area to the back buffer and flush.  Skip the full-scene
+         * composite (wallpaper + every other window + chrome + kapps +
+         * launcher + cursor) that wm_draw_all() does.
+         *
+         * Why this matters: every GUI ELF animation tick calls SYS_WM_BLIT.
+         * The old code ran wm_draw_all() per blit, so N concurrent animating
+         * apps each paid the cost of recompositing the other N-1 apps.
+         * That made performance scale as N², which is why "even one other
+         * ELF" made everything unusable.
+         *
+         * Correctness: the active window is always drawn last (pass 1) in
+         * wm_draw_all, so it's topmost — pasting its pixels straight into
+         * the back buffer can't be obscured by another window.  Chrome
+         * around the client rect is unchanged from the last full repaint
+         * and doesn't need redrawing on every blit.  Non-active windows
+         * fall back to wm_draw_all to preserve z-order correctness.
+         */
+        if (!w->hidden) {
+            int cx = w->x + WM_BORDER;
+            int cy = w->y + WM_TITLEBAR_H;
+            int cw = w->width  - 2 * WM_BORDER;
+            int ch = w->height - WM_TITLEBAR_H - WM_BORDER;
+            if (cw == w->pix_w && ch == w->pix_h)
+                fb_blit_pixels(cx, cy, w->pixels, cw, ch);
+            else
+                fb_blit_scaled(cx, cy, cw, ch, w->pixels, w->pix_w, w->pix_h);
+
+            /*
+             * Z-order preservation: if a non-active window just painted into
+             * an area where the active window also lives, re-blit the active
+             * window's client area on top so it stays visually topmost.
+             * O(2) work per blit instead of O(N) over all windows.
+             */
+            if ((int)wid != wm_active && wm_active >= 0 &&
+                wm_active < WM_MAX_WINDOWS && !wm_windows[wm_active].hidden) {
+                wm_window_t *a = &wm_windows[wm_active];
+                if (a->type == WM_TYPE_USER && a->pixels) {
+                    int acx = a->x + WM_BORDER;
+                    int acy = a->y + WM_TITLEBAR_H;
+                    int acw = a->width  - 2 * WM_BORDER;
+                    int ach = a->height - WM_TITLEBAR_H - WM_BORDER;
+                    /* Cheap overlap check */
+                    int ox0 = (cx > acx) ? cx : acx;
+                    int oy0 = (cy > acy) ? cy : acy;
+                    int ox1 = (cx + cw < acx + acw) ? cx + cw : acx + acw;
+                    int oy1 = (cy + ch < acy + ach) ? cy + ch : acy + ach;
+                    if (ox0 < ox1 && oy0 < oy1) {
+                        if (acw == a->pix_w && ach == a->pix_h)
+                            fb_blit_pixels(acx, acy, a->pixels, acw, ach);
+                        else
+                            fb_blit_scaled(acx, acy, acw, ach,
+                                           a->pixels, a->pix_w, a->pix_h);
+                    }
+                }
+            }
+
+            draw_cursor(mouse_get_x(), mouse_get_y());
+            fb_flush();
+            return 0;
+        }
 
         wm_draw_all();
         return 0;
@@ -1830,8 +2035,9 @@ void wm_cleanup_for_slot(int slot) {
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         wm_window_t *w = &wm_windows[i];
         if (!w->hidden && w->type == WM_TYPE_USER && w->owner_slot == slot) {
-            w->hidden = 1;
+            pixbuf_free(w->pixels);
             w->pixels = (uint32_t *)0;
+            w->hidden = 1;
             if (drag_win_idx == i) { drag_active = 0; drag_win_idx = -1; }
             if (wm_active == i) focus_gone = 1;
         }
@@ -1844,20 +2050,41 @@ void wm_cleanup_for_slot(int slot) {
             if (!wm_windows[i].hidden) { wm_set_active(i); break; }
         }
     }
+
+    /* Diagnostics: remaining active USER windows and pool usage */
+    int active_user = 0;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++)
+        if (!wm_windows[i].hidden && wm_windows[i].type == WM_TYPE_USER)
+            active_user++;
+    serial_write(COM1, "[WM] cleanup slot=");
+    serial_write_dec(COM1, (uint32_t)slot);
+    serial_write(COM1, " remaining_user_wins=");
+    serial_write_dec(COM1, (uint32_t)active_user);
+    serial_write(COM1, " pixbuf_used=");
+    serial_write_hex(COM1, pixbuf_pool_ptr - PIXBUF_POOL_BASE);
+    serial_write(COM1, "/");
+    serial_write_hex(COM1, PIXBUF_POOL_LIMIT - PIXBUF_POOL_BASE);
+    serial_write(COM1, "\n");
 }
 
 void wm_cleanup_all_user_windows(void) {
     int focus_gone = 0;
+    int cleaned = 0;
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         wm_window_t *w = &wm_windows[i];
         if (!w->hidden && w->type == WM_TYPE_USER) {
-            w->hidden = 1;
+            /* No individual pixbuf_free needed — pixbuf_reset() below is authoritative */
             w->pixels = (uint32_t *)0;
+            w->hidden = 1;
             if (drag_win_idx == i) { drag_active = 0; drag_win_idx = -1; }
             if (wm_active == i) focus_gone = 1;
+            cleaned++;
         }
     }
-    /* Reset the pixel buffer pool now that all windows are gone */
+    serial_write(COM1, "[WM] cleanup_all: removed ");
+    serial_write_dec(COM1, (uint32_t)cleaned);
+    serial_write(COM1, " user window(s)\n");
+    /* Reset the pixel buffer pool — all USER windows are now gone */
     pixbuf_reset();
     /* Flush all per-slot queues */
     for (int s = 0; s < MAX_PROCS; s++)

@@ -176,7 +176,7 @@ static int sched_next_after(int from) {
  * 1/2 evidence capture.                                               *
  * ------------------------------------------------------------------ */
 static const char *state_names[] = {
-    "DEAD", "RUNNING", "RUNNABLE", "ZOMBIE", "BLOCKED", "SLEEPING"
+    "DEAD", "RUNNING", "RUNNABLE", "ZOMBIE", "BLOCKED", "SLEEPING", "STOPPED"
 };
 
 void proc_dump_table(const char *tag) {
@@ -190,6 +190,16 @@ void proc_dump_table(const char *tag) {
     serial_write(COM1, " ring0_saved=");
     serial_write_dec(COM1, (uint32_t)ring0_has_saved_context);
     serial_write(COM1, "\n");
+
+    int free_slots = 0;
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (proc_table[i].state == PROC_DEAD) free_slots++;
+    serial_write(COM1, "[PTBL]   free_spawn_slots=");
+    serial_write_dec(COM1, (uint32_t)free_slots);
+    serial_write(COM1, "/");
+    serial_write_dec(COM1, (uint32_t)(MAX_PROCS - 1));
+    serial_write(COM1, "\n");
+
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_DEAD) continue;
         serial_write(COM1, "[PTBL]   slot=");
@@ -198,7 +208,9 @@ void proc_dump_table(const char *tag) {
         serial_write_dec(COM1, (uint32_t)proc_table[i].pid);
         serial_write(COM1, " state=");
         uint32_t s = (uint32_t)proc_table[i].state;
-        serial_write(COM1, s < 6 ? state_names[s] : "?");
+        serial_write(COM1, s < 7 ? state_names[s] : "?");
+        serial_write(COM1, " ppid=");
+        serial_write_dec(COM1, (uint32_t)(uint32_t)proc_table[i].parent_pid);
         serial_write(COM1, "\n");
     }
 }
@@ -213,9 +225,13 @@ static void do_switch(int next_slot, registers_t *regs) {
 
     *regs = proc_table[next_slot].saved_regs;
 
-    serial_write(COM1, "[sched] switch pid=");
-    serial_write_dec(COM1, (uint32_t)proc_table[next_slot].pid);
-    serial_write(COM1, "\n");
+    /*
+     * NOTE: per-switch serial logging was removed.  serial_putc busy-waits
+     * on the UART (each char ~87 µs at 115200 baud on real HW), and with
+     * 100 Hz PIT + N runnable processes this fired several times per tick,
+     * causing significant slowdown when multiple GUI ELFs were running.
+     * Re-enable behind a debug flag if needed.
+     */
 }
 
 extern int  process_exited;
@@ -234,7 +250,9 @@ void proc_yield(registers_t *regs) {
     if (next < 0) return;
 
     proc_table[current_proc].saved_regs = *regs;
-    proc_table[current_proc].state      = PROC_RUNNABLE;
+    /* Preserve PROC_STOPPED — wm_set_active() may have frozen this slot. */
+    if (proc_table[current_proc].state == PROC_RUNNING)
+        proc_table[current_proc].state = PROC_RUNNABLE;
 
     do_switch(next, regs);
 }
@@ -264,6 +282,14 @@ void proc_exit(registers_t *regs, int status) {
 
         /* Release any USER windows owned by this process */
         wm_cleanup_for_slot(dying);
+
+        /* Reclaim user-heap (sbrk/brk) pages back to the phys pool.
+         * Without this, every fork+exec'd GUI app permanently consumes pool
+         * space and the 4th-5th launch fails when paging_alloc_phys_page
+         * returns 0. */
+        if (proc_table[dying].page_dir)
+            paging_free_user_heap(proc_table[dying].page_dir);
+        proc_table[dying].brk = 0x400000U;
 
         proc_table[dying].exit_status = status;
 
@@ -406,24 +432,16 @@ int proc_fork(registers_t *regs) {
     process_t *child  = &proc_table[child_slot];
 
     /*
-     * Allocate 256 physical pages for child's user space (0x300000-0x3FFFFF).
-     * We need 256 pages of 4KB = 1MB.
+     * Use the child slot's fixed 1 MB phys region (PROC_SLOT_PHYS).  Each
+     * slot 1..7 owns a permanent 1 MB block at 0xA00000+(slot-1)*0x100000
+     * inside supervisor PSE pages — always kernel-writable.  When the slot
+     * becomes PROC_DEAD the region is implicitly free and the next fork()
+     * or spawn() into that slot overwrites it.  This eliminates the largest
+     * leak in the system: the old code consumed 256 pages from the 256-page
+     * sbrk pool per fork(), exhausting the pool after a single GUI app
+     * launch from desktop.
      */
-    uint32_t child_phys_base = paging_alloc_phys_page();
-    if (!child_phys_base) {
-        klog("proc", "fork: out of physical pages");
-        child->state = PROC_DEAD;
-        return -ENOMEM;
-    }
-    /* Allocate the remaining 255 pages to fill the 1MB region */
-    for (int p = 1; p < 256; p++) {
-        uint32_t page = paging_alloc_phys_page();
-        if (!page) {
-            klog("proc", "fork: out of physical pages during alloc");
-            child->state = PROC_DEAD;
-            return -ENOMEM;
-        }
-    }
+    uint32_t child_phys_base = PROC_SLOT_PHYS(child_slot);
 
     /* Copy parent user space (0x300000..0x3FFFFF) to child's physical pages */
     uint8_t *src = (uint8_t *)USER_BASE;
@@ -437,11 +455,20 @@ int proc_fork(registers_t *regs) {
                  proc_ptabs1[child_slot], child_phys_base);
     child->page_dir = proc_pdirs[child_slot];
 
-    /* Inherit parent's heap PTEs so the child sees the same heap layout.
-     * Parent and child temporarily share physical heap pages; safe for
-     * fork+exec because exec() wipes the user address space on the next run. */
-    for (uint32_t i = 0; i < 0x100U; i++)
-        proc_ptabs1[child_slot][i] = proc_ptabs1[current_proc][i];
+    /* Start the child with a FRESH empty heap.  paging_clone already zeroed
+     * proc_ptabs1[child_slot][0..0xFF]; reset brk to the heap base.
+     *
+     * The previous design aliased the parent's heap PTEs into the child,
+     * which (a) caused data corruption when fork+exec'd children sbrk'd
+     * (paging_page_mapped returned true so writes hit parent's pages), and
+     * (b) made proc_exit's paging_free_user_heap() dangerous because freeing
+     * the child's PTEs would also free the parent's live malloc pages.
+     *
+     * The dominant pattern is fork+exec, where the child's heap is
+     * irrelevant pre-exec and exec resets brk anyway.  Programs that fork
+     * without exec lose heap-copy semantics, which this kernel never
+     * implemented correctly (it aliased, didn't copy). */
+    child->brk = 0x400000U;
 
     /* Clone fd table from parent (bumping pipe refcounts) */
     fd_table_clone(&child->fd_table, &parent->fd_table, 0 /* don't close cloexec on fork */);
@@ -559,6 +586,17 @@ void proc_sleep(registers_t *regs, uint32_t ticks) {
 
     if (ticks == 0) {
         regs->eax = 0;
+        return;
+    }
+
+    /* If this process has been suspended by the WM focus system, don't let
+     * it sleep — yield immediately instead so it gets properly frozen by
+     * the scheduler on the next tick without escaping via PROC_SLEEPING. */
+    if (proc_table[current_proc].state == PROC_STOPPED) {
+        proc_table[current_proc].saved_regs     = *regs;
+        proc_table[current_proc].saved_regs.eax = 0;
+        int next = sched_next_after(current_proc);
+        if (next >= 0) do_switch(next, regs);
         return;
     }
 
@@ -748,11 +786,7 @@ void proc_timer_tick(registers_t *regs) {
                  * stale snapshot from the very first switch. */
                 saved_ring0_regs = *regs;
                 ring0_has_saved_context = 1;
-                serial_write(COM1, "[sched] ring0→pid=");
-                serial_write_dec(COM1, (uint32_t)proc_table[i].pid);
-                serial_write(COM1, " slot=");
-                serial_write_dec(COM1, (uint32_t)i);
-                serial_write(COM1, "\n");
+                /* per-tick ring0→ring3 transition log removed — hot path */
                 do_switch(i, regs);
                 return;
             }
@@ -775,7 +809,9 @@ void proc_timer_tick(registers_t *regs) {
     int next = sched_next_after(current_proc);
     if (next >= 0) {
         proc_table[current_proc].saved_regs = *regs;
-        proc_table[current_proc].state      = PROC_RUNNABLE;
+        /* Preserve PROC_STOPPED — wm_set_active may have frozen this slot. */
+        if (proc_table[current_proc].state == PROC_RUNNING)
+            proc_table[current_proc].state = PROC_RUNNABLE;
         do_switch(next, regs);
         return;
     }
@@ -805,7 +841,9 @@ void proc_timer_tick(registers_t *regs) {
      *      shell with the correct ESP. */
     if (ring0_has_saved_context) {
         proc_table[current_proc].saved_regs = *regs;
-        proc_table[current_proc].state      = PROC_RUNNABLE;
+        /* Preserve PROC_STOPPED — wm_set_active may have frozen this slot. */
+        if (proc_table[current_proc].state == PROC_RUNNING)
+            proc_table[current_proc].state = PROC_RUNNABLE;
         current_proc = -1;
 
         /* ring0_E = original ESP value at the moment the ring-0 PIT fired.
@@ -832,7 +870,7 @@ void proc_timer_tick(registers_t *regs) {
         regs->cs     = 0x08u;
         regs->eflags = 0x02u;  /* IF=0; trampoline does cli before iret */
 
-        serial_write(COM1, "[sched] yield ring3→ring0 (trampoline)\n");
+        /* per-tick ring3→ring0 yield log removed — hot path */
         return;
     }
 

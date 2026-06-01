@@ -30,6 +30,17 @@ void      paging_switch_dir(uint32_t *page_dir);
  * Returns the physical address, or 0 if the pool is exhausted. */
 uint32_t  paging_alloc_phys_page(void);
 
+/* Return a 4 KB page allocated by paging_alloc_phys_page back to the pool. */
+void      paging_free_phys_page(uint32_t paddr);
+
+/* Walk pdir's PDE[1] page table, free every present user-heap page, and
+ * clear the PTEs.  Called from proc_exit() to reclaim sbrk/brk pages. */
+void      paging_free_user_heap(uint32_t *pdir);
+
+/* Diagnostics on the user-heap pool (sbrk/brk backing store). */
+uint32_t  paging_phys_heap_used_pages(void);
+uint32_t  paging_phys_heap_total_pages(void);
+
 /* Map a single 4 KB page in page_dir: vaddr → paddr.
  * user=1 sets U/S so ring-3 code can access it; user=0 is supervisor-only.
  * The target PDE must already be a 4 KB page table (not PSE). */

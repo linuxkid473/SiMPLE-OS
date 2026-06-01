@@ -6,7 +6,7 @@
 #include "types.h"
 
 #define MAX_PROCS       8
-#define PROC_TIMESLICE  10U
+#define PROC_TIMESLICE  3U
 
 /* Wait status encoding (POSIX) */
 #define W_EXITED(code)    (((code) & 0xFF) << 8)

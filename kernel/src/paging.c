@@ -58,14 +58,83 @@ static uint32_t page_tab1[PT_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
  */
 #define PHYS_HEAP_BASE  0x900000U
 #define PHYS_HEAP_LIMIT 0xA00000U   /* 1 MB = 256 × 4 KB pages */
+#define PHYS_HEAP_PAGES 256U
 
-static uint32_t phys_heap_next = PHYS_HEAP_BASE;
+/*
+ * Bitmap allocator for the user heap pool (sbrk / linux_brk).
+ *
+ * Each bit in phys_heap_bm represents one 4 KB page in [PHYS_HEAP_BASE,
+ * PHYS_HEAP_LIMIT).  0 = free, 1 = allocated.  This lets us release sbrk
+ * pages when a process exits, so GUI ELFs can be launched, closed, and
+ * relaunched indefinitely without exhausting the 1 MB pool.
+ *
+ * Previously this was a bump pointer (phys_heap_next) that only reset on
+ * full kernel reload via proc_register_initial(), so any sbrk by a spawned
+ * GUI app permanently consumed pool space until shell reboot.
+ */
+static uint32_t phys_heap_bm[PHYS_HEAP_PAGES / 32];
+static uint32_t phys_heap_used = 0;
+static uint32_t phys_heap_hint = 0;   /* search hint for first-fit */
 
 uint32_t paging_alloc_phys_page(void) {
-    if (phys_heap_next >= PHYS_HEAP_LIMIT) return 0;
-    uint32_t page = phys_heap_next;
-    phys_heap_next += PAGE_SIZE;
-    return page;
+    for (uint32_t i = 0; i < PHYS_HEAP_PAGES; i++) {
+        uint32_t idx = (phys_heap_hint + i) % PHYS_HEAP_PAGES;
+        uint32_t w   = idx >> 5;
+        uint32_t b   = idx & 31;
+        if (!(phys_heap_bm[w] & (1U << b))) {
+            phys_heap_bm[w] |= (1U << b);
+            phys_heap_used++;
+            phys_heap_hint = (idx + 1) % PHYS_HEAP_PAGES;
+            return PHYS_HEAP_BASE + idx * PAGE_SIZE;
+        }
+    }
+    return 0;
+}
+
+void paging_free_phys_page(uint32_t paddr) {
+    if (paddr < PHYS_HEAP_BASE || paddr >= PHYS_HEAP_LIMIT) return;
+    uint32_t idx = (paddr - PHYS_HEAP_BASE) / PAGE_SIZE;
+    uint32_t w   = idx >> 5;
+    uint32_t b   = idx & 31;
+    if (phys_heap_bm[w] & (1U << b)) {
+        phys_heap_bm[w] &= ~(1U << b);
+        if (phys_heap_used) phys_heap_used--;
+        if (idx < phys_heap_hint) phys_heap_hint = idx;
+    }
+}
+
+uint32_t paging_phys_heap_used_pages(void) { return phys_heap_used; }
+uint32_t paging_phys_heap_total_pages(void) { return PHYS_HEAP_PAGES; }
+
+/*
+ * Free all user-heap PTEs in pdir's PDE[1] page table (virtual 0x400000-
+ * 0x4FFFFF) and return the underlying physical pages to the bitmap pool.
+ * Called from proc_exit() so a dying GUI ELF returns its malloc/sbrk pages.
+ */
+void paging_free_user_heap(uint32_t *pdir) {
+    if (!pdir) return;
+    uint32_t pde = pdir[1];
+    if (!(pde & PDE_PRESENT) || (pde & PDE_PS)) return;
+    uint32_t *ptab = (uint32_t *)(pde & ~0xFFFU);
+    uint32_t freed = 0;
+    for (uint32_t i = 0; i < 0x100U; i++) {
+        uint32_t pte = ptab[i];
+        if (pte & PTE_PRESENT) {
+            paging_free_phys_page(pte & ~0xFFFU);
+            ptab[i] = 0;
+            __asm__ volatile("invlpg (%0)" : : "r"(0x400000U + i * PAGE_SIZE) : "memory");
+            freed++;
+        }
+    }
+    if (freed) {
+        serial_write(COM1, "[paging] freed ");
+        serial_write_dec(COM1, freed);
+        serial_write(COM1, " user-heap pages; pool_used=");
+        serial_write_dec(COM1, phys_heap_used);
+        serial_write(COM1, "/");
+        serial_write_dec(COM1, PHYS_HEAP_PAGES);
+        serial_write(COM1, "\n");
+    }
 }
 
 /*
@@ -96,7 +165,9 @@ uint32_t paging_alloc_phys_page(void) {
  *    Fix: zero page_tab1[0..0xFF] so the heap region starts fully absent.
  */
 void paging_reset_phys_heap(void) {
-    phys_heap_next = PHYS_HEAP_BASE;
+    for (uint32_t i = 0; i < PHYS_HEAP_PAGES / 32; i++) phys_heap_bm[i] = 0;
+    phys_heap_used = 0;
+    phys_heap_hint = 0;
 
     /* Clear all heap-range PTEs and flush each TLB entry */
     for (uint32_t i = 0; i < 0x100U; i++) {
