@@ -1416,10 +1416,10 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
             /* Move */
             w->x = x - drag_off_x;
             w->y = y - drag_off_y;
-            if (w->x < 0)                           w->x = 0;
-            if (w->y < UI_MENUBAR_H)                w->y = UI_MENUBAR_H;
-            if (w->x + w->width  > scr_w)           w->x = scr_w - w->width;
-            if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
+            if (w->x < 0)                w->x = 0;
+            if (w->y < UI_MENUBAR_H)     w->y = UI_MENUBAR_H;
+            if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
+            if (w->y + w->height > scr_h)  w->y = scr_h - w->height;
         } else if (drag_mode == 2) {
             /* Resize bottom-right: top-left corner fixed */
             int new_w = (x + drag_off_x) - w->x;
@@ -1427,7 +1427,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
             if (new_w < WIN_MIN_W) new_w = WIN_MIN_W;
             if (new_h < WIN_MIN_H) new_h = WIN_MIN_H;
             if (w->x + new_w > scr_w) new_w = scr_w - w->x;
-            if (w->y + new_h > scr_h - UI_DOCK_H) new_h = scr_h - UI_DOCK_H - w->y;
+            if (w->y + new_h > scr_h)  new_h = scr_h - w->y;
             w->width  = new_w;
             w->height = new_h;
         } else if (drag_mode == 3) {
@@ -1438,7 +1438,7 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
             if (new_w < WIN_MIN_W) { new_x = drag_right_edge - WIN_MIN_W; new_w = WIN_MIN_W; }
             if (new_x < 0)        { new_x = 0; new_w = drag_right_edge; }
             if (new_h < WIN_MIN_H) new_h = WIN_MIN_H;
-            if (w->y + new_h > scr_h - UI_DOCK_H) new_h = scr_h - UI_DOCK_H - w->y;
+            if (w->y + new_h > scr_h)  new_h = scr_h - w->y;
             w->x      = new_x;
             w->width  = new_w;
             w->height = new_h;
@@ -1614,10 +1614,10 @@ void wm_handle_key(int key_type) {
     w->x += dx;
     w->y += dy;
 
-    if (w->x < 0)               w->x = 0;
-    if (w->y < UI_MENUBAR_H)    w->y = UI_MENUBAR_H;
+    if (w->x < 0)                 w->x = 0;
+    if (w->y < UI_MENUBAR_H)      w->y = UI_MENUBAR_H;
     if (w->x + w->width  > scr_w) w->x = scr_w - w->width;
-    if (w->y + w->height > scr_h - UI_DOCK_H) w->y = scr_h - UI_DOCK_H - w->height;
+    if (w->y + w->height > scr_h)  w->y = scr_h - w->height;
 
     wm_draw_all();
 }
