@@ -23,6 +23,20 @@ uint32_t *paging_get_page_dir(void);
 void      paging_clone(uint32_t *dst_dir, uint32_t *dst_tab0, uint32_t *dst_tab1,
                        uint32_t phys_user_base);
 
+/*
+ * Deep-copy all user-heap PTEs from parent_dir into child_dir.
+ *
+ * For each present, user-accessible PTE in the heap range (virtual
+ * 0x400000–0x4FFFFF, PDE[1] indices 0x000–0x0FF) of parent_dir, a fresh
+ * physical page is allocated, the data is copied, and the PTE is installed
+ * in child_dir with the same flags.  child_dir's PDE[1] must already have
+ * been set up by paging_clone() before calling this.
+ *
+ * Returns 0 on success, -1 if the physical pool is exhausted (fork fails
+ * with -ENOMEM; the caller must clean up the child slot).
+ */
+int       paging_clone_heap(uint32_t *parent_dir, uint32_t *child_dir);
+
 /* Load a page directory into CR3 (TLB flush). */
 void      paging_switch_dir(uint32_t *page_dir);
 

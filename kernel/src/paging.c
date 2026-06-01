@@ -127,9 +127,9 @@ void paging_free_user_heap(uint32_t *pdir) {
         }
     }
     if (freed) {
-        serial_write(COM1, "[paging] freed ");
+        serial_write(COM1, "[VM] destroy heap: freed ");
         serial_write_dec(COM1, freed);
-        serial_write(COM1, " user-heap pages; pool_used=");
+        serial_write(COM1, " pages, pool_used=");
         serial_write_dec(COM1, phys_heap_used);
         serial_write(COM1, "/");
         serial_write_dec(COM1, PHYS_HEAP_PAGES);
@@ -283,6 +283,72 @@ void paging_clone(uint32_t *dst_dir, uint32_t *dst_tab0, uint32_t *dst_tab1,
     /* PDE[2..1023]: inherit from kernel's page_dir to preserve UC markings */
     for (uint32_t i = 2; i < PD_ENTRIES; i++)
         dst_dir[i] = page_dir[i];
+
+    serial_write(COM1, "[VM] create addr space: dir=0x");
+    serial_write_hex(COM1, (uint32_t)dst_dir);
+    serial_write(COM1, " phys_user=0x");
+    serial_write_hex(COM1, phys_user_base);
+    serial_write(COM1, "\n");
+}
+
+/*
+ * paging_clone_heap — deep-copy all parent heap PTEs into the child.
+ *
+ * Walks parent_dir's PDE[1] page table (virtual 0x400000–0x4FFFFF, indices
+ * 0x000–0x0FF) and for each present, user-accessible PTE:
+ *   1. Allocates a fresh physical page from the pool.
+ *   2. Copies the page contents (parent phys → child phys, both identity-mapped
+ *      via the supervisor PSE pages that cover 0x900000–0x9FFFFF).
+ *   3. Installs the new PTE in child_dir's PDE[1] table with the same flags.
+ *
+ * Called by proc_fork() after paging_clone() to give the child a complete
+ * writable copy of the parent's heap — required for correct fork() semantics
+ * when the parent has live heap allocations.
+ *
+ * Returns 0 on success, -1 if the physical pool is exhausted.
+ */
+int paging_clone_heap(uint32_t *parent_dir, uint32_t *child_dir) {
+    uint32_t parent_pde1 = parent_dir[1];
+    uint32_t child_pde1  = child_dir[1];
+
+    if (!(parent_pde1 & PDE_PRESENT) || (parent_pde1 & PDE_PS)) return 0;
+    if (!(child_pde1  & PDE_PRESENT) || (child_pde1  & PDE_PS)) return 0;
+
+    uint32_t *parent_tab = (uint32_t *)(parent_pde1 & ~0xFFFU);
+    uint32_t *child_tab  = (uint32_t *)(child_pde1  & ~0xFFFU);
+
+    uint32_t copied = 0;
+    for (uint32_t i = 0; i < 0x100U; i++) {
+        uint32_t pte = parent_tab[i];
+        if (!(pte & PTE_PRESENT)) continue;
+        if (!(pte & PTE_USER))    continue;
+
+        uint32_t new_phys = paging_alloc_phys_page();
+        if (!new_phys) {
+            serial_write(COM1, "[VM] clone heap OOM at PTE ");
+            serial_write_dec(COM1, i);
+            serial_write(COM1, "\n");
+            return -1;
+        }
+
+        /* Copy page data via identity-mapped kernel addresses */
+        uint8_t *src = (uint8_t *)(pte & ~0xFFFU);
+        uint8_t *dst = (uint8_t *)new_phys;
+        for (uint32_t j = 0; j < PAGE_SIZE; j++) dst[j] = src[j];
+
+        /* Install in child's page table, preserving all flags */
+        child_tab[i] = new_phys | (pte & 0xFFFU);
+        copied++;
+    }
+
+    serial_write(COM1, "[VM] clone heap: ");
+    serial_write_dec(COM1, copied);
+    serial_write(COM1, " pages copied, pool_used=");
+    serial_write_dec(COM1, phys_heap_used);
+    serial_write(COM1, "/");
+    serial_write_dec(COM1, PHYS_HEAP_PAGES);
+    serial_write(COM1, "\n");
+    return 0;
 }
 
 void paging_switch_dir(uint32_t *dir) {

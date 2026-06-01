@@ -184,7 +184,11 @@ user: \
     user/snake.elf   \
     user/ticker_a.elf \
     user/ticker_b.elf \
-    user/ticker_c.elf
+    user/ticker_c.elf \
+    user/isoA.elf    \
+    user/isoB.elf    \
+    user/vmfork.elf  \
+    user/crash.elf
 
 # =============================================================================
 # MODERN POSIX user programs — define main(), link against USER_RUNTIME
@@ -264,6 +268,22 @@ user/paint.elf: user/paint.c $(LEGACY_RUNTIME_DEPS)
 user/snake.elf: user/snake.c $(LEGACY_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/snake.c $(LEGACY_RUNTIME_SRCS)
 
+# ---------------------------------------------------------------------------
+# VM isolation / validation test programs
+# ---------------------------------------------------------------------------
+
+user/isoA.elf: user/isoA.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/isoA.c $(LEGACY_RUNTIME_SRCS)
+
+user/isoB.elf: user/isoB.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/isoB.c $(LEGACY_RUNTIME_SRCS)
+
+user/vmfork.elf: user/vmfork.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/vmfork.c $(LEGACY_RUNTIME_SRCS)
+
+user/crash.elf: user/crash.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/crash.c $(LEGACY_RUNTIME_SRCS)
+
 # =============================================================================
 # Kernel build rules
 # =============================================================================
@@ -323,6 +343,10 @@ image: \
     user/desktop.elf \
     user/paint.elf \
     user/snake.elf \
+    user/isoA.elf \
+    user/isoB.elf \
+    user/vmfork.elf \
+    user/crash.elf \
     $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
@@ -358,6 +382,10 @@ image: \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_a.elf      ::ticker_a.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_b.elf      ::ticker_b.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_c.elf      ::ticker_c.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/isoA.elf          ::isoA.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/isoB.elf          ::isoB.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/vmfork.elf        ::vmfork.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/crash.elf         ::crash.elf; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% \
 	    set 1 boot on 2>/dev/null || true; \
 	$(LIMINE_DEPLOY) $(IMAGE)

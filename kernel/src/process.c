@@ -110,9 +110,10 @@ void proc_register_initial(uint32_t *page_dir __attribute__((unused)), fd_table_
         fd_table_init(&proc_table[0].fd_table);
     current_proc = 0;
     paging_switch_dir(proc_pdirs[0]);
+    serial_write(COM1, "[VM] switch CR3: initial pid=1 dir=0x");
+    serial_write_hex(COM1, (uint32_t)proc_pdirs[0]);
+    serial_write(COM1, "\n");
     tss_set_esp0((uint32_t)(proc_kstacks[0] + 4096));
-
-    serial_write(COM1, "[proc] initial pid=1\n");
 }
 
 static int alloc_child_slot(void) {
@@ -275,6 +276,10 @@ void proc_exit(registers_t *regs, int status) {
     int dying = current_proc;
 
     if (dying >= 0) {
+        serial_write(COM1, "[VM] destroy addr space: pid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[dying].pid);
+        serial_write(COM1, "\n");
+
         /* Close all fds */
         for (int fd = 0; fd < FD_MAX; fd++)
             if (proc_table[dying].fd_table.fds[fd].type != FD_NONE)
@@ -455,20 +460,29 @@ int proc_fork(registers_t *regs) {
                  proc_ptabs1[child_slot], child_phys_base);
     child->page_dir = proc_pdirs[child_slot];
 
-    /* Start the child with a FRESH empty heap.  paging_clone already zeroed
-     * proc_ptabs1[child_slot][0..0xFF]; reset brk to the heap base.
+    serial_write(COM1, "[VM] clone addr space: parent_pid=");
+    serial_write_dec(COM1, (uint32_t)parent->pid);
+    serial_write(COM1, " child_slot=");
+    serial_write_dec(COM1, (uint32_t)child_slot);
+    serial_write(COM1, "\n");
+
+    /*
+     * Deep-copy the parent's heap (virtual 0x400000–0x4FFFFF) into the child
+     * with fresh physical pages.  This gives the child a fully independent
+     * writable copy of all heap data that existed at the time of fork().
+     * paging_clone() already zeroed child's heap PTEs, so we only install
+     * entries where the parent has live allocations.
      *
-     * The previous design aliased the parent's heap PTEs into the child,
-     * which (a) caused data corruption when fork+exec'd children sbrk'd
-     * (paging_page_mapped returned true so writes hit parent's pages), and
-     * (b) made proc_exit's paging_free_user_heap() dangerous because freeing
-     * the child's PTEs would also free the parent's live malloc pages.
-     *
-     * The dominant pattern is fork+exec, where the child's heap is
-     * irrelevant pre-exec and exec resets brk anyway.  Programs that fork
-     * without exec lose heap-copy semantics, which this kernel never
-     * implemented correctly (it aliased, didn't copy). */
-    child->brk = 0x400000U;
+     * On OOM the child slot is released and fork() returns -ENOMEM.
+     */
+    if (paging_clone_heap(proc_pdirs[current_proc], proc_pdirs[child_slot]) != 0) {
+        proc_table[child_slot].state = PROC_DEAD;
+        klog("proc", "fork: heap clone OOM");
+        return -(int32_t)ENOMEM;
+    }
+
+    /* Child inherits parent's brk (heap ceiling). */
+    child->brk = parent->brk;
 
     /* Clone fd table from parent (bumping pipe refcounts) */
     fd_table_clone(&child->fd_table, &parent->fd_table, 0 /* don't close cloexec on fork */);
@@ -995,6 +1009,12 @@ int proc_spawn_user(uint32_t entry, uint32_t user_sp,
     paging_clone(proc_pdirs[slot], proc_ptabs[slot],
                  proc_ptabs1[slot], phys_user_base);
     p->page_dir = proc_pdirs[slot];
+
+    serial_write(COM1, "[VM] create addr space: slot=");
+    serial_write_dec(COM1, (uint32_t)slot);
+    serial_write(COM1, " pid=");
+    serial_write_dec(COM1, (uint32_t)p->pid);
+    serial_write(COM1, "\n");
 
     /*
      * Initial CPU state for IRET into ring-3.

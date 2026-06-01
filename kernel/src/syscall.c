@@ -331,7 +331,16 @@ int32_t sys_exec(const char *path, registers_t *regs) {
         for (uint32_t j = saved[i].filesz; j < saved[i].memsz; j++) dest[j] = 0;
     }
 
-    /* Reset brk to start of heap for the newly exec'd program */
+    /* Free any heap pages from the previous image and reset brk.
+     * Without the free, stale PTEs remain in the page table and
+     * paging_page_mapped() returns 1 for old frames, causing the new
+     * process to silently inherit stale heap data and exhaust the pool. */
+    if (current_proc >= 0 && proc_table[current_proc].page_dir) {
+        paging_free_user_heap(proc_table[current_proc].page_dir);
+        serial_write(COM1, "[VM] exec: reset user heap for pid=");
+        serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
+        serial_write(COM1, "\n");
+    }
     if (current_proc >= 0)
         proc_table[current_proc].brk = 0x400000U;
 

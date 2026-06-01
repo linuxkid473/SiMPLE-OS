@@ -166,33 +166,53 @@ void idt_init(void) {
 }
 
 /* -------------------------------------------------------------------------
-   User-process fault handler
+   User-process fault handler — [VM] diagnostics
    ---------------------------------------------------------------------- */
 static void kill_user_process(registers_t *regs, const char *reason) {
-    serial_write(COM1, "[SIMPLE] user process killed: ");
+    uint32_t cr2 = 0;
+    if (regs->int_no == 14)
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+    serial_write(COM1, "[VM] page fault: ");
     serial_write(COM1, reason);
     serial_write(COM1, "\n");
-    serial_write(COM1, "[SIMPLE] INT=");   serial_write_dec(COM1, regs->int_no);
-    serial_write(COM1, " ERR=");           serial_write_hex(COM1, regs->err_code);
-    serial_write(COM1, " EIP=");           serial_write_hex(COM1, regs->eip);
-    serial_write(COM1, " CS=");            serial_write_hex(COM1, regs->cs);
+
+    serial_write(COM1, "[VM]   pid=");
+    if (current_proc >= 0)
+        serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
+    else
+        serial_write(COM1, "?");
+    serial_write(COM1, " INT=");
+    serial_write_dec(COM1, regs->int_no);
+    serial_write(COM1, " EIP=0x");
+    serial_write_hex(COM1, regs->eip);
+    serial_write(COM1, " CS=0x");
+    serial_write_hex(COM1, regs->cs);
     serial_write(COM1, "\n");
 
     if (regs->int_no == 14) {
-        uint32_t cr2;
-        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        serial_write(COM1, "[SIMPLE] CR2=");
+        serial_write(COM1, "[VM]   CR2=0x");
         serial_write_hex(COM1, cr2);
-        serial_write(COM1, "\n");
-        vga_write("User fault: ");
+        serial_write(COM1, " err=0x");
+        serial_write_hex(COM1, regs->err_code);
+        serial_write(COM1, " (");
+        serial_write(COM1, (regs->err_code & 1) ? "present"    : "not-present");
+        serial_write(COM1, "|");
+        serial_write(COM1, (regs->err_code & 2) ? "write"      : "read");
+        serial_write(COM1, "|");
+        serial_write(COM1, (regs->err_code & 4) ? "user-mode"  : "kernel-mode");
+        if (regs->err_code & 8)  serial_write(COM1, "|reserved-bit");
+        if (regs->err_code & 16) serial_write(COM1, "|instr-fetch");
+        serial_write(COM1, ")\n");
+        vga_write("[VM] page fault: ");
         vga_write(reason);
         vga_putc('\n');
     } else {
-        vga_write("User fault: ");
+        vga_write("[VM] user fault: ");
         vga_write_line(reason);
     }
 
-    /* Send SIGSEGV to current process, or kill it directly */
+    /* Kill only the offending process; kernel keeps running */
     if (current_proc >= 0) {
         proc_exit(regs, W_SIGNALED(SIGSEGV));
     } else {
