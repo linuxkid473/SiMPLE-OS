@@ -181,6 +181,7 @@ user: \
     user/term.elf    \
     user/desktop.elf \
     user/paint.elf   \
+    user/snake.elf   \
     user/ticker_a.elf \
     user/ticker_b.elf \
     user/ticker_c.elf
@@ -260,6 +261,9 @@ user/desktop.elf: user/desktop.c user/dirent.c $(LEGACY_RUNTIME_DEPS)
 user/paint.elf: user/paint.c $(LEGACY_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/paint.c $(LEGACY_RUNTIME_SRCS)
 
+user/snake.elf: user/snake.c $(LEGACY_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/snake.c $(LEGACY_RUNTIME_SRCS)
+
 # =============================================================================
 # Kernel build rules
 # =============================================================================
@@ -318,6 +322,7 @@ image: \
     user/term.elf \
     user/desktop.elf \
     user/paint.elf \
+    user/snake.elf \
     $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
@@ -349,6 +354,7 @@ image: \
 	mcopy -i $(IMAGE)@@1048576 user/term.elf          ::term.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/desktop.elf       ::desktop.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/paint.elf         ::paint.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/snake.elf         ::snake.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_a.elf      ::ticker_a.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_b.elf      ::ticker_b.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/ticker_c.elf      ::ticker_c.elf; \

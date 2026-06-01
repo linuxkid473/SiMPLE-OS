@@ -453,19 +453,19 @@ static void draw_menubar(unsigned int *mb) {
 /* ================================================================
  * Dock
  * ================================================================ */
-#define N_BTNS   4
-#define BTN_W    140
+#define N_BTNS   5
+#define BTN_W    130
 #define BTN_H    42
-#define BTN_GAP  16
+#define BTN_GAP  12
 
 #define BTN_STRIP  (N_BTNS*BTN_W + (N_BTNS-1)*BTN_GAP)
 #define BTN_X0     ((DK_W - BTN_STRIP) / 2)
 #define BTN_Y0     ((DK_H - BTN_H) / 2)   /* = 5 */
 
 /* btn_app: empty string "" means the button has a custom handler */
-static const char *btn_label[N_BTNS]  = { "TERMINAL", "CALC", "FILES", "PAINT" };
-static const char *btn_app[N_BTNS]    = { "term.elf", "calc.elf", "",   "paint.elf" };
-static const unsigned int btn_acc[N_BTNS] = { 0x44FFCC, 0xFF8844, 0x8888FF, 0xFF6644 };
+static const char *btn_label[N_BTNS]  = { "TERMINAL", "CALC", "FILES", "PAINT", "SNAKE" };
+static const char *btn_app[N_BTNS]    = { "term.elf", "calc.elf", "", "paint.elf", "snake.elf" };
+static const unsigned int btn_acc[N_BTNS] = { 0x44FFCC, 0xFF8844, 0x8888FF, 0xFF6644, 0x44FF77 };
 
 static int bx(int i) { return BTN_X0 + i*(BTN_W + BTN_GAP); }
 
