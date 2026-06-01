@@ -222,6 +222,100 @@ void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
     }
 }
 
+/* Read a pixel from the back buffer */
+uint32_t fb_read_pixel(int x, int y) {
+    if (!fb_addr || x < 0 || (uint32_t)x >= fb_width || y < 0 || (uint32_t)y >= fb_height)
+        return 0;
+    return fb_back[(uint32_t)y * fb_width + (uint32_t)x];
+}
+
+/* Alpha-blend color over the back buffer in the given rectangle.
+ * Uses right-shift approximation: (a*alpha + b*(256-alpha)) >> 8 */
+void fb_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha) {
+    if (!fb_addr || alpha == 0 || w <= 0 || h <= 0) return;
+    if (alpha == 255) { fb_fill_rect(x, y, w, h, color); return; }
+    uint32_t sr = (color >> 16) & 0xFF;
+    uint32_t sg = (color >>  8) & 0xFF;
+    uint32_t sb =  color        & 0xFF;
+    uint32_t ia = 256u - alpha;   /* inverse alpha (0..256) */
+    for (int ry = y; ry < y + h; ry++) {
+        if (ry < 0 || (uint32_t)ry >= fb_height) continue;
+        uint32_t *row = fb_back + (uint32_t)ry * fb_width;
+        for (int rx = x; rx < x + w; rx++) {
+            if (rx < 0 || (uint32_t)rx >= fb_width) continue;
+            uint32_t dst = row[rx];
+            uint32_t r = (sr * alpha + ((dst >> 16) & 0xFF) * ia) >> 8;
+            uint32_t g = (sg * alpha + ((dst >>  8) & 0xFF) * ia) >> 8;
+            uint32_t b = (sb * alpha + ( dst        & 0xFF) * ia) >> 8;
+            row[rx] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/* Vertical gradient fill: linearly interpolate top→bottom colour */
+void fb_fill_gradient_v(int x, int y, int w, int h,
+                        uint32_t col_top, uint32_t col_bot) {
+    if (!fb_addr || w <= 0 || h <= 0) return;
+    uint32_t tr = (col_top >> 16) & 0xFF, tg = (col_top >> 8) & 0xFF, tb = col_top & 0xFF;
+    uint32_t br = (col_bot >> 16) & 0xFF, bg = (col_bot >> 8) & 0xFF, bb = col_bot & 0xFF;
+    for (int ry = y; ry < y + h; ry++) {
+        if (ry < 0 || (uint32_t)ry >= fb_height) continue;
+        int t  = ry - y;
+        int dv = h > 1 ? h - 1 : 1;
+        uint32_t r  = (tr * (dv - t) + br * t) / (uint32_t)dv;
+        uint32_t g  = (tg * (dv - t) + bg * t) / (uint32_t)dv;
+        uint32_t b  = (tb * (dv - t) + bb * t) / (uint32_t)dv;
+        uint32_t col = (r << 16) | (g << 8) | b;
+        uint32_t *row = fb_back + (uint32_t)ry * fb_width;
+        for (int rx = x; rx < x + w; rx++) {
+            if (rx < 0 || (uint32_t)rx >= fb_width) continue;
+            row[rx] = col;
+        }
+    }
+}
+
+/* Screen-edge vignette: darken pixels proportionally to distance from centre.
+ * Uses precomputed per-row/column lookup tables to avoid per-pixel division. */
+void fb_vignette(uint32_t sw, uint32_t sh, uint8_t strength) {
+    if (!fb_addr || sw == 0 || sh == 0 || strength == 0) return;
+    uint32_t cx = sw / 2, cy = sh / 2;
+    uint32_t max_r2 = cx * cx + cy * cy;
+    if (max_r2 == 0) return;
+
+    /* Per-axis squared-distance contributions (divisions done once per axis) */
+    static uint8_t xtab[2048], ytab[2048];
+    uint32_t sx = sw < 2048u ? sw : 2048u;
+    uint32_t sy = sh < 2048u ? sh : 2048u;
+    for (uint32_t x = 0; x < sx; x++) {
+        int dx = (int)x - (int)cx;
+        uint32_t v = (uint32_t)strength * (uint32_t)(dx * dx) / max_r2;
+        xtab[x] = (uint8_t)(v > 255u ? 255u : v);
+    }
+    for (uint32_t y = 0; y < sy; y++) {
+        int dy = (int)y - (int)cy;
+        uint32_t v = (uint32_t)strength * (uint32_t)(dy * dy) / max_r2;
+        ytab[y] = (uint8_t)(v > 255u ? 255u : v);
+    }
+
+    for (uint32_t y = 0; y < sh; y++) {
+        uint32_t yd   = ytab[y < 2048u ? y : 2047u];
+        uint32_t *row = fb_back + y * fb_width;
+        for (uint32_t x = 0; x < sw; x++) {
+            uint32_t dark = (uint32_t)xtab[x < 2048u ? x : 2047u] + yd;
+            if (dark == 0) continue;
+            if (dark > 255u) dark = 255u;
+            uint32_t dst = row[x];
+            uint32_t rr = (dst >> 16) & 0xFF;
+            uint32_t gg = (dst >>  8) & 0xFF;
+            uint32_t bb =  dst        & 0xFF;
+            rr = rr > dark ? rr - dark : 0u;
+            gg = gg > dark ? gg - dark : 0u;
+            bb = bb > dark ? bb - dark : 0u;
+            row[x] = (rr << 16) | (gg << 8) | bb;
+        }
+    }
+}
+
 /* Copy the back buffer to the real framebuffer in one pass.
  * Call once at the end of each fully-composed frame to eliminate flicker. */
 void fb_flush(void) {
@@ -245,6 +339,32 @@ void fb_draw_string_px(int x, int y, const char* s, uint32_t fg, uint32_t bg) {
     while (*s) {
         draw_char_rgb(*s, cx, y, fg, bg);
         cx += 8;
+        s++;
+    }
+}
+
+/* Draw a string rendering only the foreground glyph pixels.
+ * Background pixels in each 8×8 cell are not touched, so the underlying
+ * framebuffer content (glass tint, etc.) shows through. */
+void fb_draw_string_px_fg(int x, int y, const char *s, uint32_t fg) {
+    if (!fb_addr) return;
+    int cx = x;
+    while (*s) {
+        char *bitmap = font8x8_basic[(uint8_t)(uint8_t)*s];
+        for (int r = 0; r < 8; r++) {
+            int py = y + r;
+            if (py < 0 || (uint32_t)py >= fb_height) { cx += 8; s++; goto next; }
+            for (int cb = 0; cb < 8; cb++) {
+                int px2 = cx + cb;
+                if (px2 < 0 || (uint32_t)px2 >= fb_width) continue;
+                if (bitmap[r] & (1 << cb))
+                    fb_back[(uint32_t)py * fb_width + (uint32_t)px2] = fg;
+            }
+        }
+        cx += 8;
+        s++;
+        continue;
+next:
         s++;
     }
 }

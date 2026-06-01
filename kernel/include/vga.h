@@ -65,6 +65,9 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
 /* Draw a string at pixel coords with raw RGB fg/bg (title bar text). */
 void fb_draw_string_px(int x, int y, const char* s, uint32_t fg, uint32_t bg);
 
+/* Draw a string rendering only foreground glyph pixels (no bg overwrite). */
+void fb_draw_string_px_fg(int x, int y, const char *s, uint32_t fg);
+
 /* Blit a w*h array of 32bpp pixels (row-major) at screen position (x,y).
  * Clips to framebuffer bounds. Used by WM syscalls. */
 void fb_blit_pixels(int x, int y, const uint32_t *src, int w, int h);
@@ -77,5 +80,20 @@ void fb_blit_scaled(int x, int y, int dst_w, int dst_h,
 /* Flush the back buffer to the real framebuffer (eliminates flicker).
  * Must be called once per fully-composed frame. */
 void fb_flush(void);
+
+/* Read a pixel from the back buffer. Returns 0 if out of bounds. */
+uint32_t fb_read_pixel(int x, int y);
+
+/* Fill a rectangle with alpha blending (0=transparent, 255=opaque).
+ * Blends color over existing back-buffer content. */
+void fb_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha);
+
+/* Draw a vertical gradient from col_top to col_bot in a rectangle. */
+void fb_fill_gradient_v(int x, int y, int w, int h,
+                        uint32_t col_top, uint32_t col_bot);
+
+/* Apply a dark radial vignette around the screen edges.
+ * strength: 0-255 (how dark the extreme corners get). */
+void fb_vignette(uint32_t sw, uint32_t sh, uint8_t strength);
 
 #endif

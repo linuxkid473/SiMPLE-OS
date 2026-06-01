@@ -55,27 +55,30 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c);
  */
 
 /* ---- geometry constants ---- */
-#define WM_BORDER      2     /* px — flat border on all four sides       */
-#define WM_TITLEBAR_H  18    /* px — includes the top WM_BORDER stripe   */
+#define WM_BORDER      2     /* px — border on all four sides            */
+#define WM_TITLEBAR_H  24    /* px — taller modern titlebar              */
 #define WM_MOVE_STEP   8     /* px per Alt+Arrow press (one cell width)  */
 
+/* Corner rounding radius (pixels). Must be <= WM_TITLEBAR_H and <= WM_BORDER+8 */
+#define WM_CORNER_R    8
+
 /* Terminal window: sized for 80 cols × 49 rows at 8 px/cell.
- * 2 + 80*8 + 2 = 644   18 + 49*8 + 2 = 412 */
+ * 2 + 80*8 + 2 = 644   24 + 49*8 + 2 = 418 */
 #define WM_TERM_W  644
-#define WM_TERM_H  412
+#define WM_TERM_H  418
 
 /* Calculator window — fits display bar + 4×4 clickable button grid.
  * client area: 158 × 128
- * window total: (2+158+2) × (18+128+2) = 162 × 148 */
+ * window total: (2+158+2) × (24+128+2) = 162 × 154 */
 #define WM_CALC_W  162
-#define WM_CALC_H  148
+#define WM_CALC_H  154
 
 /* SText editor window — 44 cols × 16 visible rows at 8 px/cell.
  * text area: 44*8=352 wide, 16*8=128 tall; 4 px padding each side.
  * client area: 360 × 136
- * window total: (2+360+2) × (18+136+2) = 364 × 156 */
+ * window total: (2+360+2) × (24+136+2) = 364 × 162 */
 #define WM_STEXT_W 364
-#define WM_STEXT_H 156
+#define WM_STEXT_H 162
 
 /* Maximum simultaneous windows on screen. */
 #define WM_MAX_WINDOWS    20
@@ -107,6 +110,7 @@ typedef struct {
     uint32_t      *pixels;      /* backing store for WM_TYPE_USER only    */
     int            pix_w, pix_h; /* pixel buffer dimensions at alloc time */
     int            owner_slot;  /* process slot that owns this window (-1=kernel) */
+    uint8_t        anim_alpha;  /* open-fade alpha: 0=invisible→255=stable */
 } wm_window_t;
 
 /* ---- global state (read-only outside wm.c) ---- */

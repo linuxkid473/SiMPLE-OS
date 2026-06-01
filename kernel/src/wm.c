@@ -177,30 +177,78 @@ static void wm_flush_slot_queue(int s) {
 /* ================================================================
  * Launcher bar state
  *
- * A fixed "Apps" button is always drawn in the top-left corner of
- * the desktop, on top of all windows (rendered last, hit-tested
- * first).  Clicking it toggles a small dropdown menu.
+ * A glass "APPS" button sits in the top-left corner.  Clicking it
+ * slides open a full glass panel with categorised app entries.
  * ================================================================ */
 /* launcher_open: 0=closed  1=main menu  2=ELF browser */
-static int launcher_open = 0;
+static int launcher_open   = 0;
+static int launcher_anim_y = 0;   /* current slide offset (0=fully open, neg=hidden) */
 
-/* Launcher button — fixed screen position */
+/* Launcher button */
 #define LNCHR_BTN_X     4
 #define LNCHR_BTN_Y     4
-#define LNCHR_BTN_W    40
-#define LNCHR_BTN_H    16
+#define LNCHR_BTN_W    64
+#define LNCHR_BTN_H    22
 
-/* Dropdown menu — immediately below the button */
-#define LNCHR_MENU_X    4
-#define LNCHR_MENU_Y   (LNCHR_BTN_Y + LNCHR_BTN_H + 1)   /* = 21 */
-#define LNCHR_MENU_W  148
-#define LNCHR_ITEM_H   14
-/* 17 items: STerm, Calc, SText, + 9 utility kapps + 4 game kapps + Run App... */
-#define LNCHR_NITEMS   19
+/* Glass panel — immediately below the button */
+#define LNCHR_PANEL_X   4
+#define LNCHR_PANEL_Y  (LNCHR_BTN_Y + LNCHR_BTN_H + 3)
+#define LNCHR_PANEL_W  250
 
-/* ELF browser panel dimensions */
-#define LNCHR_BROWSER_W    164
+/* Item geometry */
+#define LNCHR_ITEM_H   18    /* height per app entry */
+#define LNCHR_HDR_H    20    /* height per category header */
+#define LNCHR_ICON_W   12    /* small coloured icon square */
+
+/* ELF browser panel */
+#define LNCHR_BROWSER_W    200
 #define LNCHR_BROWSER_MAX   20
+
+/* ---- Launcher item table ----
+ * action == -1  → non-clickable category header
+ * action == 0   → wm_spawn TERMINAL
+ * action == 1   → wm_spawn CALC
+ * action == 2   → wm_spawn STEXT
+ * action == 3+N → wm_spawn_kapp(N)   (N = KAPP_*)
+ * action == 19  → ELF browser (was 18 in old code; kept at 18 below)
+ */
+typedef struct {
+    const char *label;
+    int         action;       /* -1=header, else as above */
+    uint32_t    icon_color;   /* background of the icon square */
+    char        icon_char;    /* letter drawn inside the icon */
+} lnchr_item_t;
+
+static const lnchr_item_t lnchr_items[] = {
+    /* ---- SYSTEM ---- */
+    { "SYSTEM",           -1,  0x000000, ' ' },
+    { "STerm",             0,  0x003311, 'T' },
+    { "Calculator",        1,  0x002A15, 'C' },
+    { "SText",             2,  0x002010, 'E' },
+    /* ---- UTILITIES ---- */
+    { "UTILITIES",        -1,  0x000000, ' ' },
+    { "Clock",             3,  0x001A22, 'K' },
+    { "System Info",       5,  0x001A10, 'I' },
+    { "Task Manager",      6,  0x001A10, 'M' },
+    { "Paint",             7,  0x001A0A, 'P' },
+    { "Notepad",           8,  0x001A0A, 'N' },
+    { "File Manager",      9,  0x001A0A, 'F' },
+    { "File Viewer",      10,  0x001A0A, 'V' },
+    { "Settings",         11,  0x001520, 'S' },
+    /* ---- GAMES ---- */
+    { "GAMES",            -1,  0x000000, ' ' },
+    { "Snake",            12,  0x0A2005, 'S' },
+    { "Breakout",         13,  0x1A1005, 'B' },
+    { "Pong",             14,  0x051A1A, 'G' },
+    { "2048",             15,  0x0A2005, '4' },
+    { "SiMPLE Racer",      4,  0x1A1005, 'R' },
+    { "Speedway",         16,  0x1A0A05, 'W' },
+    { "Constitution",     17,  0x08140A, 'D' },
+    /* ---- APPS ---- */
+    { "APPS",             -1,  0x000000, ' ' },
+    { "Run App...",       18,  0x050F1A, 'A' },
+};
+#define LNCHR_NTOTAL  23
 
 /* FAT16 filesystem reference — set by wm_set_fs() from shell_run */
 static fat16_fs_t    *wm_fs = (fat16_fs_t *)0;
@@ -275,39 +323,73 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 };
 
 /* ================================================================
- * Colour palette — Green Glass theme
+ * Green Glass colour palette — Military Cyberpunk aesthetic
  * ================================================================ */
-#define COL_DESKTOP         0x070D09   /* near-black forest desktop             */
-#define COL_BORDER_ACT      0x33EE66   /* vivid green border, focused           */
-#define COL_BORDER_INACT    0x1A3322   /* muted forest border, unfocused        */
-#define COL_TITLEBG_ACT     0x00AA44   /* emerald titlebar, focused             */
-#define COL_TITLEBG_INACT   0x0C2A16   /* dim forest titlebar, unfocused        */
-#define COL_TITLEFG         0xFFFFFF   /* white title text                      */
-#define COL_CLIENTBG        0x080808   /* near-black client area                */
-#define COL_DISPBG          0x002200   /* dark-green calculator display bg      */
-#define COL_DISPFG          0x00FF88   /* bright mint calculator display fg     */
-#define COL_BTNBG           0x0A2015   /* dark green button fill                */
-#define COL_BTNBDR          0x33AA55   /* green button border                   */
-#define COL_BTNFG           0xCCFFCC   /* light-green button text               */
-#define COL_CLOSEBTN_BG     0xBB2233   /* close button — crimson                */
-#define COL_CLOSEBTN_BD     0xFF6677   /* close button top/left highlight       */
-#define COL_LNCHR_BG        0x0A2A15   /* launcher button background            */
-#define COL_LNCHR_BD        0x33DD66   /* launcher button border                */
-#define COL_MENU_BG         0x0A180E   /* launcher dropdown background          */
-#define COL_MENU_BD         0x33AA55   /* launcher dropdown border              */
-#define COL_MENU_FG         0xAAFFBB   /* launcher menu item text               */
-#define COL_STEXT_FG        0x99FFAA   /* SText editor text colour              */
-#define COL_MENUBAR_BG      0x050E08   /* top menu bar background               */
-#define COL_DOCK_BG         0x080D09   /* bottom dock background                */
-#define COL_DOCK_BTN_BG     0x0A2A15   /* dock button background                */
-#define COL_DOCK_BTN_BD     0x33CC55   /* dock button border                    */
-#define COL_DOCK_BTN_FG     0xAAFFBB   /* dock button label text                */
 
-/* Titlebar gradient bands */
-#define COL_TITLE_GLOS_ACT  0x44FF88   /* active titlebar gloss stripe (top)    */
-#define COL_TITLE_SHAD_ACT  0x007733   /* active titlebar shadow stripe (bot)   */
-#define COL_TITLE_GLOS_INAC 0x1E5533   /* inactive titlebar gloss stripe        */
-#define COL_TITLE_SHAD_INAC 0x061A0C   /* inactive titlebar shadow stripe       */
+/* Desktop */
+#define COL_DESKTOP          0x030A05   /* near-black green-tinted desktop      */
+#define COL_WALLPAPER_TINT   0x031005   /* green overlay tint on wallpaper      */
+
+/* Window border/frame */
+#define COL_BORDER_ACT       0x22EE55   /* vivid green border, focused          */
+#define COL_BORDER_INACT     0x0F2A18   /* muted border, unfocused              */
+
+/* Titlebar gradient — active */
+#define COL_TITLE_TOP_ACT    0x1AEE66   /* active: bright mint top              */
+#define COL_TITLE_MID_ACT    0x00AA44   /* active: emerald middle               */
+#define COL_TITLE_BOT_ACT    0x004422   /* active: deep shadow bottom           */
+
+/* Titlebar gradient — inactive */
+#define COL_TITLE_TOP_INAC   0x0E4A22   /* inactive: dim forest top             */
+#define COL_TITLE_MID_INAC   0x072A14   /* inactive: deep forest middle         */
+#define COL_TITLE_BOT_INAC   0x030F08   /* inactive: near-black bottom          */
+
+/* Titlebar text */
+#define COL_TITLEFG_ACT      0xEEFFEE   /* active: near-white title text        */
+#define COL_TITLEFG_INACT    0x558866   /* inactive: dim green title text       */
+
+/* Client area — glass panel effect */
+#define COL_GLASS_TINT       0x041408   /* very dark green glass tint           */
+#define COL_GLASS_EDGE       0x0D3318   /* glass panel inner edge highlight     */
+
+/* Calculator / display */
+#define COL_DISPBG           0x010A03   /* dark display bg                      */
+#define COL_DISPFG           0x00FF88   /* bright mint display fg               */
+#define COL_BTNBG            0x061A0C   /* dark green button fill               */
+#define COL_BTNBDR           0x22AA44   /* green button border                  */
+#define COL_BTNFG            0xBBFFCC   /* light-green button text              */
+
+/* Close button — crimson with hover style */
+#define COL_CLOSE_FILL       0x991A28   /* close button fill                    */
+#define COL_CLOSE_FILL_HOV   0xEE2244   /* close button hover                   */
+#define COL_CLOSE_EDGE       0xFF5566   /* close button highlight edge          */
+#define COL_CLOSE_FG         0xFFEEEE   /* close button X colour                */
+
+/* Launcher panel */
+#define COL_LNCHR_BTN_BG     0x061A0D   /* launcher button background           */
+#define COL_LNCHR_BTN_BD     0x22EE55   /* launcher button border               */
+#define COL_PANEL_BG         0x040E07   /* launcher glass panel bg (very dark)  */
+#define COL_PANEL_BD         0x22AA44   /* launcher glass panel border          */
+#define COL_PANEL_FG         0xAAFFBB   /* launcher normal item text            */
+#define COL_PANEL_HDR_BG     0x061A0C   /* category header background           */
+#define COL_PANEL_HDR_FG     0x44FF88   /* category header text                 */
+#define COL_PANEL_HOVER_BG   0x0A2A14   /* item hover background                */
+#define COL_PANEL_HOVER_FG   0xCCFFDD   /* item hover text                      */
+#define COL_PANEL_OPEN_FG    0x33EE66   /* already-open kapp indicator          */
+#define COL_PANEL_DIM_FG     0x446655   /* dimmed (unavailable) item text       */
+#define COL_PANEL_ACCENT     0x1AEE55   /* left accent bar on category headers  */
+#define COL_PANEL_SEP        0x0A2A14   /* separator line colour                */
+
+/* SText editor */
+#define COL_STEXT_FG         0x88FFAA   /* editor text colour                   */
+
+/* Glow layers (active window ambient glow) */
+#define COL_GLOW_1           0x00330F   /* innermost glow layer                 */
+#define COL_GLOW_2           0x00220A   /* middle glow layer                    */
+#define COL_GLOW_3           0x001107   /* outer glow layer                     */
+
+/* Shadow layers */
+#define COL_SHADOW_NEAR      0x00000088 /* drop shadow near (unused: not RGBA)  */
 
 /* ---- Permanent UI chrome heights ---- */
 #define UI_MENUBAR_H  24   /* top menu bar height (px)  */
@@ -318,6 +400,79 @@ static const calc_btn_t calc_btns[CALC_NCOLS * CALC_NROWS] = {
 #define DOCK_BTN_H    40
 #define DOCK_BTN_GAP  12
 #define DOCK_NITEMS    3
+
+/* ================================================================
+ * Rounded-corner tables (radius = WM_CORNER_R = 8)
+ *
+ * corner_insets[r] = number of pixels to erase from each corner edge
+ * at row r from the corner.  Computed from: inset = R - sqrt(R²-(R-r)²)
+ * ================================================================ */
+static const int corner_insets[WM_CORNER_R] = { 8, 4, 3, 2, 1, 0, 0, 0 };
+
+/* Per-corner saved background pixels (read before window is drawn) */
+static uint32_t csave_tl[WM_CORNER_R][WM_CORNER_R];
+static uint32_t csave_tr[WM_CORNER_R][WM_CORNER_R];
+static uint32_t csave_bl[WM_CORNER_R][WM_CORNER_R];
+static uint32_t csave_br[WM_CORNER_R][WM_CORNER_R];
+
+/* Save corner pixels from fb_back BEFORE drawing this window */
+static void save_corners(int wx, int wy, int ww, int wh) {
+    int R = WM_CORNER_R;
+    for (int r = 0; r < R; r++) {
+        for (int c = 0; c < R; c++) {
+            csave_tl[r][c] = fb_read_pixel(wx + c,          wy + r);
+            csave_tr[r][c] = fb_read_pixel(wx + ww - R + c, wy + r);
+            csave_bl[r][c] = fb_read_pixel(wx + c,          wy + wh - R + r);
+            csave_br[r][c] = fb_read_pixel(wx + ww - R + c, wy + wh - R + r);
+        }
+    }
+}
+
+/* Restore saved corner pixels to create rounded-corner illusion */
+static void apply_corners(int wx, int wy, int ww, int wh) {
+    int R = WM_CORNER_R;
+    for (int r = 0; r < R; r++) {
+        int inset = corner_insets[r];
+        for (int c = 0; c < inset && c < R; c++) {
+            /* top-left */
+            fb_fill_rect(wx + c,          wy + r,         1, 1, csave_tl[r][c]);
+            /* top-right (mirror horizontally) */
+            fb_fill_rect(wx + ww - 1 - c, wy + r,         1, 1, csave_tr[r][R - 1 - c]);
+            /* bottom-left (mirror vertically) */
+            fb_fill_rect(wx + c,          wy + wh - 1 - r, 1, 1, csave_bl[R - 1 - r][c]);
+            /* bottom-right (mirror both) */
+            fb_fill_rect(wx + ww - 1 - c, wy + wh - 1 - r, 1, 1, csave_br[R - 1 - r][R - 1 - c]);
+        }
+    }
+}
+
+/* Draw a single-pixel rounded border on top of an existing window rect */
+static void draw_rounded_border(int wx, int wy, int ww, int wh, uint32_t col) {
+    int R = WM_CORNER_R;
+    /* top / bottom horizontal runs (skip corner columns) */
+    fb_fill_rect(wx + R, wy,         ww - 2 * R, 1, col);
+    fb_fill_rect(wx + R, wy + wh - 1, ww - 2 * R, 1, col);
+    /* left / right vertical runs (skip corner rows) */
+    fb_fill_rect(wx,         wy + R, 1, wh - 2 * R, col);
+    fb_fill_rect(wx + ww - 1, wy + R, 1, wh - 2 * R, col);
+    /* Approximate arc pixels for each corner */
+    for (int r = 0; r < R; r++) {
+        int inset = corner_insets[r];
+        int next_inset = (r + 1 < R) ? corner_insets[r + 1] : 0;
+        /* The border pixel at each corner arc row is the first non-erased column */
+        if (inset > 0 && inset <= ww / 2) {
+            /* top-left arc pixel */
+            fb_fill_rect(wx + inset - 1, wy + r, 1, 1, col);
+            /* top-right arc pixel */
+            fb_fill_rect(wx + ww - inset, wy + r, 1, 1, col);
+            /* bottom-left arc pixel */
+            fb_fill_rect(wx + inset - 1, wy + wh - 1 - r, 1, 1, col);
+            /* bottom-right arc pixel */
+            fb_fill_rect(wx + ww - inset, wy + wh - 1 - r, 1, 1, col);
+        }
+        (void)next_inset;
+    }
+}
 
 /* ================================================================
  * Calculator state machine
@@ -650,67 +805,104 @@ static void stext_move(int key_type) {
 static void draw_window_chrome(wm_window_t *w, int is_active) {
     int wx = w->x, wy = w->y, ww = w->width, wh = w->height;
 
-    /* ---- Drop shadow (offset dark rect drawn first, behind everything) ---- */
-    fb_fill_rect(wx + 5, wy + 5, ww, wh, 0x000000);
+    /* Save the four corners of fb_back BEFORE we paint anything */
+    save_corners(wx, wy, ww, wh);
 
-    /* ---- Four-sided beveled border (highlight top/left, shadow bot/right) ---- */
-    uint32_t b_hi  = is_active ? 0x55FF88 : 0x2A4433;
-    uint32_t b_sha = is_active ? 0x007722 : 0x0A1A0A;
-    fb_fill_rect(wx,              wy,              ww,        WM_BORDER, b_hi);
-    fb_fill_rect(wx,              wy,              WM_BORDER, wh,        b_hi);
-    fb_fill_rect(wx,              wy+wh-WM_BORDER, ww,        WM_BORDER, b_sha);
-    fb_fill_rect(wx+ww-WM_BORDER, wy,              WM_BORDER, wh,        b_sha);
+    /* ---- Ambient glow: concentric green rings around active window ---- */
+    if (is_active) {
+        fb_fill_rect_alpha(wx - 6, wy - 6, ww + 12, wh + 12, COL_GLOW_3, 90);
+        fb_fill_rect_alpha(wx - 4, wy - 4, ww +  8, wh +  8, COL_GLOW_2, 110);
+        fb_fill_rect_alpha(wx - 2, wy - 2, ww +  4, wh +  4, COL_GLOW_1, 130);
+        /* Overwrite the glow's interior so only the ring is visible */
+        fb_fill_rect_alpha(wx,     wy,     ww,       wh,      COL_DESKTOP, 80);
+    }
+
+    /* ---- Multi-layer soft drop shadow ---- */
+    fb_fill_rect_alpha(wx + 8, wy + 8, ww + 2, wh + 2, 0x000000, 90);
+    fb_fill_rect_alpha(wx + 5, wy + 5, ww + 2, wh + 2, 0x000000, 70);
+    fb_fill_rect_alpha(wx + 3, wy + 3, ww + 1, wh + 1, 0x000000, 50);
+
+    /* ---- Window base fill ---- */
+    uint32_t border_col = is_active ? COL_BORDER_ACT : COL_BORDER_INACT;
+    fb_fill_rect(wx, wy, ww, wh, border_col);
 
     /* ---- Gradient titlebar ---- */
     int tx  = wx + WM_BORDER;
     int ty  = wy + WM_BORDER;
     int tw  = ww - 2 * WM_BORDER;
-    int tth = WM_TITLEBAR_H - WM_BORDER;   /* = 16 px */
+    int tth = WM_TITLEBAR_H - WM_BORDER;   /* inner titlebar height */
 
-    uint32_t t_glos = is_active ? COL_TITLE_GLOS_ACT  : COL_TITLE_GLOS_INAC;
-    uint32_t t_base = is_active ? COL_TITLEBG_ACT      : COL_TITLEBG_INACT;
-    uint32_t t_shad = is_active ? COL_TITLE_SHAD_ACT   : COL_TITLE_SHAD_INAC;
-
-    fb_fill_rect(tx, ty,           tw, tth, t_base);  /* base fill              */
-    fb_fill_rect(tx, ty,           tw, 2,   t_glos);  /* gloss highlight (top)  */
-    fb_fill_rect(tx, ty + tth - 3, tw, 3,   t_shad);  /* shadow stripe (bottom) */
+    if (is_active) {
+        fb_fill_gradient_v(tx, ty, tw, tth,
+                           COL_TITLE_TOP_ACT, COL_TITLE_BOT_ACT);
+        /* Gloss highlight: top 3 rows slightly brighter */
+        fb_fill_rect_alpha(tx, ty, tw, 3, COL_TITLE_TOP_ACT, 100);
+    } else {
+        fb_fill_gradient_v(tx, ty, tw, tth,
+                           COL_TITLE_TOP_INAC, COL_TITLE_BOT_INAC);
+    }
 
     /* Separator line between titlebar and client area */
     fb_fill_rect(tx, wy + WM_TITLEBAR_H - 1, tw, 1,
-                 is_active ? 0x22CC55 : 0x1A3322);
+                 is_active ? 0x11CC44 : 0x0A2218);
 
-    /* Title text — sits in the base-color band (rows 2..12) */
-    fb_draw_string_px(tx + 8, ty + 4, w->title, COL_TITLEFG, t_base);
+    /* Title text — fg-only so gradient shows through */
+    uint32_t title_fg = is_active ? COL_TITLEFG_ACT : COL_TITLEFG_INACT;
+    fb_draw_string_px_fg(tx + 10, ty + (tth - 8) / 2, w->title, title_fg);
 
-    /* ---- Close button — 12×12 px, top-right of title bar ---- */
-    int cbx = wx + ww - 16;
-    int cby = wy + 4;
-    fb_fill_rect(cbx,      cby,      12, 12, COL_CLOSEBTN_BG);
-    fb_fill_rect(cbx,      cby,      12, 1,  COL_CLOSEBTN_BD);  /* top hi    */
-    fb_fill_rect(cbx,      cby,      1,  12, COL_CLOSEBTN_BD);  /* left hi   */
-    fb_fill_rect(cbx,      cby + 11, 12, 1,  0x881122);          /* bot shad  */
-    fb_fill_rect(cbx + 11, cby,      1,  12, 0x881122);          /* right shad*/
-    fb_draw_string_px(cbx + 2, cby + 2, "X", COL_TITLEFG, COL_CLOSEBTN_BG);
+    /* ---- Close button — 14×14 px, vertically centred in titlebar ---- */
+    int cbx = wx + ww - 4 - 14;
+    int cby = wy + (WM_TITLEBAR_H - 14) / 2;
+    /* Rounded-ish fill */
+    fb_fill_rect(cbx,     cby,     14, 14, COL_CLOSE_FILL);
+    /* Gloss top edge */
+    fb_fill_rect(cbx,     cby,     14,  2, 0xDD3355);
+    /* Highlight edges */
+    fb_fill_rect(cbx,     cby,     14,  1, COL_CLOSE_EDGE);
+    fb_fill_rect(cbx,     cby,      1, 14, COL_CLOSE_EDGE);
+    /* Shadow edges */
+    fb_fill_rect(cbx,     cby + 13, 14, 1, 0x550011);
+    fb_fill_rect(cbx + 13, cby,      1, 14, 0x550011);
+    /* × glyph */
+    fb_draw_string_px_fg(cbx + 3, cby + 3, "X", COL_CLOSE_FG);
 
-    /* ---- Client background ---- */
-    fb_fill_rect(tx,
-                 wy + WM_TITLEBAR_H,
-                 tw,
-                 wh - WM_TITLEBAR_H - WM_BORDER,
-                 COL_CLIENTBG);
+    /* ---- Glass client area ---- */
+    int cay = wy + WM_TITLEBAR_H;
+    int cah = wh - WM_TITLEBAR_H - WM_BORDER;
+    /* Semi-transparent dark green glass over existing framebuffer content */
+    fb_fill_rect_alpha(tx, cay, tw, cah, COL_GLASS_TINT, 210);
+    /* Subtle inner edge highlight along the top of the client area */
+    fb_fill_rect_alpha(tx, cay, tw, 1, COL_GLASS_EDGE, 180);
+    /* Very subtle left/right inner edge */
+    fb_fill_rect_alpha(tx,          cay, 1, cah, COL_GLASS_EDGE, 80);
+    fb_fill_rect_alpha(tx + tw - 1, cay, 1, cah, COL_GLASS_EDGE, 80);
 
-    /* ---- Resize corner handles (bottom-left / bottom-right) ---- */
-    uint32_t corner_col = is_active ? 0x44FF88 : 0x1A5533;
-    /* Bottom-right — draw a small L-shape (right border + bottom strip) */
+    /* ---- Resize corner accent marks ---- */
+    uint32_t rc = is_active ? 0x33FF77 : 0x0F3322;
     fb_fill_rect(wx + ww - RESIZE_HANDLE, wy + wh - WM_BORDER,
-                 RESIZE_HANDLE, WM_BORDER, corner_col);
+                 RESIZE_HANDLE, WM_BORDER, rc);
     fb_fill_rect(wx + ww - WM_BORDER, wy + wh - RESIZE_HANDLE,
-                 WM_BORDER, RESIZE_HANDLE, corner_col);
-    /* Bottom-left — mirror */
-    fb_fill_rect(wx, wy + wh - WM_BORDER,
-                 RESIZE_HANDLE, WM_BORDER, corner_col);
-    fb_fill_rect(wx, wy + wh - RESIZE_HANDLE,
-                 WM_BORDER, RESIZE_HANDLE, corner_col);
+                 WM_BORDER, RESIZE_HANDLE, rc);
+    fb_fill_rect(wx,          wy + wh - WM_BORDER,
+                 RESIZE_HANDLE, WM_BORDER, rc);
+    fb_fill_rect(wx,          wy + wh - RESIZE_HANDLE,
+                 WM_BORDER, RESIZE_HANDLE, rc);
+
+    /* ---- Rounded corners: restore saved background pixels ---- */
+    apply_corners(wx, wy, ww, wh);
+
+    /* ---- Rounded border painted on top of corner arcs ---- */
+    draw_rounded_border(wx, wy, ww, wh, border_col);
+
+    /* ---- Open-fade animation overlay ---- */
+    if (w->anim_alpha < 255) {
+        uint8_t overlay = (uint8_t)(255u - w->anim_alpha);
+        fb_fill_rect_alpha(wx, wy, ww, wh, COL_DESKTOP, overlay);
+        /* Advance towards fully-opaque */
+        uint8_t step = 30;
+        w->anim_alpha = (w->anim_alpha + step > 255u) ? 255u
+                        : (uint8_t)(w->anim_alpha + step);
+    }
 }
 
 static void sync_terminal_client(wm_window_t *w) {
@@ -753,6 +945,9 @@ static void draw_calc_content(wm_window_t *w) {
 
     /* Display box: 4-px inset from client edges, 20 px tall */
     fb_fill_rect(cx + 4, cy + 4, cw - 8, 20, COL_DISPBG);
+    /* Display border */
+    fb_fill_rect(cx + 4, cy + 4, cw - 8, 1, 0x116622u);
+    fb_fill_rect(cx + 4, cy + 4, 1, 20, 0x116622u);
     char disp[32];
     calc_build_display(disp, (int)sizeof(disp));
     fb_draw_string_px(cx + 8, cy + 8, disp, COL_DISPFG, COL_DISPBG);
@@ -781,8 +976,8 @@ static void draw_stext_content(wm_window_t *w) {
         line_idx = si->scroll + r;
         int ty   = cy + r * 8;
         if (line_idx < si->nlines)
-            fb_draw_string_px(cx, ty, si->buf[line_idx], COL_STEXT_FG, COL_CLIENTBG);
-        /* Lines below si->nlines are already black from chrome fill — skip */
+            fb_draw_string_px(cx, ty, si->buf[line_idx], COL_STEXT_FG, 0xFF000000u);
+        /* Lines below si->nlines are already dark from chrome fill — skip */
     }
 
     /* Cursor: invert the character cell under the cursor */
@@ -793,7 +988,7 @@ static void draw_stext_content(wm_window_t *w) {
         if (!cur_ch[0]) cur_ch[0] = ' ';
         cur_ch[1] = '\0';
         fb_draw_string_px(cx + si->cx * 8, cy + vis_row * 8,
-                          cur_ch, COL_CLIENTBG, COL_STEXT_FG);
+                          cur_ch, COL_GLASS_TINT, COL_STEXT_FG);
     }
 }
 
@@ -801,107 +996,180 @@ static void draw_stext_content(wm_window_t *w) {
  * Launcher bar rendering
  * ================================================================ */
 
-/* Menu item labels (index 0-12) */
-static const char *lnchr_labels[LNCHR_NITEMS] = {
-    "STerm",          /*  0 */
-    "Calculator",     /*  1 */
-    "SText",          /*  2 */
-    "Clock",          /*  3 → KAPP_CLOCK    */
-    "SiMPLE Racer",   /*  4 → KAPP_ABOUT    */
-    "System Info",    /*  5 → KAPP_SYSINFO  */
-    "Task Manager",   /*  6 → KAPP_TASKMGR  */
-    "Paint",          /*  7 → KAPP_PAINT    */
-    "Notepad",        /*  8 → KAPP_NOTEPAD  */
-    "File Manager",   /*  9 → KAPP_FILEMGR  */
-    "File Viewer",    /* 10 → KAPP_FILEVIEW */
-    "Settings",       /* 11 → KAPP_SETTINGS */
-    "Snake",          /* 12 → KAPP_SNAKE    */
-    "Breakout",       /* 13 → KAPP_BREAKOUT */
-    "Pong",           /* 14 → KAPP_PONG     */
-    "2048",            /* 15 → KAPP_2048     */
-    "SiMPLE Speedway", /* 16 → KAPP_SPEEDWAY     */
-    "Constitution",   /* 17 → KAPP_CONSTITUTION */
-    "Run App...",     /* 18 → ELF browser       */
-};
+/* Forward declaration for point_in_rect (defined later in this file) */
+static int point_in_rect(int px, int py, int rx, int ry, int rw, int rh);
 
-/* Separators above items 3 (utilities), 12 (games), 18 (ELF browser) */
-static int lnchr_is_separator_before(int item) {
-    return (item == 3 || item == 12 || item == 18);
+/* ---- Compute total launcher panel height from the item table ---- */
+static int lnchr_panel_height(void) {
+    int h = 4;   /* top/bottom padding */
+    for (int i = 0; i < LNCHR_NTOTAL; i++) {
+        h += (lnchr_items[i].action < 0) ? LNCHR_HDR_H : LNCHR_ITEM_H;
+    }
+    return h;
+}
+
+/* Draw the glass "APPS" button */
+static void draw_launcher_button(int hovered) {
+    int bx = LNCHR_BTN_X, by = LNCHR_BTN_Y;
+    int bw = LNCHR_BTN_W, bh = LNCHR_BTN_H;
+
+    /* Glass base: semi-transparent dark green over whatever is behind */
+    fb_fill_rect_alpha(bx, by, bw, bh, COL_LNCHR_BTN_BG, 220);
+    /* Top gloss stripe */
+    fb_fill_rect_alpha(bx, by, bw, 3, 0x33FF77, hovered ? 120 : 60);
+    /* Bottom shadow stripe */
+    fb_fill_rect_alpha(bx, by + bh - 2, bw, 2, 0x001008, 180);
+    /* Border */
+    fb_fill_rect(bx,          by,          bw, 1, COL_LNCHR_BTN_BD);
+    fb_fill_rect(bx,          by + bh - 1, bw, 1, COL_LNCHR_BTN_BD);
+    fb_fill_rect(bx,          by,          1, bh, COL_LNCHR_BTN_BD);
+    fb_fill_rect(bx + bw - 1, by,          1, bh, COL_LNCHR_BTN_BD);
+    /* Active indicator when panel is open */
+    if (launcher_open)
+        fb_fill_rect(bx, by + bh - 1, bw, 2, COL_LNCHR_BTN_BD);
+    /* Label — fg-only so glass background shows through */
+    uint32_t lbl_col = hovered ? 0xCCFFDDu : 0x88FFAAU;
+    fb_draw_string_px_fg(bx + (bw - 4*8) / 2, by + (bh - 8) / 2, "APPS", lbl_col);
+}
+
+/* Draw one launcher item row; returns 1 if it should be highlighted */
+static void draw_lnchr_item(int ix, int iy, int iw, const lnchr_item_t *it,
+                            int hovered, int open_kapp) {
+    if (it->action < 0) {
+        /* Category header */
+        fb_fill_rect(ix, iy, iw, LNCHR_HDR_H, COL_PANEL_HDR_BG);
+        /* Left accent bar */
+        fb_fill_rect(ix, iy, 3, LNCHR_HDR_H, COL_PANEL_ACCENT);
+        /* Separator line below */
+        fb_fill_rect(ix, iy + LNCHR_HDR_H - 1, iw, 1, COL_PANEL_SEP);
+        fb_draw_string_px_fg(ix + 8, iy + (LNCHR_HDR_H - 8) / 2,
+                             it->label, COL_PANEL_HDR_FG);
+        return;
+    }
+
+    /* Regular item */
+    uint32_t row_bg = hovered ? COL_PANEL_HOVER_BG : 0xFF000000u;
+    if (hovered) fb_fill_rect(ix, iy, iw, LNCHR_ITEM_H, row_bg);
+
+    /* Small coloured icon square */
+    int icon_x = ix + 6;
+    int icon_y = iy + (LNCHR_ITEM_H - LNCHR_ICON_W) / 2;
+    fb_fill_rect(icon_x, icon_y, LNCHR_ICON_W, LNCHR_ICON_W, it->icon_color);
+    /* Icon border */
+    fb_fill_rect(icon_x,                  icon_y,                  LNCHR_ICON_W, 1, 0x22AA44u);
+    fb_fill_rect(icon_x,                  icon_y + LNCHR_ICON_W-1, LNCHR_ICON_W, 1, 0x22AA44u);
+    fb_fill_rect(icon_x,                  icon_y,                  1, LNCHR_ICON_W, 0x22AA44u);
+    fb_fill_rect(icon_x + LNCHR_ICON_W-1, icon_y,                  1, LNCHR_ICON_W, 0x22AA44u);
+    /* Icon letter — fg-only over the icon square */
+    char ibuf[2] = { it->icon_char, '\0' };
+    fb_draw_string_px_fg(icon_x + 2, icon_y + 2, ibuf, 0x44FF88u);
+
+    /* Item label */
+    uint32_t fg;
+    if      (it->action == 18 && !wm_fs)     fg = COL_PANEL_DIM_FG;
+    else if (open_kapp)                       fg = COL_PANEL_OPEN_FG;
+    else if (hovered)                         fg = COL_PANEL_HOVER_FG;
+    else                                      fg = COL_PANEL_FG;
+
+    fb_draw_string_px_fg(icon_x + LNCHR_ICON_W + 6,
+                         iy + (LNCHR_ITEM_H - 8) / 2,
+                         it->label, fg);
+
+    /* Subtle bottom separator */
+    fb_fill_rect_alpha(ix + 4, iy + LNCHR_ITEM_H - 1, iw - 8, 1,
+                       COL_PANEL_SEP, 120);
 }
 
 static void draw_launcher(void) {
-    /* "Apps" button — always visible, with gloss effect */
-    fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y, LNCHR_BTN_W, LNCHR_BTN_H, COL_LNCHR_BG);
-    /* gloss top stripe */
-    fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y, LNCHR_BTN_W, 2, 0x44EE77);
-    /* bottom shadow stripe */
-    fb_fill_rect(LNCHR_BTN_X, LNCHR_BTN_Y + LNCHR_BTN_H - 2, LNCHR_BTN_W, 2, 0x061508);
-    /* border */
-    fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y,                   LNCHR_BTN_W, 1,            COL_LNCHR_BD);
-    fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y + LNCHR_BTN_H - 1, LNCHR_BTN_W, 1,            COL_LNCHR_BD);
-    fb_fill_rect(LNCHR_BTN_X,                    LNCHR_BTN_Y,                   1,            LNCHR_BTN_H, COL_LNCHR_BD);
-    fb_fill_rect(LNCHR_BTN_X + LNCHR_BTN_W - 1, LNCHR_BTN_Y,                   1,            LNCHR_BTN_H, COL_LNCHR_BD);
-    /* label */
-    fb_draw_string_px(LNCHR_BTN_X + 8, LNCHR_BTN_Y + 4, "Apps", COL_MENU_FG, COL_LNCHR_BG);
+    int mx = mouse_get_x();
+    int my = mouse_get_y();
+
+    /* Hover detection for the button itself */
+    int btn_hov = point_in_rect(mx, my, LNCHR_BTN_X, LNCHR_BTN_Y,
+                                LNCHR_BTN_W, LNCHR_BTN_H);
+    draw_launcher_button(btn_hov || launcher_open);
 
     if (!launcher_open) return;
 
-    if (launcher_open == 1) {
-        /* ---- Main dropdown menu ---- */
-        /* Compute total height including 2 extra pixels per separator */
-        int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 3 * 3;  /* 3 separators × 3px */
-        fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_MENU_W, menu_h, COL_MENU_BG);
-        /* border */
-        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              LNCHR_MENU_W, 1,       COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y + menu_h - 1, LNCHR_MENU_W, 1,       COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X,                     LNCHR_MENU_Y,              1,             menu_h, COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X + LNCHR_MENU_W - 1, LNCHR_MENU_Y,             1,             menu_h, COL_MENU_BD);
-
-        /* Draw items with separator lines */
-        int iy = LNCHR_MENU_Y + 1;
-        for (int i = 0; i < LNCHR_NITEMS; i++) {
-            if (lnchr_is_separator_before(i)) {
-                fb_fill_rect(LNCHR_MENU_X + 1, iy, LNCHR_MENU_W - 2, 3, COL_MENU_BG);
-                fb_fill_rect(LNCHR_MENU_X + 4, iy + 1, LNCHR_MENU_W - 8, 1, COL_MENU_BD);
-                iy += 3;
-            }
-            uint32_t fg = COL_MENU_FG;
-            /* Dim "Run App..." when no FS */
-            if (i == 18 && !wm_fs) fg = 0x556677u;
-            /* Highlight already-open kapps */
-            if (i >= 3 && i <= 17 && kapp_is_open(i - 3)) fg = 0x55FF88u;
-            fb_draw_string_px(LNCHR_MENU_X + 8, iy + 3, lnchr_labels[i], fg, COL_MENU_BG);
-            iy += LNCHR_ITEM_H;
+    /* ---- Slide-in animation: advance launcher_anim_y toward 0 ---- */
+    if (launcher_open == 1 || launcher_open == 2) {
+        if (launcher_anim_y < 0) {
+            launcher_anim_y += 30;
+            if (launcher_anim_y > 0) launcher_anim_y = 0;
         }
-    } else {
-        /* ---- ELF browser panel (launcher_open == 2) ---- */
-        int rows = wm_elf_count + 1; /* +1 for "< Back" row */
-        if (rows < 2) rows = 2;      /* minimum: "< Back" + placeholder */
-        int browser_h = rows * LNCHR_ITEM_H + 2;
+    }
 
-        fb_fill_rect(LNCHR_MENU_X, LNCHR_MENU_Y, LNCHR_BROWSER_W, browser_h, COL_MENU_BG);
-        /* border */
-        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y,               LNCHR_BROWSER_W, 1,          COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y+browser_h-1,   LNCHR_BROWSER_W, 1,          COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X,                       LNCHR_MENU_Y,               1,               browser_h,  COL_MENU_BD);
-        fb_fill_rect(LNCHR_MENU_X + LNCHR_BROWSER_W - 1, LNCHR_MENU_Y,              1,               browser_h,  COL_MENU_BD);
+    if (launcher_open == 1) {
+        /* ---- Main glass panel ---- */
+        int panel_h = lnchr_panel_height();
+        int px  = LNCHR_PANEL_X;
+        int py  = LNCHR_PANEL_Y + launcher_anim_y;
+        int pw  = LNCHR_PANEL_W;
 
-        /* Row 0: "< Back" in salmon */
-        fb_draw_string_px(LNCHR_MENU_X + 6,
-                          LNCHR_MENU_Y + 1 + 4,
-                          "< Back", 0xFFAAAAu, COL_MENU_BG);
+        /* Glass base: very dark semi-transparent green */
+        fb_fill_rect_alpha(px, py, pw, panel_h, COL_PANEL_BG, 230);
+        /* Top gloss stripe */
+        fb_fill_rect_alpha(px, py, pw, 2, 0x33FF77, 60);
+        /* Border */
+        fb_fill_rect(px,          py,              pw, 1,       COL_PANEL_BD);
+        fb_fill_rect(px,          py + panel_h - 1, pw, 1,       COL_PANEL_BD);
+        fb_fill_rect(px,          py,              1, panel_h, COL_PANEL_BD);
+        fb_fill_rect(px + pw - 1, py,              1, panel_h, COL_PANEL_BD);
+        /* Inner border (second border for depth) */
+        fb_fill_rect_alpha(px + 1, py + 1, pw - 2, 1, COL_PANEL_BD, 80);
+        fb_fill_rect_alpha(px + 1, py + 1, 1, panel_h - 2, COL_PANEL_BD, 80);
 
-        /* Rows 1+: ELF file names */
+        /* Draw items */
+        int iy = py + 2;
+        for (int i = 0; i < LNCHR_NTOTAL; i++) {
+            const lnchr_item_t *it = &lnchr_items[i];
+            int row_h = (it->action < 0) ? LNCHR_HDR_H : LNCHR_ITEM_H;
+            int item_hov = (it->action >= 0) &&
+                           point_in_rect(mx, my, px + 1, iy, pw - 2, row_h);
+            int is_open  = (it->action >= 3 && it->action <= 17) &&
+                           kapp_is_open(it->action - 3);
+            draw_lnchr_item(px + 1, iy, pw - 2, it, item_hov, is_open);
+            iy += row_h;
+        }
+
+    } else if (launcher_open == 2) {
+        /* ---- ELF browser panel ---- */
+        int rows     = wm_elf_count + 1;
+        if (rows < 2) rows = 2;
+        int browser_h = rows * LNCHR_ITEM_H + 6;
+        int px = LNCHR_PANEL_X;
+        int py = LNCHR_PANEL_Y + launcher_anim_y;
+
+        fb_fill_rect_alpha(px, py, LNCHR_BROWSER_W, browser_h, COL_PANEL_BG, 230);
+        fb_fill_rect_alpha(px, py, LNCHR_BROWSER_W, 2, 0x33FF77, 60);
+        fb_fill_rect(px,                         py,               LNCHR_BROWSER_W, 1,          COL_PANEL_BD);
+        fb_fill_rect(px,                         py + browser_h-1, LNCHR_BROWSER_W, 1,          COL_PANEL_BD);
+        fb_fill_rect(px,                         py,               1,               browser_h,  COL_PANEL_BD);
+        fb_fill_rect(px + LNCHR_BROWSER_W - 1,   py,               1,               browser_h,  COL_PANEL_BD);
+
+        /* "< BACK" header row */
+        int back_hov = point_in_rect(mx, my, px + 1, py + 3, LNCHR_BROWSER_W - 2, LNCHR_ITEM_H);
+        if (back_hov) fb_fill_rect(px + 1, py + 3, LNCHR_BROWSER_W - 2, LNCHR_ITEM_H, COL_PANEL_HOVER_BG);
+        fb_draw_string_px_fg(px + 8, py + 3 + (LNCHR_ITEM_H - 8) / 2,
+                             "< BACK", back_hov ? 0xFFCCCCu : 0xFF9999u);
+        fb_fill_rect_alpha(px + 4, py + 3 + LNCHR_ITEM_H - 1,
+                           LNCHR_BROWSER_W - 8, 1, COL_PANEL_SEP, 120);
+
+        /* ELF file entries */
         if (wm_elf_count == 0) {
-            fb_draw_string_px(LNCHR_MENU_X + 6,
-                              LNCHR_MENU_Y + 1 + LNCHR_ITEM_H + 4,
-                              "No .elf files", 0x777799u, COL_MENU_BG);
+            fb_draw_string_px_fg(px + 8,
+                                 py + 3 + LNCHR_ITEM_H + (LNCHR_ITEM_H - 8) / 2,
+                                 "No .elf files found", COL_PANEL_DIM_FG);
         } else {
-            int i;
-            for (i = 0; i < wm_elf_count; i++) {
-                fb_draw_string_px(LNCHR_MENU_X + 6,
-                                  LNCHR_MENU_Y + 1 + (i + 1) * LNCHR_ITEM_H + 4,
-                                  wm_elf_entries[i].name, COL_MENU_FG, COL_MENU_BG);
+            for (int i = 0; i < wm_elf_count; i++) {
+                int ey = py + 3 + (i + 1) * LNCHR_ITEM_H;
+                int ehov = point_in_rect(mx, my, px + 1, ey, LNCHR_BROWSER_W - 2, LNCHR_ITEM_H);
+                if (ehov) fb_fill_rect(px + 1, ey, LNCHR_BROWSER_W - 2, LNCHR_ITEM_H, COL_PANEL_HOVER_BG);
+                fb_draw_string_px_fg(px + 8, ey + (LNCHR_ITEM_H - 8) / 2,
+                                     wm_elf_entries[i].name,
+                                     ehov ? COL_PANEL_HOVER_FG : COL_PANEL_FG);
+                fb_fill_rect_alpha(px + 4, ey + LNCHR_ITEM_H - 1,
+                                   LNCHR_BROWSER_W - 8, 1, COL_PANEL_SEP, 120);
             }
         }
     }
@@ -915,12 +1183,15 @@ static void draw_launcher(void) {
 
 static void draw_cursor(int x, int y) {
     int len = CUR_ARM * 2 + 1;
-    /* black outline */
-    fb_fill_rect(x - CUR_ARM - 1, y - 1,           len + 2, 3,       0x000000);
-    fb_fill_rect(x - 1,           y - CUR_ARM - 1, 3,       len + 2, 0x000000);
-    /* white cross */
-    fb_fill_rect(x - CUR_ARM, y,           len, 1, 0xFFFFFF);
-    fb_fill_rect(x,           y - CUR_ARM, 1,   len, 0xFFFFFF);
+    /* Dark outline for contrast */
+    fb_fill_rect(x - CUR_ARM - 1, y - 1,           len + 2, 3,       0x001A08);
+    fb_fill_rect(x - 1,           y - CUR_ARM - 1, 3,       len + 2, 0x001A08);
+    /* Bright green cross */
+    fb_fill_rect(x - CUR_ARM, y,           len, 1, 0x44FF88);
+    fb_fill_rect(x,           y - CUR_ARM, 1,   len, 0x44FF88);
+    /* Bright dot at centre */
+    fb_fill_rect(x - 1, y - 1, 3, 3, 0xAAFFCC);
+    fb_fill_rect(x, y, 1, 1, 0xFFFFFF);
 }
 
 /* ================================================================
@@ -941,9 +1212,11 @@ static int point_in_titlebar(const wm_window_t *w, int px, int py) {
            py >= w->y && py < w->y + WM_TITLEBAR_H;
 }
 
-/* 1 if (px,py) is inside the close button (12×12 at top-right of title bar) */
+/* 1 if (px,py) is inside the close button (14×14 at top-right of title bar) */
 static int point_in_close_btn(const wm_window_t *w, int px, int py) {
-    return point_in_rect(px, py, w->x + w->width - 16, w->y + 4, 12, 12);
+    int cbx = w->x + w->width - 4 - 14;
+    int cby = w->y + (WM_TITLEBAR_H - 14) / 2;
+    return point_in_rect(px, py, cbx, cby, 14, 14);
 }
 
 /* Bottom-right corner resize handle */
@@ -1078,10 +1351,11 @@ static void wm_spawn(wm_win_type_t type) {
     /* Cascade multiple windows of the same type so they don't overlap exactly */
     offset = inst * 24;
 
-    w           = &wm_windows[wi];
-    w->type     = type;
-    w->instance = inst;
-    w->hidden   = 0;
+    w             = &wm_windows[wi];
+    w->type       = type;
+    w->instance   = inst;
+    w->hidden     = 0;
+    w->anim_alpha = 0;   /* start fully transparent — fades in on first draw */
 
     /* Available vertical range: below menu bar, above dock */
     int avail_y  = UI_MENUBAR_H;
@@ -1210,60 +1484,60 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
         /* ---- 1. Launcher button ---- */
         if (point_in_rect(x, y, LNCHR_BTN_X, LNCHR_BTN_Y,
                           LNCHR_BTN_W, LNCHR_BTN_H)) {
-            launcher_open = launcher_open ? 0 : 1;
+            if (launcher_open) {
+                launcher_open   = 0;
+            } else {
+                launcher_open   = 1;
+                launcher_anim_y = -lnchr_panel_height();  /* slide in from above */
+            }
             launcher_handled = 1;
         }
 
-        /* ---- 2a. Launcher main menu (launcher_open == 1) ---- */
+        /* ---- 2a. Launcher main glass panel (launcher_open == 1) ---- */
         if (!launcher_handled && launcher_open == 1) {
-            int menu_h = LNCHR_NITEMS * LNCHR_ITEM_H + 2 + 3 * 3;
-            if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
-                              LNCHR_MENU_W, menu_h)) {
-                /* Map click Y to item index, accounting for separator gaps */
-                int rel = y - LNCHR_MENU_Y - 1;
-                int item = -1;
-                {
-                    int iy = 0;
-                    for (int i = 0; i < LNCHR_NITEMS; i++) {
-                        if (lnchr_is_separator_before(i)) iy += 3;
-                        if (rel >= iy && rel < iy + LNCHR_ITEM_H) { item = i; break; }
-                        iy += LNCHR_ITEM_H;
+            int panel_h = lnchr_panel_height();
+            int py = LNCHR_PANEL_Y + launcher_anim_y;
+            if (point_in_rect(x, y, LNCHR_PANEL_X, py, LNCHR_PANEL_W, panel_h)) {
+                /* Map click Y to item in lnchr_items[] */
+                int iy = py + 2;
+                int action = -2;  /* -2 = no hit */
+                for (int i = 0; i < LNCHR_NTOTAL; i++) {
+                    const lnchr_item_t *it = &lnchr_items[i];
+                    int row_h = (it->action < 0) ? LNCHR_HDR_H : LNCHR_ITEM_H;
+                    if (it->action >= 0 && y >= iy && y < iy + row_h) {
+                        action = it->action;
+                        break;
                     }
+                    iy += row_h;
                 }
-                if (item == 0) {        /* "STerm" */
-                    wm_spawn(WM_TYPE_TERMINAL);
-                    launcher_open = 0;
-                } else if (item == 1) { /* "Calculator" */
-                    wm_spawn(WM_TYPE_CALC);
-                    launcher_open = 0;
-                } else if (item == 2) { /* "SText" */
-                    wm_spawn(WM_TYPE_STEXT);
-                    launcher_open = 0;
-                } else if (item >= 3 && item <= 17) { /* Kapp items */
-                    wm_spawn_kapp(item - 3);
-                    launcher_open = 0;
-                } else if (item == 18 && wm_fs) { /* "Run App..." → ELF browser */
+                if (action == 0) {
+                    wm_spawn(WM_TYPE_TERMINAL);   launcher_open = 0;
+                } else if (action == 1) {
+                    wm_spawn(WM_TYPE_CALC);       launcher_open = 0;
+                } else if (action == 2) {
+                    wm_spawn(WM_TYPE_STEXT);      launcher_open = 0;
+                } else if (action >= 3 && action <= 17) {
+                    wm_spawn_kapp(action - 3);    launcher_open = 0;
+                } else if (action == 18 && wm_fs) {
                     fat16_dirent_t tmp[32];
                     int total = 0;
                     fat16_list_entries(wm_fs, 0, tmp, 32, &total);
                     wm_elf_count = 0;
-                    {
-                        int ei;
-                        for (ei = 0; ei < total && wm_elf_count < LNCHR_BROWSER_MAX; ei++) {
-                            if (tmp[ei].attr & 0x10u) continue;
-                            char *n = tmp[ei].name;
-                            int l = (int)strlen(n);
-                            if (l >= 4 && n[l-4] == '.' &&
-                                (n[l-3] == 'E' || n[l-3] == 'e') &&
-                                (n[l-2] == 'L' || n[l-2] == 'l') &&
-                                (n[l-1] == 'F' || n[l-1] == 'f')) {
-                                wm_elf_entries[wm_elf_count++] = tmp[ei];
-                            }
+                    for (int ei = 0; ei < total && wm_elf_count < LNCHR_BROWSER_MAX; ei++) {
+                        if (tmp[ei].attr & 0x10u) continue;
+                        char *n = tmp[ei].name;
+                        int l = (int)strlen(n);
+                        if (l >= 4 && n[l-4] == '.' &&
+                            (n[l-3]=='E'||n[l-3]=='e') &&
+                            (n[l-2]=='L'||n[l-2]=='l') &&
+                            (n[l-1]=='F'||n[l-1]=='f')) {
+                            wm_elf_entries[wm_elf_count++] = tmp[ei];
                         }
                     }
-                    launcher_open = 2;
-                } else {
-                    launcher_open = 0;
+                    launcher_open   = 2;
+                    launcher_anim_y = -((wm_elf_count + 2) * LNCHR_ITEM_H + 6);
+                } else if (action == -2) {
+                    /* click outside items but inside panel → ignore */
                 }
                 launcher_handled = 1;
             } else {
@@ -1275,13 +1549,14 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
         if (!launcher_handled && launcher_open == 2) {
             int rows = wm_elf_count + 1;
             if (rows < 2) rows = 2;
-            int browser_h = rows * LNCHR_ITEM_H + 2;
-            if (point_in_rect(x, y, LNCHR_MENU_X, LNCHR_MENU_Y,
+            int browser_h = rows * LNCHR_ITEM_H + 6;
+            int py = LNCHR_PANEL_Y + launcher_anim_y;
+            if (point_in_rect(x, y, LNCHR_PANEL_X, py,
                               LNCHR_BROWSER_W, browser_h)) {
-                int item = (y - LNCHR_MENU_Y - 1) / LNCHR_ITEM_H;
+                int item = (y - py - 3) / LNCHR_ITEM_H;
                 if (item == 0) {
-                    /* "< Back" → return to main menu */
-                    launcher_open = 1;
+                    launcher_open   = 1;
+                    launcher_anim_y = -lnchr_panel_height();
                 } else {
                     int elf_idx = item - 1;
                     if (elf_idx >= 0 && elf_idx < wm_elf_count && wm_fs) {
@@ -1476,7 +1751,27 @@ void wm_handle_mouse(int x, int y, uint8_t new_buttons, uint8_t prev_buttons) {
  * the terminal window, so subsequent vga_putc() calls land there.
  * ================================================================ */
 void wm_draw_all(void) {
+    /* 1. Wallpaper (scaled) */
     fb_blit_scaled(0, 0, scr_w, scr_h, wm_wallpaper, WP_W, WP_H);
+
+    /* 2. Green tint overlay — transforms the blue wallpaper toward cyberpunk green */
+    fb_fill_rect_alpha(0, 0, scr_w, scr_h, COL_WALLPAPER_TINT, 160);
+
+    /* 3. Vignette — darken screen edges for depth */
+    fb_vignette((uint32_t)scr_w, (uint32_t)scr_h, 80);
+
+    /* 4. Subtle wallpaper dimming behind the focused window */
+    if (wm_active >= 0 && wm_active < WM_MAX_WINDOWS &&
+        !wm_windows[wm_active].hidden) {
+        wm_window_t *aw = &wm_windows[wm_active];
+        /* Darken everything OUTSIDE the active window slightly */
+        fb_fill_rect_alpha(0,        0,        scr_w,      aw->y,      0x000000, 30);
+        fb_fill_rect_alpha(0,        aw->y+aw->height, scr_w,
+                           scr_h - aw->y - aw->height,     0x000000, 30);
+        fb_fill_rect_alpha(0,        aw->y,    aw->x,      aw->height, 0x000000, 30);
+        fb_fill_rect_alpha(aw->x+aw->width, aw->y,
+                           scr_w - aw->x - aw->width, aw->height,  0x000000, 30);
+    }
 
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < WM_MAX_WINDOWS; i++) {
@@ -1809,6 +2104,7 @@ int32_t wm_syscall(uint32_t nr, uint32_t a, uint32_t b, uint32_t c) {
         w->pix_w      = cw;
         w->pix_h      = ch;
         w->owner_slot = (current_proc >= 0) ? current_proc : -1;
+        w->anim_alpha = 0;   /* fade in on first draw */
         strncpy(w->title_buf, "App", 31);
         w->title_buf[31] = '\0';
         w->title    = w->title_buf;
@@ -2126,15 +2422,16 @@ void wm_spawn_kapp(int kapp_id) {
     /* Position: centered on screen (within desktop usable area) */
     int avail_y = UI_MENUBAR_H;
     int avail_h = scr_h - UI_DOCK_H - UI_MENUBAR_H;
-    w->x        = (scr_w - def->def_w) / 2;
-    w->y        = avail_y + (avail_h - def->def_h) / 2;
-    w->width    = def->def_w;
-    w->height   = def->def_h;
-    w->type     = WM_TYPE_KAPP;
-    w->instance = kapp_id;  /* repurpose instance field as kapp type ID */
-    w->hidden   = 0;
-    w->pixels   = (uint32_t *)0;
+    w->x          = (scr_w - def->def_w) / 2;
+    w->y          = avail_y + (avail_h - def->def_h) / 2;
+    w->width      = def->def_w;
+    w->height     = def->def_h;
+    w->type       = WM_TYPE_KAPP;
+    w->instance   = kapp_id;
+    w->hidden     = 0;
+    w->pixels     = (uint32_t *)0;
     w->owner_slot = -1;
+    w->anim_alpha = 0;   /* fade in on first draw */
 
     /* Use the kapp title */
     strncpy(w->title_buf, def->title, 31);
