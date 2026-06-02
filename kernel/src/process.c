@@ -308,7 +308,7 @@ void proc_exit(registers_t *regs, int status) {
             for (int i = 0; i < MAX_PROCS; i++) {
                 if (proc_table[i].pid == ppid) {
                     /* Send SIGCHLD */
-                    proc_table[i].sig_pending |= (1U << SIGCHLD);
+                    proc_table[i].sig_pending |= (1U << (SIGCHLD-1));
 
                     if (proc_table[i].state == PROC_BLOCKED) {
                         /* Leave dying as ZOMBIE — parent re-executes waitpid()
@@ -642,7 +642,7 @@ int proc_send_signal(pid_t pid, int sig) {
         /* Immediately terminate */
         if (idx == current_proc) {
             /* Will be handled by caller */
-            proc_table[idx].sig_pending |= (1U << sig);
+            proc_table[idx].sig_pending |= (1U << (sig-1));
         } else {
             proc_table[idx].state       = PROC_ZOMBIE;
             proc_table[idx].exit_status = W_SIGNALED(SIGKILL);
@@ -660,7 +660,7 @@ int proc_send_signal(pid_t pid, int sig) {
         return 0;
     }
 
-    proc_table[idx].sig_pending |= (1U << sig);
+    proc_table[idx].sig_pending |= (1U << (sig-1));
 
     /* Wake sleeping/blocked process */
     if (proc_table[idx].state == PROC_SLEEPING ||
@@ -723,7 +723,7 @@ void proc_deliver_signals(registers_t *regs) {
     /* Find lowest set bit */
     int sig = -1;
     for (int s = 1; s < NSIG; s++) {
-        if (deliverable & (1U << s)) {
+        if (deliverable & (1U << (s-1))) {
             sig = s;
             break;
         }
@@ -731,7 +731,7 @@ void proc_deliver_signals(registers_t *regs) {
     if (sig < 0) return;
 
     /* Clear from pending */
-    proc->sig_pending &= ~(1U << sig);
+    proc->sig_pending &= ~(1U << (sig-1));
 
     struct sigaction *sa = &proc->sig_actions[sig];
 
@@ -772,7 +772,7 @@ void proc_deliver_signals(registers_t *regs) {
     frame->saved_mask    = proc->sig_mask;
 
     /* Mask signals during handler */
-    proc->sig_mask |= sa->sa_mask | (1U << sig);
+    proc->sig_mask |= sa->sa_mask | (1U << (sig-1));
 
     /* Redirect to handler */
     regs->eip    = (uint32_t)sa->sa_handler;

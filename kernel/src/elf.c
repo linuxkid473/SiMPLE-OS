@@ -14,9 +14,10 @@
  *
  *   0x100000 – _kernel_end kernel code + data + BSS  (supervisor)
  *   _kernel_end – ~0x3F0000 kmalloc heap             (supervisor)
- *   0x300000 – 0x3EFFFF   user ELF code/data/BSS     (USER_BASE, user-accessible)
- *   0x3F0000 – 0x3FFFC7   user stack (grows down)    (user-accessible)
- *   0x3FFFC8 – 0x3FFFFF   exit stub + stack frame    (user-accessible)
+ *   0x300000 – 0x3FFDE7   user ELF code/data/BSS + stack (USER_BASE, user-accessible)
+ *   0x3FFFE0            USER_INITIAL_SP (stack grows down from here)
+ *   0x3FFFE8 – 0x3FFFEF  SIG_TRAMPOLINE_ADDR (above initial SP, never clobbered)
+ *   0x3FFFF0 – 0x3FFFF9  EXIT_STUB_ADDR      (above initial SP, never clobbered)
  *
  * USER_BASE and USER_STACK come from elf.h; must match user/linker.ld and paging.c.
  */
@@ -316,11 +317,10 @@ int exec_elf(void *data) {
     }
 
     /*
-     * Plant stubs in the user stack area:
-     *   SIG_TRAMPOLINE_ADDR (0x3FFF80): sigreturn trampoline
-     *   EXIT_STUB_ADDR      (0x3FFFA0): exit stub (Linux SYS_EXIT=1)
-     *
-     * If _start returns without calling exit(), the exit stub runs.
+     * Plant stubs above USER_INITIAL_SP so the downward-growing stack cannot
+     * overwrite them:
+     *   SIG_TRAMPOLINE_ADDR (0x3FFFE8): sigreturn trampoline
+     *   EXIT_STUB_ADDR      (0x3FFFF0): exit stub (Linux SYS_EXIT=1)
      */
     /* Sigreturn trampoline: mov $119, %eax; int $0x80; hlt */
     static const uint8_t sigret_stub[] = {

@@ -170,31 +170,57 @@ void idt_init(void) {
    ---------------------------------------------------------------------- */
 static void kill_user_process(registers_t *regs, const char *reason) {
     uint32_t cr2 = 0;
-    if (regs->int_no == 14)
-        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
-    serial_write(COM1, "[VM] page fault: ");
+    /* Full diagnostic dump to serial */
+    serial_write(COM1, "[FAULT] ");
     serial_write(COM1, reason);
     serial_write(COM1, "\n");
 
-    serial_write(COM1, "[VM]   pid=");
-    if (current_proc >= 0)
+    serial_write(COM1, "[FAULT]  PID=");
+    if (current_proc >= 0) {
         serial_write_dec(COM1, (uint32_t)proc_table[current_proc].pid);
-    else
+        serial_write(COM1, " (");
+        serial_write(COM1, proc_table[current_proc].cwd);
+        serial_write(COM1, ")");
+    } else {
         serial_write(COM1, "?");
+    }
     serial_write(COM1, " INT=");
     serial_write_dec(COM1, regs->int_no);
-    serial_write(COM1, " EIP=0x");
+    serial_write(COM1, " ERR=0x");
+    serial_write_hex(COM1, regs->err_code);
+    serial_write(COM1, "\n");
+
+    serial_write(COM1, "[FAULT]  EIP=0x");
     serial_write_hex(COM1, regs->eip);
     serial_write(COM1, " CS=0x");
     serial_write_hex(COM1, regs->cs);
+    serial_write(COM1, " EFLAGS=0x");
+    serial_write_hex(COM1, regs->eflags);
+    serial_write(COM1, "\n");
+
+    serial_write(COM1, "[FAULT]  ESP=0x");
+    serial_write_hex(COM1, regs->useresp);
+    serial_write(COM1, " EBP=0x");
+    serial_write_hex(COM1, regs->ebp);
+    serial_write(COM1, " CR2=0x");
+    serial_write_hex(COM1, cr2);
+    serial_write(COM1, "\n");
+
+    serial_write(COM1, "[FAULT]  EAX=0x");
+    serial_write_hex(COM1, regs->eax);
+    serial_write(COM1, " EBX=0x");
+    serial_write_hex(COM1, regs->ebx);
+    serial_write(COM1, " ECX=0x");
+    serial_write_hex(COM1, regs->ecx);
+    serial_write(COM1, " EDX=0x");
+    serial_write_hex(COM1, regs->edx);
     serial_write(COM1, "\n");
 
     if (regs->int_no == 14) {
-        serial_write(COM1, "[VM]   CR2=0x");
+        serial_write(COM1, "[FAULT]  #PF CR2=0x");
         serial_write_hex(COM1, cr2);
-        serial_write(COM1, " err=0x");
-        serial_write_hex(COM1, regs->err_code);
         serial_write(COM1, " (");
         serial_write(COM1, (regs->err_code & 1) ? "present"    : "not-present");
         serial_write(COM1, "|");
@@ -204,13 +230,46 @@ static void kill_user_process(registers_t *regs, const char *reason) {
         if (regs->err_code & 8)  serial_write(COM1, "|reserved-bit");
         if (regs->err_code & 16) serial_write(COM1, "|instr-fetch");
         serial_write(COM1, ")\n");
-        vga_write("[VM] page fault: ");
-        vga_write(reason);
-        vga_putc('\n');
-    } else {
-        vga_write("[VM] user fault: ");
-        vga_write_line(reason);
     }
+
+    /* For #UD (Invalid Opcode), dump 16 bytes at EIP */
+    if (regs->int_no == 6) {
+        uint32_t eip = regs->eip;
+        if (eip >= 0x300000 && eip < 0x700000) {
+            serial_write(COM1, "[FAULT]  #UD bytes at EIP:");
+            const uint8_t *p = (const uint8_t *)eip;
+            for (int i = 0; i < 16; i++) {
+                serial_write(COM1, " ");
+                /* print two hex digits */
+                uint8_t b = p[i];
+                const char *hex = "0123456789ABCDEF";
+                char buf[3];
+                buf[0] = hex[b >> 4];
+                buf[1] = hex[b & 0xF];
+                buf[2] = '\0';
+                serial_write(COM1, buf);
+            }
+            serial_write(COM1, "\n");
+        }
+    }
+
+    /* VGA display */
+    vga_write("[FAULT] INT=");
+    /* print int number (simple dec) */
+    {
+        uint32_t n = regs->int_no;
+        if (n >= 10) vga_putc('0' + (char)(n / 10));
+        vga_putc('0' + (char)(n % 10));
+    }
+    vga_write(" EIP=0x");
+    {
+        uint32_t n = regs->eip;
+        const char *hex = "0123456789ABCDEF";
+        for (int i = 28; i >= 0; i -= 4) vga_putc(hex[(n >> i) & 0xF]);
+    }
+    vga_write(" ");
+    vga_write(reason);
+    vga_putc('\n');
 
     /* Kill only the offending process; kernel keeps running */
     if (current_proc >= 0) {
@@ -460,7 +519,7 @@ static void syscall_handler(registers_t *regs) {
         break;
 
     case 162: /* nanosleep(req, rem) */
-        sys_linux_nanosleep((const void *)a0, (void *)a1, regs);
+        regs->eax = (uint32_t)sys_linux_nanosleep((const void *)a0, (void *)a1, regs);
         break;
 
     case 168: /* poll(fds, nfds, timeout) */

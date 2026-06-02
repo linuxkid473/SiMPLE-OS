@@ -494,6 +494,11 @@ int32_t sys_rename(const char *old_path, const char *new_path) {
     if (fat16_stat(g_fs, 0, old_name, &old_entry) != FAT16_OK) return -(int32_t)ENOENT;
 
     int rc = fat16_move_file(g_fs, 0, old_name, 0, new_name);
+    if (rc == FAT16_ERR_EXISTS) {
+        /* POSIX rename() atomically replaces existing destination */
+        fat16_remove(g_fs, 0, new_name);
+        rc = fat16_move_file(g_fs, 0, old_name, 0, new_name);
+    }
     return (rc == FAT16_OK) ? 0 : -1;
 }
 
@@ -679,7 +684,11 @@ int32_t sys_linux_open(const char *path, uint32_t flags, uint32_t mode) {
     if (!g_fs) return -(int32_t)EIO;
 
     const char *name = strip_slash(path);
-    if (!*name) return -(int32_t)EINVAL;
+    /* "/" strips to ""; "." is current dir — both map to FAT16 root (cluster 0) */
+    if (!*name || (name[0] == '.' && name[1] == '\0')) {
+        int fd = fd_alloc_file(syscall_get_fd_table(), 0, "/", flags, 0);
+        return (int32_t)fd;
+    }
 
     fat16_dirent_t entry;
     int rc = fat16_stat(g_fs, 0, name, &entry);
@@ -930,8 +939,10 @@ int32_t sys_linux_setsid(void) {
 }
 
 int32_t sys_linux_getppid(void) {
-    if (current_proc < 0) return 1;
-    return (int32_t)proc_table[current_proc].parent_pid;
+    if (current_proc < 0) return 0;
+    int32_t ppid = (int32_t)proc_table[current_proc].parent_pid;
+    /* Root/kernel-spawned processes have parent_pid=-1; return 0 (Linux init convention) */
+    return (ppid < 0) ? 0 : ppid;
 }
 
 int32_t sys_linux_getpgrp(void) {
@@ -993,7 +1004,7 @@ int32_t sys_linux_sigprocmask(int how, const uint32_t *set, uint32_t *oset) {
         if (!user_ptr_ok(set, sizeof(uint32_t))) return -(int32_t)EFAULT;
         uint32_t new_set = *set;
         /* SIGKILL and SIGSTOP cannot be blocked */
-        new_set &= ~((1U << SIGKILL) | (1U << SIGSTOP));
+        new_set &= ~((1U << (SIGKILL-1)) | (1U << (SIGSTOP-1)));
 
         switch (how) {
         case SIG_BLOCK:
@@ -1016,8 +1027,13 @@ int32_t sys_linux_sigprocmask(int how, const uint32_t *set, uint32_t *oset) {
 int32_t sys_linux_sigreturn(registers_t *regs) {
     if (current_proc < 0) return -(int32_t)ESRCH;
 
-    /* Restore from sig_frame_t on user stack */
-    uint32_t user_sp = regs->useresp;
+    /*
+     * On entry, user ESP = frame_start + 4.
+     * The handler's C `ret` popped the retaddr (4 bytes) from the frame, so
+     * ESP advanced by 4 past the true sig_frame_t base.  Subtract 4 to get
+     * back to the frame start.
+     */
+    uint32_t user_sp = regs->useresp - 4;
     sig_frame_t *frame = (sig_frame_t *)user_sp;
 
     if (!user_ptr_ok(frame, sizeof(sig_frame_t))) return -(int32_t)EFAULT;
@@ -1043,7 +1059,7 @@ int32_t sys_linux_sigsuspend(const uint32_t *mask) {
     if (mask && user_ptr_ok(mask, sizeof(uint32_t))) {
         /* Temporarily set mask and wait for a signal */
         proc_table[current_proc].sig_mask = *mask &
-            ~((1U << SIGKILL) | (1U << SIGSTOP));
+            ~((1U << (SIGKILL-1)) | (1U << (SIGSTOP-1)));
     }
     /* Always returns -EINTR after signal delivery */
     return -(int32_t)EINTR;
@@ -1264,7 +1280,7 @@ int32_t sys_linux_getdents(int32_t fd, void *buf, uint32_t count) {
     uint32_t ino = 1;
     for (int i = (int)f->file.offset; i < kcount && pos + 12 + 14 < count; i++) {
         uint32_t name_len = (uint32_t)strlen(kbuf[i].name);
-        uint32_t reclen = (8 + name_len + 2 + 3) & ~3U;
+        uint32_t reclen = (12 + name_len + 3) & ~3U;
         if (pos + reclen > count) break;
 
         linux_dirent_t *de = (linux_dirent_t *)((uint8_t *)buf + pos);
@@ -1305,16 +1321,16 @@ int32_t sys_linux_getdents64(int32_t fd, void *buf, uint32_t count) {
         dir_cluster = f->file.dir_cluster;
     }
 
-    fat16_dirent_t kbuf[32];
+    fat16_dirent_t kbuf[64];
     int kcount = 0;
-    int rc = fat16_list_entries(g_fs, dir_cluster, kbuf, 32, &kcount);
+    int rc = fat16_list_entries(g_fs, dir_cluster, kbuf, 64, &kcount);
     if (rc != FAT16_OK) return -(int32_t)EIO;
 
     uint32_t pos = 0;
     uint64_t ino = 1;
     for (int i = (int)f->file.offset; i < kcount; i++) {
         uint32_t name_len = (uint32_t)strlen(kbuf[i].name);
-        uint32_t reclen = (19 + name_len + 3) & ~3U;
+        uint32_t reclen = (20 + name_len + 3) & ~3U;
         if (pos + reclen > count) break;
 
         linux_dirent64_t *de = (linux_dirent64_t *)((uint8_t *)buf + pos);

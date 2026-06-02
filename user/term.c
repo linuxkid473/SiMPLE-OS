@@ -786,6 +786,7 @@ static void cmd_run(int wid, const char *name, unsigned int *px) {
 
     wm_setfocus(wid);
     tp("Done.", C_INFO);
+    redraw(wid, px);
 }
 
 static void cmd_echo(const char *text) {

@@ -188,7 +188,9 @@ user: \
     user/isoA.elf    \
     user/isoB.elf    \
     user/vmfork.elf  \
-    user/crash.elf
+    user/crash.elf   \
+    user/smkhelp.elf \
+    user/posixsmoke.elf
 
 # =============================================================================
 # MODERN POSIX user programs — define main(), link against USER_RUNTIME
@@ -284,6 +286,14 @@ user/vmfork.elf: user/vmfork.c $(LEGACY_RUNTIME_DEPS)
 user/crash.elf: user/crash.c $(LEGACY_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/crash.c $(LEGACY_RUNTIME_SRCS)
 
+# smkhelp.elf — execve helper: exits with code 42
+user/smkhelp.elf: user/smkhelp.c $(USER_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/smkhelp.c $(USER_RUNTIME_SRCS)
+
+# posixsmoke.elf — comprehensive POSIX syscall smoke test
+user/posixsmoke.elf: user/posixsmoke.c $(USER_RUNTIME_DEPS)
+	$(USER_CC) -o $@ user/posixsmoke.c $(USER_RUNTIME_SRCS)
+
 # =============================================================================
 # Kernel build rules
 # =============================================================================
@@ -347,6 +357,8 @@ image: \
     user/isoB.elf \
     user/vmfork.elf \
     user/crash.elf \
+    user/smkhelp.elf \
+    user/posixsmoke.elf \
     $(LIMINE_SYS) $(LIMINE_DEPLOY) grub/limine.conf
 	@set -e; \
 	rm -f $(IMAGE); \
@@ -386,6 +398,8 @@ image: \
 	mcopy -i $(IMAGE)@@1048576 user/isoB.elf          ::isoB.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/vmfork.elf        ::vmfork.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/crash.elf         ::crash.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/smkhelp.elf       ::smkhelp.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/posixsmoke.elf    ::smoke.elf; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% \
 	    set 1 boot on 2>/dev/null || true; \
 	$(LIMINE_DEPLOY) $(IMAGE)
