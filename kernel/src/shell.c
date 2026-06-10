@@ -13,6 +13,7 @@
 #include "process.h"
 #include "string.h"
 #include "syscall.h"
+#include "tty.h"
 #include "vga.h"
 #include "wm.h"
 
@@ -1168,6 +1169,80 @@ static void shell_completion(
     completion_sort(out);
 }
 
+/*
+ * shell_exec_foreground — load file_arg as an ELF, pass it argv
+ * (argv0 + all remaining tokens from *parse) and run it as the
+ * FOREGROUND program: the shell blocks until the process exits, so the
+ * program has exclusive use of the keyboard.  On exit the termios and
+ * terminal state (scroll region, colours, cursor) are restored so a
+ * crashed full-screen program cannot wedge the console.
+ *
+ * Returns  0  program ran (regardless of its exit status)
+ *         -1  file not found / is a directory (caller may try fallbacks;
+ *             *parse is left untouched in this case)
+ *         -2  other error (already reported)
+ */
+static int shell_exec_foreground(fat16_fs_t *fs, const char *file_arg,
+                                 char **parse, const char *argv0) {
+    uint16_t dir_cluster = cwd_cluster;
+    char file_name[SHELL_NAME_MAX];
+    int rc = resolve_parent_and_name(fs, file_arg, &dir_cluster, file_name);
+    if (rc != FAT16_OK) return -1;
+
+    fat16_dirent_t de;
+    if (fat16_stat(fs, dir_cluster, file_name, &de) != FAT16_OK) return -1;
+    if (de.attr & FAT16_ATTR_DIRECTORY) return -1;
+
+    int spawn_slot = proc_find_spawn_slot();
+    if (spawn_slot < 0) {
+        vga_write_line("ELF: no free process slot");
+        return -2;
+    }
+
+    uint32_t phys = PROC_SLOT_PHYS(spawn_slot);
+    uint32_t out_len = 0;
+    rc = fat16_read_file(fs, dir_cluster, file_name,
+                         (char *)phys, ELF_LOAD_BUF, &out_len);
+    if (rc != FAT16_OK) {
+        vga_write_line("Failed to read file");
+        return -2;
+    }
+
+    /* argv = argv0 + remaining command-line tokens */
+    char *argvv[POSIX_ARGV_MAX + 1];
+    int argc = 0;
+    argvv[argc++] = (char *)argv0;
+    char *tok;
+    while (argc < POSIX_ARGV_MAX && (tok = next_token(parse)) != NULL)
+        argvv[argc++] = tok;
+    argvv[argc] = (char *)0;
+
+    int elf_rc = exec_elf_spawn_argv((void *)phys, out_len, spawn_slot,
+                                     argvv, (char *const *)0);
+    if (elf_rc < 0) {
+        vga_write_line("ELF: execution failed");
+        return -2;
+    }
+
+    /*
+     * Foreground wait.  The PIT tick handler switches to the runnable
+     * child whenever the shell hlt's here (current_proc == -1), and the
+     * child yields back when it blocks.  Crucially the shell does NOT
+     * read the console while waiting, so every keystroke goes to the
+     * program.  Spawned processes have no parent and are auto-reaped to
+     * PROC_DEAD on exit, which terminates this loop.
+     */
+    while (proc_table[spawn_slot].state != PROC_DEAD) {
+        __asm__ volatile("sti; hlt" ::: "memory");
+    }
+
+    /* Restore terminal state the program may have changed. */
+    tty_default_termios(&g_tty.termios);
+    tty_flush_input();
+    vga_term_reset();
+    return 0;
+}
+
 void shell_run(fat16_fs_t* fs, int fs_ready) {
     char line[SHELL_LINE_MAX];
 
@@ -1774,41 +1849,16 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
 
         if (strcmp(command, "run") == 0) {
             char* arg1 = next_token(&parse);
-            char* arg2 = next_token(&parse);
-            if (!arg1 || arg2) {
-                vga_write_line("usage: run <file>");
+            if (!arg1) {
+                vga_write_line("usage: run <file> [args...]");
                 continue;
             }
 
-            uint16_t dir_cluster = cwd_cluster;
-            char file_name[SHELL_NAME_MAX];
-            int rc = resolve_parent_and_name(fs, arg1, &dir_cluster, file_name);
-            if (rc == FAT16_ERR_NOT_FOUND || rc == FAT16_ERR_NOTDIR) {
+            int r = shell_exec_foreground(fs, arg1, &parse, arg1);
+            if (r == -1)
                 print_label_target("File not found: ", arg1);
-                continue;
-            }
-            if (rc != FAT16_OK) {
-                print_label_target("Invalid file name: ", arg1);
-                continue;
-            }
-
-            int spawn_slot = proc_find_spawn_slot();
-            if (spawn_slot < 0) {
-                vga_write_line("ELF: no free process slot");
-                continue;
-            }
-            uint32_t phys = PROC_SLOT_PHYS(spawn_slot);
-            uint32_t out_len = 0;
-            rc = fat16_read_file(fs, dir_cluster, file_name,
-                                 (char *)phys, ELF_LOAD_BUF, &out_len);
-            if (rc != FAT16_OK) {
-                vga_write_line("Failed to read file");
-                continue;
-            }
-            int elf_rc = exec_elf_spawn((void *)phys, out_len, spawn_slot);
-            if (elf_rc < 0)
-                vga_write_line("ELF: execution failed");
-            vga_putc('\n');
+            else if (r == 0)
+                vga_putc('\n');
             continue;
         }
 
@@ -2001,6 +2051,35 @@ void shell_run(fat16_fs_t* fs, int fs_ready) {
                 }
             }
             continue;
+        }
+
+        /*
+         * Not a built-in: try it as a program on disk so that
+         * `vim file.txt` works like `run vim.elf file.txt`.
+         * Try the name as typed first, then with ".elf" appended.
+         */
+        if (fs_ready) {
+            int r = shell_exec_foreground(fs, command, &parse, command);
+            if (r == -1 && !strchr(command, '.')) {
+                char with_ext[SHELL_NAME_MAX + 4];
+                uint32_t ci = 0;
+                while (command[ci] && ci < SHELL_NAME_MAX - 1) {
+                    with_ext[ci] = command[ci];
+                    ci++;
+                }
+                with_ext[ci] = '\0';
+                const char *ext = ".elf";
+                for (uint32_t ei = 0; ext[ei] && ci < sizeof(with_ext) - 1; ei++)
+                    with_ext[ci++] = ext[ei];
+                with_ext[ci] = '\0';
+                r = shell_exec_foreground(fs, with_ext, &parse, command);
+            }
+            if (r == 0) {
+                vga_putc('\n');
+                continue;
+            }
+            if (r == -2)
+                continue;
         }
 
         vga_write("Unknown command: ");

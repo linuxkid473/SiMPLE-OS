@@ -55,6 +55,27 @@ int      elf_validate(void* data);
 int      exec_elf(void* data);
 uint32_t build_posix_stack(const char *path);
 
+/* Maximum argv/envp entries accepted by the stack builders. */
+#define POSIX_ARGV_MAX 32
+#define POSIX_ENVP_MAX 16
+
+/*
+ * build_posix_stack_argv — build the Linux i386 initial stack from real
+ * argument/environment vectors (kernel pointers, NULL-terminated arrays;
+ * envp may be NULL).  Writes into the live virtual user space.
+ * Returns the new user ESP.
+ */
+uint32_t build_posix_stack_argv(char *const argv[], char *const envp[]);
+
+/* Same, but writes into the physical 1 MB block backing a spawned
+ * process (virtual = USER_BASE + offset).  Returns the VIRTUAL user ESP. */
+uint32_t build_posix_stack_phys_argv(uint8_t *phys_mem,
+                                     char *const argv[], char *const envp[]);
+
+/* exec_elf_spawn with explicit argv/envp (NULL-terminated kernel arrays). */
+int exec_elf_spawn_argv(void *data, uint32_t data_len, int slot,
+                        char *const argv[], char *const envp[]);
+
 /*
  * build_posix_stack_phys — like build_posix_stack() but writes into a
  * physical memory block instead of the live virtual user space.

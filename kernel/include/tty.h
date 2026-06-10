@@ -88,4 +88,24 @@ int  tty_is_eof(char c);
 /* Returns 1 if in canonical mode */
 int  tty_is_canon(void);
 
+/* ----------------------------------------------------------------
+ * Raw-mode input queue.
+ *
+ * In non-canonical mode user programs read a terminal byte stream:
+ * printable keys arrive as single bytes, special keys (arrows,
+ * Delete, Home/End/PgUp/PgDn) arrive as VT100/xterm escape
+ * sequences.  tty_pump() translates pending key events into that
+ * byte stream without blocking; readers drain it with tty_getc().
+ * ---------------------------------------------------------------- */
+
+/* Translate all currently-pending keyboard events into queued bytes.
+ * Non-blocking; safe to call from syscall context. */
+void tty_pump(void);
+/* 1 if at least one byte is queued (pumps first). */
+int  tty_input_pending(void);
+/* Pop one queued byte, or -1 if the queue is empty. Does NOT pump. */
+int  tty_getc(void);
+/* Discard all queued input (TCSETSF). */
+void tty_flush_input(void);
+
 #endif

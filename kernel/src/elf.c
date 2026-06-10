@@ -139,15 +139,38 @@ launch_ring3(uint32_t entry   __attribute__((unused)),
  *
  * Returns the new user ESP (points at EXIT_STUB_ADDR).
  */
-uint32_t build_posix_stack(const char *path) {
-    uint8_t *top = (uint8_t *)USER_INITIAL_SP;
-    uint8_t *p   = top;
+/*
+ * Generic builder: writes the initial stack into `mem_base`, which is
+ * where USER_BASE is reachable in the CURRENT address space — either
+ * (uint8_t *)USER_BASE itself (live exec) or the physical slot block
+ * (spawn path).  Pointers stored on the stack are virtual (USER_BASE-
+ * relative).  argv/envp are NULL-terminated arrays of KERNEL pointers;
+ * envp may be NULL.  Returns the virtual user ESP.
+ */
+static uint32_t build_stack_common(uint8_t *mem_base,
+                                   char *const argv[], char *const envp[]) {
+    uint8_t *p = mem_base + (USER_INITIAL_SP - USER_BASE);
 
-    /* Copy path string just below the stack top */
-    size_t len = strlen(path) + 1;
-    p -= len;
-    for (size_t i = 0; i < len; i++) p[i] = path[i];
-    uint32_t argv0_addr = (uint32_t)p;
+    int argc = 0, envc = 0;
+    while (argv && argv[argc] && argc < POSIX_ARGV_MAX) argc++;
+    while (envp && envp[envc] && envc < POSIX_ENVP_MAX) envc++;
+
+    uint32_t argv_vaddr[POSIX_ARGV_MAX];
+    uint32_t envp_vaddr[POSIX_ENVP_MAX];
+
+    /* Copy strings (top of stack, growing down) */
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        p -= len;
+        for (size_t j = 0; j < len; j++) p[j] = argv[i][j];
+        argv_vaddr[i] = USER_BASE + (uint32_t)(p - mem_base);
+    }
+    for (int i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        p -= len;
+        for (size_t j = 0; j < len; j++) p[j] = envp[i][j];
+        envp_vaddr[i] = USER_BASE + (uint32_t)(p - mem_base);
+    }
 
     /* Align down to 4 bytes */
     p = (uint8_t *)((uint32_t)p & ~3U);
@@ -156,15 +179,20 @@ uint32_t build_posix_stack(const char *path) {
     p -= 4; *(uint32_t *)p = 0;
     p -= 4; *(uint32_t *)p = 0;
 
-    /* envp: NULL terminator (no environment variables) */
+    /* envp vector + NULL terminator */
     p -= 4; *(uint32_t *)p = 0;
+    for (int i = envc - 1; i >= 0; i--) {
+        p -= 4; *(uint32_t *)p = envp_vaddr[i];
+    }
 
-    /* argv: argv[0] pointer, NULL terminator */
+    /* argv vector + NULL terminator */
     p -= 4; *(uint32_t *)p = 0;
-    p -= 4; *(uint32_t *)p = argv0_addr;
+    for (int i = argc - 1; i >= 0; i--) {
+        p -= 4; *(uint32_t *)p = argv_vaddr[i];
+    }
 
-    /* argc = 1 */
-    p -= 4; *(uint32_t *)p = 1;
+    /* argc */
+    p -= 4; *(uint32_t *)p = (uint32_t)argc;
 
     /*
      * Fake return address: if _start() executes a bare `ret` without calling
@@ -173,7 +201,23 @@ uint32_t build_posix_stack(const char *path) {
      */
     p -= 4; *(uint32_t *)p = EXIT_STUB_ADDR;
 
-    return (uint32_t)p;
+    return USER_BASE + (uint32_t)(p - mem_base);
+}
+
+uint32_t build_posix_stack_argv(char *const argv[], char *const envp[]) {
+    return build_stack_common((uint8_t *)USER_BASE, argv, envp);
+}
+
+uint32_t build_posix_stack_phys_argv(uint8_t *phys_mem,
+                                     char *const argv[], char *const envp[]) {
+    return build_stack_common(phys_mem, argv, envp);
+}
+
+uint32_t build_posix_stack(const char *path) {
+    char *argv[2];
+    argv[0] = (char *)path;
+    argv[1] = (char *)0;
+    return build_stack_common((uint8_t *)USER_BASE, argv, (char *const *)0);
 }
 
 /* -------------------------------------------------------------------------
@@ -189,39 +233,10 @@ uint32_t build_posix_stack(const char *path) {
  *   so virtual address = USER_BASE + offset_within_block.
  */
 uint32_t build_posix_stack_phys(uint8_t *phys_mem, const char *path) {
-    /* Stack top in physical memory: offset of USER_INITIAL_SP within user space */
-    uint32_t top_off = USER_INITIAL_SP - USER_BASE;
-    uint8_t *p       = phys_mem + top_off;
-
-    /* argv[0] path string */
-    size_t len = strlen(path) + 1;
-    p -= len;
-    for (size_t i = 0; i < len; i++) p[i] = path[i];
-    /* Virtual address of the path string as seen by the process */
-    uint32_t argv0_vaddr = USER_BASE + (uint32_t)(p - phys_mem);
-
-    /* Align to 4 bytes */
-    p = (uint8_t *)((uint32_t)p & ~3U);
-
-    /* auxv: AT_NULL (type=0, value=0) */
-    p -= 4; *(uint32_t *)p = 0;
-    p -= 4; *(uint32_t *)p = 0;
-
-    /* envp: NULL terminator */
-    p -= 4; *(uint32_t *)p = 0;
-
-    /* argv: argv[0] pointer, NULL terminator */
-    p -= 4; *(uint32_t *)p = 0;
-    p -= 4; *(uint32_t *)p = argv0_vaddr;
-
-    /* argc = 1 */
-    p -= 4; *(uint32_t *)p = 1;
-
-    /* Fake return address: lands on exit stub if _start does a bare ret */
-    p -= 4; *(uint32_t *)p = EXIT_STUB_ADDR;
-
-    /* Return the VIRTUAL user ESP (process sees USER_BASE-relative addresses) */
-    return USER_BASE + (uint32_t)(p - phys_mem);
+    char *argv[2];
+    argv[0] = (char *)path;
+    argv[1] = (char *)0;
+    return build_stack_common(phys_mem, argv, (char *const *)0);
 }
 
 /* -------------------------------------------------------------------------
@@ -388,6 +403,12 @@ int exec_elf(void *data) {
  * returns control to the blocking exec_elf() call that set kernel_esp).
  */
 int exec_elf_spawn(void *data, uint32_t data_len, int slot) {
+    return exec_elf_spawn_argv(data, data_len, slot,
+                               (char *const *)0, (char *const *)0);
+}
+
+int exec_elf_spawn_argv(void *data, uint32_t data_len, int slot,
+                        char *const argv[], char *const envp[]) {
     serial_write(COM1, "[elf_spawn] entry slot=");
     serial_write_dec(COM1, (uint32_t)slot);
     serial_write(COM1, " data_len=");
@@ -491,7 +512,12 @@ int exec_elf_spawn(void *data, uint32_t data_len, int slot) {
     for (uint32_t i = 0; i < sizeof(exit_stub_bytes); i++) ep[i] = exit_stub_bytes[i];
 
     /* Build POSIX stack in physical memory; returns virtual user_sp */
-    uint32_t user_sp = build_posix_stack_phys(pm, "kernel");
+    uint32_t user_sp;
+    if (argv && argv[0]) {
+        user_sp = build_posix_stack_phys_argv(pm, argv, envp);
+    } else {
+        user_sp = build_posix_stack_phys(pm, "kernel");
+    }
 
     klog_hex("elf_spawn", "slot",     (uint32_t)slot);
     klog_hex("elf_spawn", "entry",    entry);

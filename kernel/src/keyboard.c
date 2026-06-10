@@ -170,6 +170,86 @@ int keyboard_is_ctrl_pressed(void) {
     return ctrl_pressed;
 }
 
+/*
+ * Run one scancode through the modifier/extended-prefix state machine.
+ * Returns 1 if a key event was produced, 0 if the byte only changed
+ * internal state (modifiers, key releases, unknown codes, 0xE0 prefix).
+ *
+ * Shared by the blocking reader (keyboard_read_event) and the
+ * non-blocking reader (keyboard_poll_event) so both see a single
+ * consistent shift/ctrl/alt state.
+ */
+static int keyboard_translate(uint8_t scancode, key_event_t *event) {
+    if (scancode == 0xE0) {
+        extended_prefix = 1;
+        return 0;
+    }
+
+    if (extended_prefix) {
+        extended_prefix = 0;
+        uint8_t code = scancode & 0x7F;
+
+        /* Right Alt press / release (extended 0x38) */
+        if (code == 0x38) {
+            alt_pressed = (scancode & 0x80) ? 0 : 1;
+            return 0;
+        }
+
+        if (scancode & 0x80) return 0;   /* other extended key releases */
+
+        if (code == 0x4B) { event->type = KEY_EVENT_LEFT;   return 1; }
+        if (code == 0x4D) { event->type = KEY_EVENT_RIGHT;  return 1; }
+        if (code == 0x48) { event->type = KEY_EVENT_UP;     return 1; }
+        if (code == 0x50) { event->type = KEY_EVENT_DOWN;   return 1; }
+        if (code == 0x53) { event->type = KEY_EVENT_DELETE; return 1; }
+        if (code == 0x47) { event->type = KEY_EVENT_HOME;   return 1; }
+        if (code == 0x4F) { event->type = KEY_EVENT_END;    return 1; }
+        if (code == 0x49) { event->type = KEY_EVENT_PGUP;   return 1; }
+        if (code == 0x51) { event->type = KEY_EVENT_PGDN;   return 1; }
+        return 0;
+    }
+
+    /* Shift press / release */
+    if (scancode == 0x2A || scancode == 0x36) { shift_pressed = 1; return 0; }
+    if (scancode == 0xAA || scancode == 0xB6) { shift_pressed = 0; return 0; }
+
+    /* Left Alt press / release (0x38 press, 0xB8 = 0x80|0x38 release) */
+    if (scancode == 0x38) { alt_pressed = 1; return 0; }
+    if (scancode == 0xB8) { alt_pressed = 0; return 0; }
+
+    /* Left Ctrl press / release (0x1D press, 0x9D release) */
+    if (scancode == 0x1D) { ctrl_pressed = 1; return 0; }
+    if (scancode == 0x9D) { ctrl_pressed = 0; return 0; }
+
+    if (scancode & 0x80) return 0;
+
+    if (scancode == 0x1C) {
+        event->type = KEY_EVENT_ENTER;
+        return 1;
+    }
+
+    if (scancode == 0x0E) {
+        event->type = KEY_EVENT_BACKSPACE;
+        return 1;
+    }
+
+    if (scancode < 128) {
+        char c = shift_pressed ? shift_keymap[scancode] : keymap[scancode];
+        if (c) {
+            /* If Ctrl is pressed and it's a letter, convert to control character */
+            if (ctrl_pressed && c >= 'a' && c <= 'z') {
+                c = (char)(c - 'a' + 1);
+            } else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
+                c = (char)(c - 'A' + 1);
+            }
+            event->type = KEY_EVENT_CHAR;
+            event->ch = c;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void keyboard_read_event(key_event_t* event) {
     event->type = KEY_EVENT_NONE;
     event->ch = 0;
@@ -223,72 +303,40 @@ process_scancode:
 
         /* NOTE: wm_push_key() called by IRQ handler (fast path) or
          * by the polling fallback above.  Do NOT call it again here. */
-
-        if (extended_prefix) {
-            extended_prefix = 0;
-            uint8_t code = scancode & 0x7F;
-
-            /* Right Alt press / release (extended 0x38) */
-            if (code == 0x38) {
-                alt_pressed = (scancode & 0x80) ? 0 : 1;
-                return;
-            }
-
-            if (scancode & 0x80) return;   /* other extended key releases */
-
-            if (code == 0x4B) { event->type = KEY_EVENT_LEFT;   return; }
-            if (code == 0x4D) { event->type = KEY_EVENT_RIGHT;  return; }
-            if (code == 0x48) { event->type = KEY_EVENT_UP;     return; }
-            if (code == 0x50) { event->type = KEY_EVENT_DOWN;   return; }
-            if (code == 0x53) { event->type = KEY_EVENT_DELETE; return; }
-            return;
-        }
-
-        /* Left Shift press / release */
-        if (scancode == 0x2A || scancode == 0x36) {
-            shift_pressed = 1;
-            return;
-        }
-        if (scancode == 0xAA || scancode == 0xB6) {
-            shift_pressed = 0;
-            return;
-        }
-
-        /* Left Alt press / release (0x38 press, 0xB8 = 0x80|0x38 release) */
-        if (scancode == 0x38) { alt_pressed = 1; return; }
-        if (scancode == 0xB8) { alt_pressed = 0; return; }
-
-        /* Left Ctrl press / release (0x1D press, 0x9D release) */
-        if (scancode == 0x1D) { ctrl_pressed = 1; return; }
-        if (scancode == 0x9D) { ctrl_pressed = 0; return; }
-
-        if (scancode & 0x80) return;
-
-        if (scancode == 0x1C) {
-            event->type = KEY_EVENT_ENTER;
-            return;
-        }
-
-        if (scancode == 0x0E) {
-            event->type = KEY_EVENT_BACKSPACE;
-            return;
-        }
-
-        if (scancode < 128) {
-            char c = shift_pressed ? shift_keymap[scancode] : keymap[scancode];
-            if (c) {
-                /* If Ctrl is pressed and it's a letter, convert to control character */
-                if (ctrl_pressed && c >= 'a' && c <= 'z') {
-                    c = (char)(c - 'a' + 1);
-                } else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
-                    c = (char)(c - 'A' + 1);
-                }
-                event->type = KEY_EVENT_CHAR;
-                event->ch = c;
-                return;
-            }
-        }
+        keyboard_translate(scancode, event);
+        /* Return after each non-prefix scancode, whether or not it produced
+         * an event (preserves historical behaviour: callers loop on
+         * KEY_EVENT_NONE). */
         return;
+    }
+}
+
+int keyboard_poll_event(key_event_t* event) {
+    event->type = KEY_EVENT_NONE;
+    event->ch = 0;
+
+    while (1) {
+        uint8_t scancode;
+
+        if (!kb_pop(&scancode)) {
+            /* Ring empty — try one direct PS/2 poll (IRQ may be masked or
+             * the byte may have raced the handler). */
+            uint8_t st = inb(0x64);
+            if (!(st & 0x01u))
+                return 0;              /* genuinely no input pending */
+            uint8_t data = inb(0x60);
+            if (st & 0x20u) {
+                mouse_handle_byte(data);
+                continue;
+            }
+            if (data != 0xE0u)
+                wm_push_key(data);
+            scancode = data;
+        }
+
+        if (keyboard_translate(scancode, event))
+            return 1;
+        /* State-only byte (modifier/release/prefix) — keep draining. */
     }
 }
 

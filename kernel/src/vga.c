@@ -64,6 +64,21 @@ static int          ansi_params[ANSI_MAX_PARAMS];
 static int          ansi_nparams = 0;
 static int          ansi_priv = 0;   /* '?' flag seen after CSI */
 
+/* DECSTBM scroll region, 0-based inclusive rows.
+ * scroll_bot = 0xFFFFFFFF means "bottom of screen" (region unset). */
+static uint32_t scroll_top = 0;
+static uint32_t scroll_bot = 0xFFFFFFFFu;
+
+/* CSI s / CSI u saved cursor */
+static uint32_t saved_cur_row = 0;
+static uint32_t saved_cur_col = 0;
+
+/* Software cursor (framebuffer mode): inverse-video cell at the cursor.
+ * Toggled by DECTCEM (CSI ?25h / ?25l). */
+static int      cursor_visible = 1;
+static int      cursor_drawn   = 0;
+static uint32_t cdrawn_row = 0, cdrawn_col = 0;
+
 /* ANSI color index → VGA CGA palette index */
 static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
 
@@ -414,63 +429,175 @@ static void draw_char(char c, uint32_t col, uint32_t row, uint8_t color) {
     );
 }
 
-static void vga_scroll(void) {
+/* Effective scroll region bounds clamped to the current grid. */
+static uint32_t eff_scroll_top(void) {
+    uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
+    return (scroll_top < max_rows) ? scroll_top : 0;
+}
+
+static uint32_t eff_scroll_bot(void) {
+    uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
+    return (scroll_bot < max_rows) ? scroll_bot : max_rows - 1;
+}
+
+/*
+ * Scroll the text rows [top..bot] (inclusive, 0-based) by n rows.
+ *   n > 0 : content moves UP n rows (lines vanish at top, blanks at bottom)
+ *   n < 0 : content moves DOWN |n| rows (blanks appear at top)
+ * Updates the cell buffer and blits pixels (or VGA text memory).
+ * Used by LF-at-margin scrolling, DECSTBM regions, and CSI L / CSI M.
+ */
+static void region_scroll(uint32_t top, uint32_t bot, int n) {
     uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
     uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+    if (n == 0) return;
+    if (bot >= max_rows) bot = max_rows - 1;
+    if (top > bot) return;
 
-    if (cursor_row < max_rows) return;
+    uint32_t span = bot - top + 1;
+    uint32_t un   = (uint32_t)(n < 0 ? -n : n);
+    if (un > span) un = span;
 
+    /* ---- cell buffer ---- */
+    uint32_t ccols = (max_cols < TERM_CELL_COLS) ? max_cols : TERM_CELL_COLS;
+    if (n > 0) {
+        for (uint32_t r = top; r + un <= bot && r + un < TERM_CELL_ROWS; r++) {
+            for (uint32_t c = 0; c < ccols; c++) {
+                cell_chars [r][c] = cell_chars [r + un][c];
+                cell_colors[r][c] = cell_colors[r + un][c];
+            }
+        }
+        for (uint32_t r = (bot >= un ? bot - un + 1 : top); r <= bot && r < TERM_CELL_ROWS; r++) {
+            for (uint32_t c = 0; c < ccols; c++) {
+                cell_chars [r][c] = ' ';
+                cell_colors[r][c] = vga_color;
+            }
+        }
+    } else {
+        for (uint32_t r = bot; r >= top + un && r < TERM_CELL_ROWS; r--) {
+            for (uint32_t c = 0; c < ccols; c++) {
+                cell_chars [r][c] = cell_chars [r - un][c];
+                cell_colors[r][c] = cell_colors[r - un][c];
+            }
+            if (r == 0) break;
+        }
+        for (uint32_t r = top; r < top + un && r <= bot && r < TERM_CELL_ROWS; r++) {
+            for (uint32_t c = 0; c < ccols; c++) {
+                cell_chars [r][c] = ' ';
+                cell_colors[r][c] = vga_color;
+            }
+        }
+    }
+
+    /* ---- pixels ---- */
     if (fb_addr) {
-        /*
-         * Pixel blit: shift the client area up by exactly one
-         * character row (8 pixels), then clear the last row.
-         * Only touches pixels within [draw_off_x .. draw_off_x + cw)
-         * so the window chrome and desktop are left intact.
-         */
         uint32_t stride = fb_pitch / 4;
         uint32_t ox = (uint32_t)(draw_off_x < 0 ? 0 : draw_off_x);
         uint32_t oy = (uint32_t)(draw_off_y < 0 ? 0 : draw_off_y);
         uint32_t cw = max_cols * 8;
-        uint32_t ch = max_rows * 8;
+        uint32_t py_top = oy + top * 8;
+        uint32_t py_end = oy + (bot + 1) * 8;       /* exclusive */
+        uint32_t shift  = un * 8;
+        uint32_t bg     = vga_palette[(vga_color >> 4) & 0x0F];
 
-        for (uint32_t py = oy + 8; py < oy + ch; py++) {
-            for (uint32_t px = ox; px < ox + cw; px++) {
-                uint32_t p = fb_back[py * fb_width + px];
-                fb_back[(py - 8) * fb_width + px] = p;
-                fb_addr[(py - 8) * stride   + px] = p;
+        if (n > 0) {
+            for (uint32_t py = py_top + shift; py < py_end; py++) {
+                for (uint32_t px = ox; px < ox + cw; px++) {
+                    uint32_t p = fb_back[py * fb_width + px];
+                    fb_back[(py - shift) * fb_width + px] = p;
+                    fb_addr[(py - shift) * stride   + px] = p;
+                }
             }
-        }
-        uint32_t bg = vga_palette[(vga_color >> 4) & 0x0F];
-        for (uint32_t py = oy + ch - 8; py < oy + ch; py++) {
-            for (uint32_t px = ox; px < ox + cw; px++) {
-                fb_back[py * fb_width + px] = bg;
-                fb_addr[py * stride   + px] = bg;
+            for (uint32_t py = py_end - shift; py < py_end; py++) {
+                for (uint32_t px = ox; px < ox + cw; px++) {
+                    fb_back[py * fb_width + px] = bg;
+                    fb_addr[py * stride   + px] = bg;
+                }
             }
-        }
-
-        /* Mirror the scroll in the cell buffer */
-        for (uint32_t r = 0; r + 1 < max_rows && r + 1 < TERM_CELL_ROWS; r++) {
-            for (uint32_t c = 0; c < max_cols && c < TERM_CELL_COLS; c++) {
-                cell_chars [r][c] = cell_chars [r + 1][c];
-                cell_colors[r][c] = cell_colors[r + 1][c];
+        } else {
+            for (uint32_t py = py_end - shift; py-- > py_top; ) {
+                for (uint32_t px = ox; px < ox + cw; px++) {
+                    uint32_t p = fb_back[py * fb_width + px];
+                    fb_back[(py + shift) * fb_width + px] = p;
+                    fb_addr[(py + shift) * stride   + px] = p;
+                }
             }
-        }
-        for (uint32_t c = 0; c < max_cols && c < TERM_CELL_COLS; c++) {
-            cell_chars [max_rows - 1][c] = ' ';
-            cell_colors[max_rows - 1][c] = vga_color;
+            for (uint32_t py = py_top; py < py_top + shift && py < py_end; py++) {
+                for (uint32_t px = ox; px < ox + cw; px++) {
+                    fb_back[py * fb_width + px] = bg;
+                    fb_addr[py * stride   + px] = bg;
+                }
+            }
         }
     } else {
-        for (uint32_t y = 1; y < VGA_HEIGHT; y++) {
-            for (uint32_t x = 0; x < VGA_WIDTH; x++) {
-                VGA_MEMORY[(y - 1) * VGA_WIDTH + x] = VGA_MEMORY[y * VGA_WIDTH + x];
+        if (n > 0) {
+            for (uint32_t y = top; y + un <= bot; y++)
+                for (uint32_t x = 0; x < VGA_WIDTH; x++)
+                    VGA_MEMORY[y * VGA_WIDTH + x] =
+                        VGA_MEMORY[(y + un) * VGA_WIDTH + x];
+            for (uint32_t y = bot - un + 1; y <= bot; y++)
+                for (uint32_t x = 0; x < VGA_WIDTH; x++)
+                    VGA_MEMORY[y * VGA_WIDTH + x] = vga_entry(' ', vga_color);
+        } else {
+            for (uint32_t y = bot; y >= top + un; y--) {
+                for (uint32_t x = 0; x < VGA_WIDTH; x++)
+                    VGA_MEMORY[y * VGA_WIDTH + x] =
+                        VGA_MEMORY[(y - un) * VGA_WIDTH + x];
+                if (y == 0) break;
             }
-        }
-        for (uint32_t x = 0; x < VGA_WIDTH; x++) {
-            VGA_MEMORY[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = vga_entry(' ', vga_color);
+            for (uint32_t y = top; y < top + un && y <= bot; y++)
+                for (uint32_t x = 0; x < VGA_WIDTH; x++)
+                    VGA_MEMORY[y * VGA_WIDTH + x] = vga_entry(' ', vga_color);
         }
     }
+}
 
-    cursor_row = max_rows - 1;
+/*
+ * Line feed with VT100 margin semantics: scroll only when the cursor
+ * sits on the bottom margin of the scroll region; below the region it
+ * just moves down and stops at the screen edge.  With the region unset
+ * this is exactly the old "scroll whole screen at the bottom" behaviour.
+ */
+static void vga_lf(void) {
+    uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
+    uint32_t bot = eff_scroll_bot();
+    if (cursor_row == bot) {
+        region_scroll(eff_scroll_top(), bot, 1);
+    } else if (cursor_row + 1 < max_rows) {
+        cursor_row++;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Software cursor (framebuffer mode only)                             */
+/* ------------------------------------------------------------------ */
+
+static void cursor_undraw(void) {
+    if (!cursor_drawn) return;
+    cursor_drawn = 0;
+    if (!fb_addr) return;
+    if (cdrawn_row >= TERM_CELL_ROWS || cdrawn_col >= TERM_CELL_COLS) return;
+    uint8_t col = cell_colors[cdrawn_row][cdrawn_col];
+    draw_char_rgb(cell_chars[cdrawn_row][cdrawn_col],
+                  (int)(draw_off_x + (int32_t)(cdrawn_col * 8)),
+                  (int)(draw_off_y + (int32_t)(cdrawn_row * 8)),
+                  vga_palette[col & 0x0F],
+                  vga_palette[(col >> 4) & 0x0F]);
+}
+
+static void cursor_draw(void) {
+    if (!fb_addr || !cursor_visible) return;
+    if (cursor_row >= TERM_CELL_ROWS || cursor_col >= TERM_CELL_COLS) return;
+    uint8_t col = cell_colors[cursor_row][cursor_col];
+    /* Inverse video: swap fg/bg of the underlying cell. */
+    draw_char_rgb(cell_chars[cursor_row][cursor_col],
+                  (int)(draw_off_x + (int32_t)(cursor_col * 8)),
+                  (int)(draw_off_y + (int32_t)(cursor_row * 8)),
+                  vga_palette[(col >> 4) & 0x0F],
+                  vga_palette[col & 0x0F]);
+    cursor_drawn = 1;
+    cdrawn_row = cursor_row;
+    cdrawn_col = cursor_col;
 }
 
 /* ------------------------------------------------------------------ */
@@ -548,6 +675,7 @@ void vga_set_color(uint8_t fg, uint8_t bg) {
 void vga_clear(void) {
     uint32_t max_rows = fb_addr ? fb_rows : VGA_HEIGHT;
     uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
+    cursor_drawn = 0;   /* every cell is repainted below */
     for (uint32_t y = 0; y < max_rows; y++) {
         for (uint32_t x = 0; x < max_cols; x++) {
             draw_char(' ', x, y, vga_color);
@@ -556,6 +684,7 @@ void vga_clear(void) {
     cursor_row = 0;
     cursor_col = 0;
     vga_update_cursor();
+    cursor_draw();
 }
 
 /* ------------------------------------------------------------------ */
@@ -647,11 +776,43 @@ static void ansi_dispatch(char cmd) {
         if (cursor_row >= max_rows) cursor_row = max_rows - 1;
         if (cursor_col >= max_cols) cursor_col = max_cols - 1;
         break;
+    case 'G':   /* CHA — cursor horizontal absolute (1-based) */
+        cursor_col = (p0 > 0) ? (uint32_t)(p0 - 1) : 0;
+        if (cursor_col >= max_cols) cursor_col = max_cols - 1;
+        break;
+    case 'd':   /* VPA — vertical position absolute (1-based) */
+        cursor_row = (p0 > 0) ? (uint32_t)(p0 - 1) : 0;
+        if (cursor_row >= max_rows) cursor_row = max_rows - 1;
+        break;
     case 'J':   /* erase display */
         ansi_erase_display(p0);
         break;
     case 'K':   /* erase line */
         ansi_erase_line(p0);
+        break;
+    case 'L': { /* IL — insert blank lines at cursor (within region) */
+        uint32_t bot = eff_scroll_bot();
+        if (cursor_row >= eff_scroll_top() && cursor_row <= bot)
+            region_scroll(cursor_row, bot, -(p0 > 0 ? p0 : 1));
+        break;
+    }
+    case 'M': { /* DL — delete lines at cursor (within region) */
+        uint32_t bot = eff_scroll_bot();
+        if (cursor_row >= eff_scroll_top() && cursor_row <= bot)
+            region_scroll(cursor_row, bot, (p0 > 0 ? p0 : 1));
+        break;
+    }
+    case 'r':   /* DECSTBM — set scroll region (1-based, inclusive) */
+        if (p0 <= 0 && p1 <= 0) {
+            scroll_top = 0;
+            scroll_bot = 0xFFFFFFFFu;
+        } else if (p0 >= 1 && p1 > p0) {
+            scroll_top = (uint32_t)(p0 - 1);
+            scroll_bot = (uint32_t)(p1 - 1);
+        }
+        /* VT100: cursor moves to home after DECSTBM */
+        cursor_row = 0;
+        cursor_col = 0;
         break;
     case 'm':   /* SGR — set graphics rendition */
         if (ansi_nparams == 0) {
@@ -662,18 +823,25 @@ static void ansi_dispatch(char cmd) {
         }
         break;
     case 's':   /* save cursor */
+        saved_cur_row = cursor_row;
+        saved_cur_col = cursor_col;
         break;
     case 'u':   /* restore cursor */
+        cursor_row = (saved_cur_row < max_rows) ? saved_cur_row : max_rows - 1;
+        cursor_col = (saved_cur_col < max_cols) ? saved_cur_col : max_cols - 1;
         break;
-    case 'l':   /* private mode reset (e.g. ?25l hide cursor) — ignore */
-    case 'h':   /* private mode set  — ignore */
+    case 'l':   /* private mode reset (?25l = hide cursor) */
+        if (ansi_priv && p0 == 25) cursor_visible = 0;
+        break;
+    case 'h':   /* private mode set (?25h = show cursor) */
+        if (ansi_priv && p0 == 25) cursor_visible = 1;
         break;
     default:
         break;
     }
 }
 
-void vga_putc(char c) {
+static void vga_putc_inner(char c) {
     uint32_t max_cols = fb_addr ? fb_cols : VGA_WIDTH;
 
     /* ANSI / VT100 state machine */
@@ -707,7 +875,6 @@ void vga_putc(char c) {
             ansi_dispatch(c);
             ansi_state = ANSI_NORMAL;
         }
-        vga_scroll();
         vga_update_cursor();
         return;
     }
@@ -720,7 +887,7 @@ void vga_putc(char c) {
 
     if (c == '\n') {
         cursor_col = 0;
-        cursor_row++;
+        vga_lf();
     } else if (c == '\r') {
         cursor_col = 0;
     } else if (c == '\b') {
@@ -740,12 +907,38 @@ void vga_putc(char c) {
         cursor_col++;
         if (cursor_col >= max_cols) {
             cursor_col = 0;
-            cursor_row++;
+            vga_lf();
         }
     }
 
-    vga_scroll();
     vga_update_cursor();
+}
+
+void vga_putc(char c) {
+    cursor_undraw();
+    vga_putc_inner(c);
+    cursor_draw();
+}
+
+void vga_text_dims(uint32_t *cols, uint32_t *rows) {
+    uint32_t c = fb_addr ? fb_cols : VGA_WIDTH;
+    uint32_t r = fb_addr ? fb_rows : VGA_HEIGHT;
+    if (c > TERM_CELL_COLS) c = TERM_CELL_COLS;
+    if (r > TERM_CELL_ROWS) r = TERM_CELL_ROWS;
+    *cols = c;
+    *rows = r;
+}
+
+void vga_term_reset(void) {
+    cursor_undraw();
+    scroll_top     = 0;
+    scroll_bot     = 0xFFFFFFFFu;
+    saved_cur_row  = 0;
+    saved_cur_col  = 0;
+    cursor_visible = 1;
+    ansi_state     = ANSI_NORMAL;
+    vga_color      = 0x0F;
+    cursor_draw();
 }
 
 void vga_write(const char* str) {
@@ -776,7 +969,9 @@ void vga_set_cursor_pos(uint16_t pos) {
     if (pos >= (uint16_t)(max_cols * max_rows)) {
         pos = (uint16_t)(max_cols * max_rows - 1);
     }
+    cursor_undraw();
     cursor_row = pos / max_cols;
     cursor_col = pos % max_cols;
     vga_update_cursor();
+    cursor_draw();
 }

@@ -153,6 +153,23 @@ int exec(const char *path) {
     return execve(path, (char *const *)0, (char *const *)0);
 }
 
+/* execvp — no PATH on SiMPLE; try the name as given, then with ".elf".
+ * environ is defined weakly here so legacy programs that link libc.c
+ * without env.c still link; env.c's strong definition wins otherwise. */
+char **environ __attribute__((weak)) = 0;
+int execvp(const char *file, char *const argv[]) {
+    execve(file, argv, environ);
+    /* Only returns on failure — retry with .elf appended */
+    char buf[64];
+    size_t n = strlen(file);
+    if (n < sizeof(buf) - 5) {
+        strcpy(buf, file);
+        strcpy(buf + n, ".elf");
+        return execve(buf, argv, environ);
+    }
+    return -1;
+}
+
 int waitpid(int pid, int *status, int options) {
     long ret = syscall3(7, pid, (long)status, options);
     if (ret < 0) { errno = (int)-ret; return -1; }
@@ -249,16 +266,20 @@ int pipe(int fds[2]) {
 }
 
 int fcntl(int fd, int cmd, ...) {
-    /* Get the third arg via inline asm trick — use 0 if not provided */
-    long ret = syscall3(55, fd, cmd, 0);
+    __builtin_va_list ap;
+    __builtin_va_start(ap, cmd);
+    long arg = __builtin_va_arg(ap, long);
+    __builtin_va_end(ap);
+    long ret = syscall3(55, fd, cmd, arg);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
 }
 
 int ioctl(int fd, unsigned long req, ...) {
-    /* Get arg from inline asm — use 0 if not provided */
-    unsigned long arg = 0;
-    /* We can't easily get varargs here, caller should pass arg directly */
+    __builtin_va_list ap;
+    __builtin_va_start(ap, req);
+    unsigned long arg = __builtin_va_arg(ap, unsigned long);
+    __builtin_va_end(ap);
     long ret = syscall3(54, fd, (long)req, (long)arg);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
@@ -468,7 +489,14 @@ unsigned int getticks(void) {
     return (unsigned int)syscall0(400);
 }
 
-int stat(const char *path, void *out) {
+/* Raw SiMPLE stat syscall (409): fills {size, is_dir, exists}. */
+typedef struct {
+    unsigned int  size;
+    unsigned char is_dir;
+    unsigned char exists;
+} __simple_stat_t;
+
+static int __stat_simple(const char *path, __simple_stat_t *out) {
     long ret = syscall2(409, (long)path, (long)out);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
@@ -480,18 +508,79 @@ int readdir_path(const char *path, void *buf, int max_entries) {
     return (int)ret;
 }
 
-/* fstat — stub returning 0 */
-int fstat(int fd, void *buf) {
-    (void)fd; (void)buf;
+/* POSIX struct stat — layout must match user/include/sys/stat.h */
+struct __posix_stat {
+    unsigned long st_dev;
+    unsigned int  st_ino;
+    unsigned int  st_mode;
+    unsigned      st_nlink;
+    unsigned int  st_uid;
+    unsigned int  st_gid;
+    unsigned long st_rdev;
+    int           st_size;
+    unsigned      st_blksize;
+    unsigned      st_blocks;
+    long          st_atime;
+    long          st_mtime;
+    long          st_ctime;
+};
+
+#define __S_IFREG 0100000
+#define __S_IFDIR 0040000
+#define __S_IFCHR 0020000
+
+static void __stat_fill(struct __posix_stat *st, unsigned size, int is_dir) {
+    st->st_dev   = 0;
+    st->st_ino   = 0;
+    st->st_mode  = is_dir ? (__S_IFDIR | 0755) : (__S_IFREG | 0644);
+    st->st_nlink = 1;
+    st->st_uid   = 0;
+    st->st_gid   = 0;
+    st->st_rdev  = 0;
+    st->st_size  = (int)size;
+    st->st_blksize = 512;
+    st->st_blocks  = (size + 511) / 512;
+    /* FAT16 timestamps are not read by the kernel.  Use a constant
+     * nonzero time: editors distinguish "file exists" (mtime > 0)
+     * from "no backing file" (mtime <= 0), and a constant value means
+     * "never externally modified", which is true on a single-tasking
+     * filesystem. */
+    st->st_atime = st->st_mtime = st->st_ctime = 1;
+}
+
+int stat(const char *path, struct __posix_stat *st) {
+    __simple_stat_t ss;
+    if (__stat_simple(path, &ss) < 0) return -1;
+    if (!ss.exists) { errno = 2 /* ENOENT */; return -1; }
+    __stat_fill(st, ss.size, ss.is_dir);
+    return 0;
+}
+
+int lstat(const char *path, struct __posix_stat *st) {
+    return stat(path, st);   /* no symlinks on FAT16 */
+}
+
+/* fstat — TTYs report a character device; file fds recover their size
+ * via lseek (saving and restoring the current offset). */
+int fstat(int fd, struct __posix_stat *st) {
+    if (isatty(fd)) {
+        __stat_fill(st, 0, 0);
+        st->st_mode = __S_IFCHR | 0620;
+        return 0;
+    }
+    int cur = lseek(fd, 0, 1 /* SEEK_CUR */);
+    if (cur < 0) { errno = 9 /* EBADF */; return -1; }
+    int end = lseek(fd, 0, 2 /* SEEK_END */);
+    lseek(fd, cur, 0 /* SEEK_SET */);
+    __stat_fill(st, end >= 0 ? (unsigned)end : 0, 0);
     return 0;
 }
 
 /* access — check file existence via stat */
 int access(const char *path, int mode) {
     (void)mode;
-    /* Use a stack-based stat struct */
-    struct { unsigned size; unsigned char is_dir; unsigned char exists; } st;
-    stat(path, &st);
+    __simple_stat_t st;
+    if (__stat_simple(path, &st) < 0) return -1;
     if (!st.exists) { errno = 2; return -1; }
     return 0;
 }

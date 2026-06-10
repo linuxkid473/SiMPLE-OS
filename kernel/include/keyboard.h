@@ -12,7 +12,11 @@ typedef enum {
     KEY_EVENT_LEFT,
     KEY_EVENT_RIGHT,
     KEY_EVENT_UP,
-    KEY_EVENT_DOWN
+    KEY_EVENT_DOWN,
+    KEY_EVENT_HOME,
+    KEY_EVENT_END,
+    KEY_EVENT_PGUP,
+    KEY_EVENT_PGDN
 } key_event_type_t;
 
 typedef struct {
@@ -23,6 +27,12 @@ typedef struct {
 void keyboard_init(void);
 void keyboard_read_event(key_event_t* event);
 char keyboard_getchar(void);
+
+/* Non-blocking variant of keyboard_read_event: drains pending scancodes
+ * (ring buffer first, then a direct PS/2 poll) through the same modifier
+ * state machine.  Returns 1 when a key event was produced, 0 when no
+ * more input is available right now.  Never sleeps. */
+int keyboard_poll_event(key_event_t* event);
 
 /* Returns 1 if either Alt key is currently held, 0 otherwise. */
 int keyboard_is_alt_pressed(void);

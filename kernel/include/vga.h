@@ -3,9 +3,12 @@
 
 #include "types.h"
 
-/* ---- Cell-buffer dimensions (must match internal vga.c arrays) ---- */
-#define TERM_CELL_COLS  80
-#define TERM_CELL_ROWS  60
+/* ---- Cell-buffer dimensions (must match internal vga.c arrays) ----
+ * Sized to the full 800×600 framebuffer character grid (100×75) so that
+ * every on-screen cell is backed — required for scroll regions and
+ * insert/delete-line, which reconstruct pixels from the cell buffer. */
+#define TERM_CELL_COLS  100
+#define TERM_CELL_ROWS  75
 
 /*
  * Per-terminal session snapshot.
@@ -33,6 +36,15 @@ void vga_set_color(uint8_t fg, uint8_t bg);
 void vga_write_hex(uint32_t value);
 uint16_t vga_get_cursor_pos(void);
 void vga_set_cursor_pos(uint16_t pos);
+
+/* Current text grid size (cols/rows). In framebuffer mode this is the
+ * active client area; in VGA text mode it is 80×25. */
+void vga_text_dims(uint32_t *cols, uint32_t *rows);
+
+/* Reset per-program terminal state: scroll region, saved cursor,
+ * cursor visibility, colours.  Called by the shell when a foreground
+ * program exits so a crashed editor can't wedge the console. */
+void vga_term_reset(void);
 
 /* ---- WM / window support ---- */
 

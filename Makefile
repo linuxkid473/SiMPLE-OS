@@ -163,6 +163,7 @@ all: image
 
 # 'make user' — build only the user ELFs (handy during userland development)
 user: \
+    user/vim.elf     \
     user/hello.elf   \
     user/posixtest.elf \
     user/test.elf    \
@@ -213,6 +214,15 @@ user/ticker_b.elf: user/ticker_b.c $(USER_RUNTIME_DEPS)
 
 user/ticker_c.elf: user/ticker_c.c $(USER_RUNTIME_DEPS)
 	$(USER_CC) -o $@ user/ticker_c.c $(USER_RUNTIME_SRCS)
+
+# vim.elf — modal vi/vim-style editor (ported neatvi; see docs/VIM_PORT.md).
+# Compiled -O2 (not the usual -O0) to keep the binary well inside the 1 MB
+# user address space.
+VIM_SRCS := $(wildcard user/vim/*.c)
+VIM_HDRS := user/vim/vi.h user/vim/conf.h user/vim/kmap.h user/vim/regex.h
+user/vim.elf: $(VIM_SRCS) $(VIM_HDRS) $(USER_RUNTIME_DEPS)
+	$(CC) $(subst -O0,-O2,$(USER_CFLAGS)) $(USER_LDFLAGS) -o $@ \
+	    $(VIM_SRCS) $(USER_RUNTIME_SRCS)
 
 # =============================================================================
 # LEGACY user programs — define _start(), link against LEGACY_RUNTIME only
@@ -323,7 +333,13 @@ $(BUILD_DIR)/isr.o: kernel/src/isr.s | $(BUILD_DIR)
 $(BUILD_DIR)/isr_syscall.o: kernel/src/isr_syscall.s | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: kernel/src/%.c | $(BUILD_DIR)
+# Conservative header dependency: any kernel header change rebuilds all
+# kernel objects.  Structs shared across objects (e.g. term_session_t)
+# make stale-object mismatches catastrophic, so over-rebuilding is the
+# safe default for a kernel this size.
+KERNEL_HDRS := $(wildcard kernel/include/*.h)
+
+$(BUILD_DIR)/%.o: kernel/src/%.c $(KERNEL_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL_ELF): $(OBJS)
@@ -334,6 +350,7 @@ $(KERNEL_ELF): $(OBJS)
 # =============================================================================
 image: \
     $(KERNEL_ELF) \
+    user/vim.elf \
     user/hello.elf \
     user/posixtest.elf \
     user/test.elf \
@@ -400,6 +417,9 @@ image: \
 	mcopy -i $(IMAGE)@@1048576 user/crash.elf         ::crash.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/smkhelp.elf       ::smkhelp.elf; \
 	mcopy -i $(IMAGE)@@1048576 user/posixsmoke.elf    ::smoke.elf; \
+	mcopy -i $(IMAGE)@@1048576 user/vim.elf           ::vim.elf; \
+	printf 'hello from SiMPLE OS\nthis file was made for testing vim\nthird line\n' > build/sample.txt; \
+	mcopy -i $(IMAGE)@@1048576 build/sample.txt       ::sample.txt; \
 	parted -s $(IMAGE) mklabel msdos mkpart primary fat16 1MiB 100% \
 	    set 1 boot on 2>/dev/null || true; \
 	$(LIMINE_DEPLOY) $(IMAGE)

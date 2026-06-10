@@ -19,6 +19,22 @@ int   nanosleep(const void *req, void *rem);
 /* ---- string helpers ---- */
 static size_t _sl(const char *s) { size_t n=0; while(s[n]) n++; return n; }
 
+/* memchr */
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < n; i++)
+        if (p[i] == (unsigned char)c) return (void *)(p + i);
+    return (void *)0;
+}
+
+/* ftruncate — stub: writers open with O_TRUNC, which the kernel honors,
+ * so the only remaining case (shrinking an already-open fd) cannot occur
+ * with the FAT16 driver's whole-file write model. */
+int ftruncate(int fd, int length) {
+    (void)fd; (void)length;
+    return 0;
+}
+
 /* memmove — handles overlapping regions */
 void *memmove(void *dst, const void *src, size_t n) {
     char *d = (char *)dst;
@@ -158,18 +174,8 @@ void *calloc(size_t nmemb, size_t size) {
     return p;
 }
 
-void *realloc(void *ptr, size_t size) {
-    /* Simple: allocate new, copy, leak old (bump allocator has no free) */
-    if (!ptr) return malloc(size);
-    if (!size) { free(ptr); return (void *)0; }
-    void *new_ptr = malloc(size);
-    if (!new_ptr) return (void *)0;
-    /* We don't know the old size — copy size bytes (safe if growing) */
-    char *src = (char *)ptr;
-    char *dst = (char *)new_ptr;
-    for (size_t i = 0; i < size; i++) dst[i] = src[i];
-    return new_ptr;
-}
+/* realloc() lives in malloc.c — it needs the block headers to know the
+ * old allocation size. */
 
 /* ---- abort ---- */
 void abort(void) {

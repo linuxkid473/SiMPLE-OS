@@ -14,6 +14,7 @@ off_t   lseek(int fd, off_t offset, int whence);
 /* Process */
 pid_t   fork(void);
 int     execve(const char *path, char *const argv[], char *const envp[]);
+int     execvp(const char *file, char *const argv[]);
 int     exec(const char *path);
 void    _exit(int code) __attribute__((noreturn));
 
@@ -30,12 +31,15 @@ char   *getcwd(char *buf, size_t size);
 int     unlink(const char *path);
 int     rmdir(const char *path);
 int     access(const char *path, int mode);
+int     ftruncate(int fd, off_t length);
 
 /* Misc */
 unsigned sleep(unsigned seconds);
 int      usleep(unsigned usec);
 int      yield(void);
 int      pipe(int fds[2]);
+int      isatty(int fd);
+void    *sbrk(int increment);
 
 /* Standard fd numbers */
 #define STDIN_FILENO  0

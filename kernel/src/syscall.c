@@ -245,10 +245,28 @@ static void plant_user_stubs(void) {
  * This path is used by child processes after fork()+exec(); the kernel's
  * shell uses exec_elf() directly.
  */
-int32_t sys_exec(const char *path, registers_t *regs) {
-    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+/*
+ * sys_exec_argv — exec with explicit argument/environment vectors.
+ * argv/envp must be NULL-terminated arrays of KERNEL pointers whose
+ * strings survive the ELF load (sys_linux_execve stages them in static
+ * kernel buffers).  argv == NULL falls back to argv = { path }.
+ */
+int32_t sys_exec_argv(const char *path, char *const argv[],
+                      char *const envp[], registers_t *regs) {
+    if (!user_ptr_ok(path, 1) && !(path >= (const char *)0x100000 &&
+                                   path <  (const char *)0x300000))
+        return -(int32_t)EFAULT;
 
-    const char *name = strip_slash(path);
+    /* Copy the file name into a kernel buffer: the caller's string may
+     * live in user memory that the ELF load below overwrites. */
+    static char name_k[64];
+    {
+        const char *n = strip_slash(path);
+        uint32_t i = 0;
+        while (n[i] && i < sizeof(name_k) - 1) { name_k[i] = n[i]; i++; }
+        name_k[i] = '\0';
+    }
+    const char *name = name_k;
     if (!*name) return -(int32_t)EINVAL;
     if (!g_fs)  return -(int32_t)EIO;
 
@@ -357,7 +375,12 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     plant_user_stubs();
 
     /* Build POSIX initial stack */
-    uint32_t new_sp = build_posix_stack(name);
+    uint32_t new_sp;
+    if (argv && argv[0]) {
+        new_sp = build_posix_stack_argv(argv, envp);
+    } else {
+        new_sp = build_posix_stack(name);
+    }
 
     /* Redirect iret to the new entry point */
     regs->eip     = entry;
@@ -367,6 +390,10 @@ int32_t sys_exec(const char *path, registers_t *regs) {
     regs->ss      = SEG_UDATA;
 
     return 0;
+}
+
+int32_t sys_exec(const char *path, registers_t *regs) {
+    return sys_exec_argv(path, (char *const *)0, (char *const *)0, regs);
 }
 
 #define PROC_BRK_MAX 0x700000U
@@ -575,10 +602,15 @@ int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
          *
          * This prevents process 0's stdin poll from starving GUI processes
          * by holding the CPU in a ring-0 busy loop. */
-        if (!kb_scancode_available() && current_proc >= 0) {
-            proc_block_on_kbd(regs);
-            /* If we returned (no other process to switch to), fall through
-             * and call console_read_line normally. */
+        {
+            int have_input = kb_scancode_available();
+            if (!tty_is_canon())
+                have_input = have_input || tty_input_pending();
+            if (!have_input && current_proc >= 0) {
+                proc_block_on_kbd(regs);
+                /* If we returned (no other process to switch to), fall
+                 * through and read/poll inline. */
+            }
         }
 
         if (tty_is_canon()) {
@@ -604,19 +636,45 @@ int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
             }
             return (int32_t)line_len;
         } else {
-            /* Raw mode */
-            uint8_t vmin = g_tty.termios.c_cc[VMIN];
-            if (vmin == 0) vmin = 1;
-            uint32_t got = 0;
-            while (got < vmin && got < len) {
-                char c = keyboard_getchar();
-                if (tty_is_intr(c)) {
-                    if (current_proc >= 0)
-                        proc_send_signal(proc_table[current_proc].pid, SIGINT);
-                    if (got == 0) return -(int32_t)EINTR;
-                    break;
+            /*
+             * Raw (non-canonical) mode: deliver the terminal byte stream
+             * from the TTY input queue.  Special keys arrive as VT100
+             * escape sequences (queued atomically by tty_pump), so one
+             * read() returns a complete sequence.
+             *
+             * Semantics: block until at least VMIN bytes are available
+             * (VMIN==0 → return whatever is pending, possibly nothing),
+             * then return everything queued up to len.
+             */
+            uint8_t  vmin = g_tty.termios.c_cc[VMIN];
+            uint32_t got  = 0;
+            int      echo = (g_tty.termios.c_lflag & ECHO) != 0;
+
+            for (;;) {
+                int ch;
+                tty_pump();
+                while (got < len && (ch = tty_getc()) >= 0) {
+                    if (tty_is_intr((char)ch)) {
+                        if (current_proc >= 0)
+                            proc_send_signal(proc_table[current_proc].pid, SIGINT);
+                        return got ? (int32_t)got : -(int32_t)EINTR;
+                    }
+                    buf[got++] = (char)ch;
+                    if (echo) vga_putc((char)ch);
                 }
-                buf[got++] = c;
+                if (vmin == 0 || got >= vmin || got == len)
+                    break;
+                /* Need more input.  Bail out on pending signals so the
+                 * process can handle them (read returns EINTR). */
+                if (current_proc >= 0 &&
+                    (proc_table[current_proc].sig_pending &
+                     ~proc_table[current_proc].sig_mask))
+                    return got ? (int32_t)got : -(int32_t)EINTR;
+                /* Sleep until the next interrupt (keyboard or timer).
+                 * NOTE: once got > 0 we must not proc_block_on_kbd() —
+                 * its re-entry restarts the syscall and would lose the
+                 * bytes already consumed from the queue. */
+                __asm__ volatile("sti; hlt; cli" ::: "memory");
             }
             return (int32_t)got;
         }
@@ -627,9 +685,8 @@ int32_t sys_linux_read(int32_t fd, char *buf, uint32_t len, registers_t *regs) {
     if (!f) return -(int32_t)EBADF;
 
     if (f->type == FD_TTY) {
-        /* Same as fd 0 */
-        console_read_line(buf, len);
-        return (int32_t)strlen(buf);
+        /* Same as fd 0 (canonical or raw, per termios) */
+        return sys_linux_read(0, buf, len, regs);
     }
 
     if (f->type == FD_PIPE_R) {
@@ -867,6 +924,8 @@ int32_t sys_linux_ioctl(int32_t fd, uint32_t req, uint32_t arg) {
         case TCSETSF: {
             if (!user_ptr_ok((void *)arg, sizeof(termios_t))) return -(int32_t)EFAULT;
             g_tty.termios = *(termios_t *)arg;
+            if (req == TCSETSF)
+                tty_flush_input();
             return 0;
         }
         case TIOCGWINSZ: {
@@ -1366,11 +1425,9 @@ typedef struct {
     int16_t  revents;
 } pollfd_t;
 
-int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout) {
-    (void)timeout;
-    if (!user_ptr_ok(fds, nfds * sizeof(pollfd_t))) return -(int32_t)EFAULT;
-
-    pollfd_t *pfds = (pollfd_t *)fds;
+/* One readiness scan over the pollfd array.  Returns the number of fds
+ * with non-zero revents. */
+static int poll_scan(pollfd_t *pfds, uint32_t nfds) {
     int ready = 0;
 
     for (uint32_t i = 0; i < nfds; i++) {
@@ -1400,14 +1457,20 @@ int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout) {
                 ready++;
             }
         } else if (f->type == FD_TTY || pfds[i].fd <= 2) {
+            int hit = 0;
             if (pfds[i].events & POLLIN) {
-                pfds[i].revents |= POLLIN;
-                ready++;
+                /* Real input readiness: queued raw bytes or pending
+                 * scancodes.  Without this, programs that poll-then-read
+                 * would spin or treat the tty as EOF. */
+                int avail = tty_is_canon() ? kb_scancode_available()
+                                           : tty_input_pending();
+                if (avail) { pfds[i].revents |= POLLIN; hit = 1; }
             }
             if (pfds[i].events & POLLOUT) {
                 pfds[i].revents |= POLLOUT;
-                ready++;
+                hit = 1;
             }
+            if (hit) ready++;
         } else if (f->type == FD_FILE) {
             if (pfds[i].events & POLLIN) {
                 pfds[i].revents |= POLLIN;
@@ -1423,17 +1486,87 @@ int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout) {
     return ready;
 }
 
+int32_t sys_linux_poll(void *fds, uint32_t nfds, int32_t timeout) {
+    if (!user_ptr_ok(fds, nfds * sizeof(pollfd_t))) return -(int32_t)EFAULT;
+
+    pollfd_t *pfds = (pollfd_t *)fds;
+    uint32_t start = pit_ticks();
+    /* ms → PIT ticks (100 Hz), round up so short timeouts still wait. */
+    uint32_t max_ticks = (timeout > 0) ? ((uint32_t)timeout + 9u) / 10u : 0;
+
+    for (;;) {
+        int ready = poll_scan(pfds, nfds);
+        if (ready > 0 || timeout == 0)
+            return ready;
+        if (timeout > 0 && pit_ticks() - start >= max_ticks)
+            return 0;
+        if (current_proc >= 0 &&
+            (proc_table[current_proc].sig_pending &
+             ~proc_table[current_proc].sig_mask))
+            return -(int32_t)EINTR;
+        /* Sleep until the next interrupt, then re-scan. */
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+    }
+}
+
 int32_t sys_linux_wait4(pid_t pid, int *status, int options, void *rusage,
                          registers_t *regs) {
     (void)rusage;
     return (int32_t)proc_waitpid(pid, status, options, regs);
 }
 
+/*
+ * execve — stage argv/envp in kernel buffers (the strings point into the
+ * old user image, which sys_exec_argv overwrites), then exec with them.
+ */
+#define EXEC_STR_BUF 4096
+static char  exec_strs[EXEC_STR_BUF];
+static char *exec_argv_k[POSIX_ARGV_MAX + 1];
+static char *exec_envp_k[POSIX_ENVP_MAX + 1];
+
+static int exec_copy_vec(char **uvec, char **kvec, int max,
+                         uint32_t *off, int *out_n) {
+    int n = 0;
+    if (uvec) {
+        if (!user_ptr_ok(uvec, sizeof(char *))) return -1;
+        for (; n < max; n++) {
+            if (!user_ptr_ok(&uvec[n], sizeof(char *))) return -1;
+            char *s = uvec[n];
+            if (!s) break;
+            if (!user_ptr_ok(s, 1)) return -1;
+            uint32_t len = (uint32_t)strlen(s) + 1;
+            if (*off + len > EXEC_STR_BUF) return -1;   /* E2BIG */
+            for (uint32_t j = 0; j < len; j++) exec_strs[*off + j] = s[j];
+            kvec[n] = exec_strs + *off;
+            *off += len;
+        }
+    }
+    kvec[n] = (char *)0;
+    *out_n = n;
+    return 0;
+}
+
 int32_t sys_linux_execve(const char *path, char **argv, char **envp,
                           registers_t *regs) {
-    (void)argv; (void)envp;
-    /* For now, just do the basic exec without argv/envp */
-    return sys_exec(path, regs);
+    if (!user_ptr_ok(path, 1)) return -(int32_t)EFAULT;
+
+    uint32_t off = 0;
+    int argc = 0, envc = 0;
+    if (exec_copy_vec(argv, exec_argv_k, POSIX_ARGV_MAX, &off, &argc) < 0)
+        return -(int32_t)E2BIG;
+    if (exec_copy_vec(envp, exec_envp_k, POSIX_ENVP_MAX, &off, &envc) < 0)
+        return -(int32_t)E2BIG;
+
+    /* No argv given: synthesize argv[0] = path (copied to kernel buf) */
+    if (argc == 0) {
+        uint32_t len = (uint32_t)strlen(path) + 1;
+        if (off + len > EXEC_STR_BUF) return -(int32_t)E2BIG;
+        for (uint32_t j = 0; j < len; j++) exec_strs[off + j] = path[j];
+        exec_argv_k[0] = exec_strs + off;
+        exec_argv_k[1] = (char *)0;
+    }
+
+    return sys_exec_argv(path, exec_argv_k, exec_envp_k, regs);
 }
 
 int32_t sys_linux_getuid32(void) {
